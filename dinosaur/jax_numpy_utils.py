@@ -481,9 +481,9 @@ def sharded_einsum(
       mesh=mesh,
       in_specs=in_specs,
       out_specs=out_spec,
-      check_rep=False,  # https://github.com/google/jax/issues/15894
+      check_rep=False,  # https://github.com/jax-ml/jax/issues/15894
   )
-  @jax.jit  # https://github.com/google/jax/issues/15723
+  @jax.jit  # https://github.com/jax-ml/jax/issues/15723
   def distributed_matmul(lhs, rhs):
     return matmul_impl(
         subscripts,

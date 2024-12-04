@@ -713,7 +713,7 @@ def nested_checkpoint_scan(
     Carry and output values.
   """
   # TODO(shoyer): consider upstreaming into JAX in some form:
-  # https://github.com/google/jax/issues/2139
+  # https://github.com/jax-ml/jax/issues/2139
 
   if length is not None and length != math.prod(nested_lengths):
     raise ValueError(f'inconsistent {length=} and {nested_lengths=}')
