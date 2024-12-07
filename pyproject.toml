@@ -8,7 +8,7 @@ package-data = {"dinosaur.data" = ["*"]}
 
 [project]
 name = "dinosaur-dycore"
-version = "1.1.0"  # keep sync with __init__.py
+version = "1.1.1"  # keep sync with __init__.py
 authors = [
     {name = "Google LLC", email = "noreply@google.com"},
 ]
@@ -24,6 +24,14 @@ dependencies = [
     "scipy",
     "scikit-learn",
     "tree-math",
+    # these packages below are only required for xarray-utils, and really
+    # should not be required by default.
+    "dask",
+    "fsspec",
+    "pandas",
+    "xarray",
+    # "xarray-beam",  # TODO(shoyer): figure out how to install Beam in CI
+    "xarray-tensorstore",
 ]
 
 [project.optional-dependencies]
@@ -31,12 +39,4 @@ tests = [
     "absl-py",
     "chex",
     "pytest",
-]
-xarray-utils = [
-    "dask",
-    "fsspec",
-    "pandas",
-    "xarray",
-    # "xarray-beam",  # TODO(shoyer): figure out how to install Beam in CI
-    "xarray-tensorstore",
 ]
