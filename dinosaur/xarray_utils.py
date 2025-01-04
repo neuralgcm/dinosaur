@@ -615,16 +615,16 @@ def xarray_to_primitive_equations_with_time_data(
 
   Args:
     dataset: dataset from which to extract `values` attributes of the
-      `primitive_equations.StateWithTime` in dict representation.
+      `primitive_equations.State` in dict representation.
     values: attribute to extract. Typically is `values`, `dtype` or `shape`.
     tracers_to_include: names of tracers present in the `dataset` to include in
-      the `StateWithTime`.
+      the `State`.
 
   Returns:
     Dictionary that contains atmosphere state variables in a format compatible
     with `primitive_equations.State`.
   """
-  return primitive_equations.StateWithTime(
+  return primitive_equations.State(
       vorticity=getattr(dataset['vorticity'], values),
       divergence=getattr(dataset['divergence'], values),
       temperature_variation=getattr(dataset['temperature_variation'], values),

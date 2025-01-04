@@ -11,9 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Tests for xarray_utils."""
-
 import functools
 from typing import Any
 
@@ -373,8 +370,8 @@ class XarrayUtilsTest(parameterized.TestCase):
         nodal_orography, coords
     )
     state = initial_state_fn()
-    state = primitive_equations.StateWithTime(**state.asdict(), sim_time=0.0)
-    equation = primitive_equations.PrimitiveEquationsWithTime(
+    state.sim_time = 0.0
+    equation = primitive_equations.PrimitiveEquations(
         ref_temperatures, orography, coords, physics_specs
     )
     step_fn = integrator(equation, dt)

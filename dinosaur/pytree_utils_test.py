@@ -16,11 +16,9 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
-
 from dinosaur import primitive_equations
 from dinosaur import pytree_utils
 from dinosaur import shallow_water
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -30,15 +28,20 @@ class PytreeUtilsTest(parameterized.TestCase):
 
   @parameterized.parameters(
       dict(
-          pytree={'a': np.arange(8).reshape((2, 2, 2)),
-                  'b': np.ones((2, 2, 2))},
-          axis=0,),
+          pytree={
+              'a': np.arange(8).reshape((2, 2, 2)),
+              'b': np.ones((2, 2, 2)),
+          },
+          axis=0,
+      ),
       dict(
           pytree=(np.arange(16).reshape((2, 4, 2)), np.zeros((2, 2, 2))),
-          axis=1,),
+          axis=1,
+      ),
       dict(
           pytree=(np.arange(4).reshape((4, 1)), np.zeros((4, 5))),
-          axis=-1,),
+          axis=-1,
+      ),
   )
   def test_tree_pack_unpack_roundtrip(self, pytree, axis):
     """Tests that packing -> unpacking a pytree preserves the data."""
@@ -83,14 +86,15 @@ class PytreeUtilsTest(parameterized.TestCase):
       chex.assert_trees_all_close(jax.device_get(stacked), stacked_expected)
     with self.subTest('unstack_pytree'):
       unstack_shapes = pytree_utils.shape_structure(pytree)
-      unstacked = pytree_utils.unstack_to_pytree(
-          stacked, unstack_shapes, axis)
+      unstacked = pytree_utils.unstack_to_pytree(stacked, unstack_shapes, axis)
       chex.assert_trees_all_close(pytree, jax.device_get(unstacked))
     with self.subTest('jit'):
+
       def roundtrip(x):
         stacked = pytree_utils.stack_pytree(x, axis)
         unstack_shapes = pytree_utils.shape_structure(x)
         return pytree_utils.unstack_to_pytree(stacked, unstack_shapes, axis)
+
       roundtrip_fn = jax.jit(roundtrip)
       chex.assert_trees_all_close(pytree, jax.device_get(roundtrip_fn(pytree)))
 
@@ -230,10 +234,12 @@ class PytreeUtilsTest(parameterized.TestCase):
     if should_raise:
       with self.assertRaises(ValueError):
         pytree_utils.replace_with_matching_or_default(
-            inputs, replace_dict, default)
+            inputs, replace_dict, default
+        )
     else:
       actual = pytree_utils.replace_with_matching_or_default(
-          inputs, replace_dict, default)
+          inputs, replace_dict, default
+      )
       chex.assert_trees_all_close(actual, expected)
 
   @parameterized.named_parameters(
@@ -243,7 +249,7 @@ class PytreeUtilsTest(parameterized.TestCase):
           f=lambda x: x**0.5,
           g=lambda x: x**2,
           pytree={'a': np.arange(8), 'b': 5, 'c': 2 * np.eye(2)},
-          expected={'a': np.arange(8)**0.5, 'b': 5**2, 'c': 2**2 * np.eye(2)},
+          expected={'a': np.arange(8) ** 0.5, 'b': 5**2, 'c': 2**2 * np.eye(2)},
       ),
   )
   def test_tree_map_where(self, condition_fn, f, g, pytree, expected):
@@ -258,7 +264,11 @@ class PytreeUtilsTest(parameterized.TestCase):
           f=lambda x: x**0.5,
           scalar_fn=lambda x: x**2,
           pytree={'a': np.arange(8), 'b': 5, 'c': 2 * np.eye(2)},
-          expected={'a': np.arange(8)**0.5, 'b': 5**2, 'c': 2**0.5 * np.eye(2)},
+          expected={
+              'a': np.arange(8) ** 0.5,
+              'b': 5**2,
+              'c': 2**0.5 * np.eye(2),
+          },
       ),
       dict(
           testcase_name='resclae_non_time',
@@ -274,17 +284,14 @@ class PytreeUtilsTest(parameterized.TestCase):
     assert_not_jax_array = lambda x: self.assertNotIsInstance(x, jax.Array)
     with self.subTest('jax_backed'):
       actual = pytree_utils.tree_map_over_nonscalars(
-          f=f,
-          x=pytree,
-          scalar_fn=scalar_fn)  # jax is the default backend.
+          f=f, x=pytree, scalar_fn=scalar_fn
+      )  # jax is the default backend.
       jax.tree_util.tree_map(assert_is_jax_array, actual)
       chex.assert_trees_all_close(actual, expected)
     with self.subTest('numpy_backed'):
       actual = pytree_utils.tree_map_over_nonscalars(
-          f=f,
-          x=pytree,
-          scalar_fn=scalar_fn,
-          backend='numpy')
+          f=f, x=pytree, scalar_fn=scalar_fn, backend='numpy'
+      )
       jax.tree_util.tree_map(assert_not_jax_array, actual)
       chex.assert_trees_all_close(actual, expected)
 
@@ -295,7 +302,8 @@ class PytreeUtilsTest(parameterized.TestCase):
           axis=0,
           expected=(
               {'a': np.ones(4), 'b': np.asarray(0)},
-              {'a': np.zeros(4), 'b': np.asarray(1)}),
+              {'a': np.zeros(4), 'b': np.asarray(1)},
+          ),
       ),
       dict(
           testcase_name='split_three_along_axis_1',
@@ -321,13 +329,17 @@ class PytreeUtilsTest(parameterized.TestCase):
       ),
       dict(
           testcase_name='shallow_water_state',
-          inputs=shallow_water.State(np.ones(10), np.zeros(10), np.arange(10))
+          inputs=shallow_water.State(np.ones(10), np.zeros(10), np.arange(10)),
       ),
       dict(
           testcase_name='primitive_equations_state',
-          inputs=primitive_equations.StateWithTime(
-              np.ones(10), np.zeros(10), np.arange(10), np.ones(10), 3.14,
-              {'q': np.ones(10)})
+          inputs=primitive_equations.State(
+              np.ones(10),
+              np.zeros(10),
+              np.arange(10),
+              np.ones(10),
+              {'q': np.ones(10)},
+          ),
       ),
   )
   def test_asdict_forward_and_roundtrip(self, inputs):
@@ -337,6 +349,7 @@ class PytreeUtilsTest(parameterized.TestCase):
     with self.subTest('round_trip'):
       reconstructed = from_dict_fn(dict_repr)
       chex.assert_trees_all_close(reconstructed, inputs)
+
 
 if __name__ == '__main__':
   absltest.main()

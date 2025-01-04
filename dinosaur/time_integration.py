@@ -830,6 +830,6 @@ def maybe_fix_sim_time_roundoff(
     dt: float,
 ) ->typing.PyTreeState:
   """Returns `state` with sim_time rounded to an integer value of `dt`."""
-  if hasattr(state, 'sim_time'):
+  if hasattr(state, 'sim_time') and state.sim_time is not None:
     state.sim_time = dt * jnp.round(state.sim_time / dt)
   return state

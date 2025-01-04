@@ -71,6 +71,13 @@ def assert_states_close(state0, state1, **kwargs):
             state0.tracers[tracer_name], state1.tracers[tracer_name],
             err_msg=f'Mismatch in tracer {tracer_name}:', **kwargs)
     else:
+      if field.name == 'sim_time':
+        if state0.sim_time is None != state1.sim_time is None:
+          raise AssertionError(
+              f'Mismatch is sim_time: {state0.sim_time} != {state1.sim_time}'
+          )
+        if state0.sim_time is None:  # assert_allclose does not handle None
+          continue
       np.testing.assert_allclose(getattr(state0, field.name),
                                  getattr(state1, field.name),
                                  err_msg=f'Mismatch in {field}:',
@@ -545,7 +552,6 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
         'specific_humidity': primitive_equations_states.gaussian_scalar(
             coords, physics_specs, amplitude=0.0)
     }
-    state = primitive_equations.StateWithTime(**state.asdict(), sim_time=0.0)
     # Computing tendencies using both variations.
     ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
     primitive_a = primitive_equations.PrimitiveEquationsWithTime(

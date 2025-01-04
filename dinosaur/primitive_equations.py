@@ -18,8 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-
-from typing import Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from dinosaur import coordinate_systems
 from dinosaur import jax_numpy_utils
@@ -29,7 +28,6 @@ from dinosaur import spherical_harmonic
 from dinosaur import time_integration
 from dinosaur import typing
 from dinosaur import vertical_interpolation
-
 import jax
 from jax import lax
 import jax.numpy as jnp
@@ -76,18 +74,23 @@ class State:
   temperature_variation: Array
   log_surface_pressure: Array
   tracers: Mapping[str, Array] = dataclasses.field(default_factory=dict)
+  sim_time: float | None = None
 
 
-@tree_math.struct
-class StateWithTime:
-  """Same as `State`, but also keeps track of simulation time."""
+def _asdict(state: State) -> dict[str, Any]:
+  # Exclude sim_time if it is None (the default value), to avoid breaking
+  # backwards compatibility with State.asdict() and State.astuple() before
+  # sim_time was added.
+  return {
+      field.name: getattr(state, field.name)
+      for field in state.fields
+      if field.name != 'sim_time' or state.sim_time is not None
+  }
 
-  vorticity: Array
-  divergence: Array
-  temperature_variation: Array
-  log_surface_pressure: Array
-  sim_time: float
-  tracers: Mapping[str, Array] = dataclasses.field(default_factory=dict)
+State.asdict = _asdict
+
+
+StateWithTime = State  # deprecated alias
 
 
 class StateShapeError(Exception):
@@ -139,8 +142,8 @@ class DiagnosticState:
     temperature_variation: nodal values of the T' field of shape [h, q, t].
     cos_lat_u: tuple of nodal values of cosθ * velocity_vector, each of shape
       [h, q, t].
-    sigma_dot_explicit: nodal values of d𝜎/dt due to pressure gradient terms
-      `u · ∇(log(ps))` of shape [h, q, t].
+    sigma_dot_explicit: nodal values of d𝜎/dt due to pressure gradient terms `u
+      · ∇(log(ps))` of shape [h, q, t].
     sigma_dot_full: nodal values of d𝜎/dt due to all terms of shape [h, q, t].
     cos_lat_grad_log_sp: (2,) nodal values of cosθ · ∇(log(surface_pressure)) of
       shape [1, q, t].
@@ -187,13 +190,19 @@ def compute_diagnostic_state(
       state.log_surface_pressure, clip=False
   )
   nodal_cos_lat_grad_log_sp = to_nodal_fn(cos_lat_grad_log_sp)
-  nodal_u_dot_grad_log_sp = sum(jax.tree_util.tree_map(
-      lambda x, y: x * y * coords.horizontal.sec2_lat,
-      nodal_cos_lat_u, nodal_cos_lat_grad_log_sp))
+  nodal_u_dot_grad_log_sp = sum(
+      jax.tree_util.tree_map(
+          lambda x, y: x * y * coords.horizontal.sec2_lat,
+          nodal_cos_lat_u,
+          nodal_cos_lat_grad_log_sp,
+      )
+  )
   f_explicit = sigma_coordinates.cumulative_sigma_integral(
-      nodal_u_dot_grad_log_sp, coords.vertical)
+      nodal_u_dot_grad_log_sp, coords.vertical
+  )
   f_full = sigma_coordinates.cumulative_sigma_integral(
-      nodal_divergence + nodal_u_dot_grad_log_sp, coords.vertical)
+      nodal_divergence + nodal_u_dot_grad_log_sp, coords.vertical
+  )
   # note: we only need velocities at the inner boundaries of coords.vertical.
   sum_𝜎 = np.cumsum(coords.vertical.layer_thickness)[:, np.newaxis, np.newaxis]
   sigma_dot_explicit = lax.slice_in_dim(
@@ -814,6 +823,7 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
     vertical_advection: function to use for calculating tendencies from vertical
       advection.
   """
+
   reference_temperature: np.ndarray
   orography: Array
   coords: coordinate_systems.CoordinateSystem
@@ -1056,6 +1066,7 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
         temperature_variation=temperature_tendency,
         log_surface_pressure=log_surface_pressure_tendency,
         tracers=tracers_tendency,
+        sim_time=None if state.sim_time is None else 1.0,
     )
     # Note: clipping the final total wavenumber from the explicit tendencies
     # matches SPEEDY.
@@ -1113,6 +1124,7 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
         temperature_variation=temperature_variation_implicit,
         log_surface_pressure=log_surface_pressure_implicit,
         tracers=tracers_implicit,
+        sim_time=None if state.sim_time is None else 0.0,
     )
 
   @jax.named_call
@@ -1327,46 +1339,15 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
         inverted_temperature_variation,
         inverted_log_surface_pressure,
         inverted_tracers,
+        sim_time=state.sim_time,
     )
 
 
-@dataclasses.dataclass
-class PrimitiveEquationsWithTime(PrimitiveEquations):
-  """Primitive equations that also advance time."""
-
-  def _time_and_state(
-      self, state_with_time: StateWithTime
-  ) -> tuple[float, State]:
-    state_with_time_dict = state_with_time.asdict()
-    sim_time = state_with_time_dict.pop('sim_time')
-    state_without_time = State(**state_with_time_dict)
-    return sim_time, state_without_time
-
-  def explicit_terms(self, state: StateWithTime) -> StateWithTime:
-    """Evaluates explicit terms in the ODE."""
-    _, state_without_time = self._time_and_state(state)
-    explicit_terms = super().explicit_terms(state_without_time)
-    return StateWithTime(**explicit_terms.asdict(), sim_time=1.0)
-
-  def implicit_terms(self, state: StateWithTime) -> StateWithTime:
-    """Evaluates implicit terms in the ODE."""
-    _, state_without_time = self._time_and_state(state)
-    implicit_terms = super().implicit_terms(state_without_time)
-    return StateWithTime(**implicit_terms.asdict(), sim_time=0.0)
-
-  def implicit_inverse(  # pytype: disable=signature-mismatch  # Removed 'method
-      self,
-      state: StateWithTime,
-      step_size: float,
-  ) -> StateWithTime:
-    """Applies `(1 - step_size * implicit_terms)⁻¹` to `state`."""
-    sim_time, state_without_time = self._time_and_state(state)
-    inverted = super().implicit_inverse(state_without_time, step_size)
-    return StateWithTime(**inverted.asdict(), sim_time=sim_time)
+PrimitiveEquationsWithTime = PrimitiveEquations  # deprecated alias
 
 
 @dataclasses.dataclass
-class MoistPrimitiveEquations(PrimitiveEquationsWithTime):
+class MoistPrimitiveEquations(PrimitiveEquations):
   """Primitive equations that take into account humidity and advance time."""
 
   def _get_specific_humidity(self, aux_state: DiagnosticState) -> Array:
@@ -1426,9 +1407,7 @@ class MoistPrimitiveEquations(PrimitiveEquationsWithTime):
       sigma_dot_u = 0
       sigma_dot_v = 0
     # we use virtual temperature Tv in these tendencies to accound for humidity.
-    rTv = self._virtual_temperature(
-        aux_state, moisture_contribution
-    )
+    rTv = self._virtual_temperature(aux_state, moisture_contribution)
     grad_log_ps_u, grad_log_ps_v = aux_state.cos_lat_grad_log_sp
     vertical_term_u = (sigma_dot_u + rTv * grad_log_ps_u) * sec2_lat
     vertical_term_v = (sigma_dot_v + rTv * grad_log_ps_v) * sec2_lat
@@ -1576,17 +1555,16 @@ class MoistPrimitiveEquations(PrimitiveEquationsWithTime):
   @jax.named_call
   def explicit_terms(self, state: StateWithTime) -> StateWithTime:
     """Evaluates explicit terms in the ODE."""
-    _, state_without_time = self._time_and_state(state)
-    aux_state = compute_diagnostic_state(state_without_time, self.coords)
+    aux_state = compute_diagnostic_state(state, self.coords)
     # tendencies that are computed in modal representation
     vorticity_dot, divergence_dot = self.curl_and_div_tendencies(aux_state)
     humidity_vort_correction_tendency = self.vorticity_tendency_due_to_humidity(
-        state_without_time, aux_state
+        state, aux_state
     )
     kinetic_energy_tendency = self.kinetic_energy_tendency(aux_state)
     orography_tendency = self.orography_tendency()
     humidity_div_correction_tendency = self.divergence_tendency_due_to_humidity(
-        state_without_time, aux_state
+        state, aux_state
     )
     horizontal_tendency_fn = functools.partial(
         self.horizontal_scalar_advection, aux_state=aux_state
@@ -1636,11 +1614,11 @@ class MoistPrimitiveEquations(PrimitiveEquationsWithTime):
         temperature_variation=temperature_tendency,
         log_surface_pressure=log_surface_pressure_tendency,
         tracers=tracers_tendency,
+        sim_time=None if state.sim_time is None else 1.0,
     )
     # Note: clipping the final total wavenumber from the explicit tendencies
     # matches SPEEDY.
-    explicit_terms = self.coords.horizontal.clip_wavenumbers(explicit_terms)
-    return StateWithTime(**explicit_terms.asdict(), sim_time=1.0)
+    return self.coords.horizontal.clip_wavenumbers(explicit_terms)
 
 
 @dataclasses.dataclass

@@ -61,7 +61,7 @@ def make_initial_state(coords, physics_specs):
           coords, physics_specs
       )
   }
-  state = primitive_equations.StateWithTime(**state.asdict(), sim_time=0.0)
+  state.sim_time = 0.0
   return state
 
 
