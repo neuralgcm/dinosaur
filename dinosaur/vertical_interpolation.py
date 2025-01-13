@@ -74,11 +74,9 @@ def interp(
     x: typing.Numeric, xp: typing.Array, fp: typing.Array
 ) -> jnp.ndarray:
   """Optimized version of jnp.interp."""
-  on_tpu = all(device.platform == 'tpu' for device in jax.local_devices())
-  if on_tpu:
-    return _dot_interp(x, xp, fp)
-  else:
-    return jnp.interp(x, xp, fp)
+  return jax.lax.platform_dependent(
+      x, xp, fp, tpu=_dot_interp, default=jnp.interp
+  )
 
 
 def _extrapolate_left(y):
