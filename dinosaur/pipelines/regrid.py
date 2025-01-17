@@ -19,7 +19,8 @@ file are supported, but irregular spacing is OK.
 
 from concurrent import futures
 import dataclasses
-from typing import Any, Callable, Mapping
+import logging
+from typing import Any, Callable
 
 import apache_beam as beam
 from dinosaur import horizontal_interpolation
@@ -59,22 +60,35 @@ class NearestNaNFiller(NaNFiller):
   def __call__(
       self, key: xarray_beam.Key, chunk: xarray.Dataset
   ) -> tuple[xarray_beam.Key, xarray.Dataset]:
-    return key, xarray_utils.fill_nan_with_nearest(chunk)
+    try:
+      return key, xarray_utils.fill_nan_with_nearest(chunk)
+    except ValueError as e:
+      raise ValueError(f'error while filling NaN values for {key=}') from e
 
 
+@dataclasses.dataclass
 class RaiseIfNaNFiller(NaNFiller):
   """Raises an error if any NaN values are found.
 
   This is a useful sanity check for missing source data (e.g., reading a date
   like 1900 in ARCO-ERA5 for which data is not available) or invalid vertical
   regridding (e.g., to a level that has no overlap with the source data).
+
+  Attributes:
+    allowed_incomplete_dims: dimensions allowed to be incomplete but not
+      entirely missing, e.g., allowed_incomplete_dims=('latitude', 'longitude')
+      would allow for missing values over land in an ocean variable. If no
+      dimensions are listed here, then all dimensions must be complete.
   """
+
+  allowed_incomplete_dims: tuple[str, ...] = ()
 
   def __call__(
       self, key: xarray_beam.Key, chunk: xarray.Dataset
   ) -> tuple[xarray_beam.Key, xarray.Dataset]:
     for var, array in chunk.items():
-      if array.isnull().any():
+      is_valid = array.notnull().any(dim=self.allowed_incomplete_dims)
+      if not is_valid.all():
         raise ValueError(f'NaN value found in {var} for {key=}')
     return key, chunk
 
@@ -100,6 +114,7 @@ class Source:
 
   name_mapping: NameMapping = dataclasses.field(default_factory=NameMapping)
   static_vars: list[str] | None = None
+  static_time: str | None = None
   dynamic_vars: list[str] | None = None
   variables_to_shift: list[str] = dataclasses.field(default_factory=list)
   time_shift: str = '0 hours'
@@ -153,11 +168,20 @@ def get_source_dataset_and_chunks(
     static_vars = source.static_vars
   else:
     static_vars = [k for k, v in source_ds.items() if 'time' not in v.dims]
+  static_ds = source_ds[static_vars]
+
+  if source.static_time is not None and 'time' in static_ds.dims:
+    # drop time dimension from static variables (they are duplicated along time
+    # in some datasets such as ERA5)
+    static_ds = static_ds.sel(time=source.static_time, drop=True)
+
   if source.dynamic_vars is not None:
     dynamic_vars = source.dynamic_vars
   else:
     dynamic_vars = [k for k, v in source_ds.items() if 'time' in v.dims]
-  source_ds = source_ds[static_vars + dynamic_vars]
+  dynamic_ds = source_ds[dynamic_vars]
+
+  source_ds = xarray.merge([dynamic_ds, static_ds], join='exact')
 
   # temporal shift
   source_ds = xarray_utils.xarray_selective_shift(
@@ -305,7 +329,7 @@ def get_output_chunks(
     input_chunks: dict[str, int],
     vertical_regridder: vertical_interpolation.Regridder | None,
     explicit_output_chunks: dict[str, int] | None,
-) -> dict[str, int] | None:
+) -> dict[str, int]:
   """Get the output chunks for the regridded dataset."""
   if explicit_output_chunks is None:
     return input_chunks
@@ -352,44 +376,59 @@ class RegridTarget:
 class _RegridTransform(beam.PTransform):
   """PTransform for regridding to a single target grid."""
 
-  def __init__(
-      self,
-      source_template: xarray.Dataset,
-      input_chunks: dict[str, int],
-      target: RegridTarget,
-      io_num_threads: int | None,
-      setup_executor: futures.ThreadPoolExecutor,
-  ):
-    validate_horizontal_regridder(source_template, target.horizontal_regridder)
-    validate_vertical_regridder(source_template, target.vertical_regridder)
+  source_template: xarray.Dataset
+  input_chunks: dict[str, int]
+  target: RegridTarget
+  io_num_threads: int | None
+  target_template: xarray.Dataset = dataclasses.field(init=False)
+  output_chunks: dict[str, int] = dataclasses.field(init=False)
 
-    self.nan_filler = target.nan_filler
-    self.regrid = get_regrid_func(
-        target.horizontal_regridder, target.vertical_regridder
+  def __post_init__(self):
+    validate_horizontal_regridder(
+        self.source_template, self.target.horizontal_regridder
     )
-    template = get_template(
-        source_template, target.horizontal_regridder, target.vertical_regridder
+    validate_vertical_regridder(
+        self.source_template, self.target.vertical_regridder
     )
-    if target.zarr_metadata:
-      template.attrs.update(target.zarr_metadata)
+
+    self.target_template = get_template(
+        self.source_template,
+        self.target.horizontal_regridder,
+        self.target.vertical_regridder,
+    )
+    if self.target.zarr_metadata:
+      self.target_template.attrs.update(self.target.zarr_metadata)
+
     self.output_chunks = get_output_chunks(
-        input_chunks, target.vertical_regridder, target.output_chunks
+        self.input_chunks,
+        self.target.vertical_regridder,
+        self.target.output_chunks,
     )
-    self.chunks_to_zarr = xarray_beam.ChunksToZarr(
-        target.output_path,
-        template,
-        self.output_chunks,
-        num_threads=io_num_threads,
-        setup_executor=setup_executor,
+
+  def setup_output_zarr(self):
+    xarray_beam.setup_zarr(
+        self.target_template, self.target.output_path, self.output_chunks
     )
 
   def expand(self, pcoll: beam.PCollection) -> beam.PCollection:
-    pcoll = pcoll | beam.MapTuple(self.regrid)
+    regrid = get_regrid_func(
+        self.target.horizontal_regridder, self.target.vertical_regridder
+    )
+    pcoll |= beam.MapTuple(regrid)
+
     if self.output_chunks is not None:
       pcoll |= xarray_beam.ConsolidateChunks(self.output_chunks)
-    if self.nan_filler is not None:
-      pcoll |= beam.MapTuple(self.nan_filler)
-    pcoll |= self.chunks_to_zarr
+
+    if self.target.nan_filler is not None:
+      pcoll |= beam.MapTuple(self.target.nan_filler)
+
+    pcoll |= xarray_beam.ChunksToZarr(
+        self.target.output_path,
+        self.target_template,
+        self.output_chunks,
+        num_threads=self.io_num_threads,
+        needs_setup=False,
+    )
     return pcoll
 
 
@@ -423,18 +462,24 @@ class MultiRegridTransform(beam.PTransform):
 
     # We setup Zarr stores using separate threads, which otherwise takes ~1
     # minute per regridding target.
-    with futures.ThreadPoolExecutor(
-        max_workers=len(self.regrid_targets)
-    ) as executor:
-      output_pcollections = []
-      for i, target in enumerate(self.regrid_targets):
-        pcoll = source_pcoll | f'Regrid{i}' >> _RegridTransform(
-            source_template=source_ds,
-            input_chunks=input_chunks,
-            target=target,
-            io_num_threads=self.io_num_threads,
-            setup_executor=executor,
-        )
-        output_pcollections.append(pcoll)
+    executor = futures.ThreadPoolExecutor(max_workers=len(self.regrid_targets))
+
+    output_pcollections = []
+    setup_futures = []
+    for i, target in enumerate(self.regrid_targets):
+      transform = _RegridTransform(
+          source_template=source_ds,
+          input_chunks=input_chunks,
+          target=target,
+          io_num_threads=self.io_num_threads,
+      )
+      pcoll = source_pcoll | f'Regrid{i}' >> transform
+      setup_futures.append(executor.submit(transform.setup_output_zarr))
+      output_pcollections.append(pcoll)
+
+    # Wait for any setup errors to be raised.
+    for future in futures.as_completed(setup_futures):
+      future.result()
+    logging.info('zarr setup complete')
 
     return output_pcollections
