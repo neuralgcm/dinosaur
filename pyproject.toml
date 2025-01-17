@@ -7,8 +7,8 @@ packages = ["dinosaur"]
 package-data = {dinosaur = ["data/*"]}
 
 [project]
-name = "dinosaur-dycore"
-version = "1.2.0"  # keep sync with __init__.py
+name = "dinosaur"
+version = "1.2.1"  # keep sync with __init__.py
 authors = [
     {name = "Google LLC", email = "noreply@google.com"},
 ]
