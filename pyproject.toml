@@ -9,6 +9,7 @@ package-data = {dinosaur = ["data/*"]}
 [project]
 name = "dinosaur"
 version = "1.2.1"  # keep sync with __init__.py
+description = "Differentiable Dynamics for Global Atmospheric Modeling 🦖"
 authors = [
     {name = "Google LLC", email = "noreply@google.com"},
 ]
