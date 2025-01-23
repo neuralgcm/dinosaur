@@ -21,11 +21,10 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Sequence
+from typing import Callable
 
 from dinosaur import jax_numpy_utils
 from dinosaur import typing
-
 import jax
 from jax import lax
 import jax.numpy as jnp
@@ -47,6 +46,13 @@ def _slice_shape_along_axis(
   x_shape = list(x.shape)
   x_shape[axis] = slice_width
   return tuple(x_shape)
+
+
+def _with_f64_math(
+    f: Callable[[np.ndarray], np.ndarray],
+) -> Callable[[np.ndarray], np.ndarray]:
+  """Returns a function that uses float64 internally."""
+  return lambda x: f(x.astype(np.float64)).astype(x.dtype)
 
 
 # TODO(dkochkov) Consider renaming `SigmaCoordinates` to `Grid` or `SigmaGrid`.
@@ -74,20 +80,19 @@ class SigmaCoordinates:
 
   boundaries: np.ndarray
 
-  def __init__(self, boundaries: Sequence[float] | np.ndarray):
-    object.__setattr__(self, 'boundaries', np.asarray(boundaries))
-    if not (
-        np.isclose(self.boundaries[0], 0) and np.isclose(self.boundaries[-1], 1)
-    ):
+  def __init__(self, boundaries: np.typing.ArrayLike):
+    boundaries = np.asarray(boundaries)
+    if not (np.isclose(boundaries[0], 0) and np.isclose(boundaries[-1], 1)):
       raise ValueError(
           'Expected boundaries[0] = 0, boundaries[-1] = 1, '
-          f'got boundaries = {self.boundaries}'
+          f'got boundaries = {boundaries}'
       )
-    if not all(np.diff(self.boundaries) > 0):
+    if not all(np.diff(boundaries) > 0):
       raise ValueError(
           'Expected `boundaries` to be monotonically increasing, '
-          f'got boundaries = {self.boundaries}'
+          f'got boundaries = {boundaries}'
       )
+    object.__setattr__(self, 'boundaries', boundaries)
 
   @property
   def internal_boundaries(self) -> np.ndarray:
@@ -95,15 +100,17 @@ class SigmaCoordinates:
 
   @property
   def centers(self) -> np.ndarray:
-    return (self.boundaries[1:] + self.boundaries[:-1]) / 2
+    # Use float64 internally so we can convert float32 boundaries to centers and
+    # back without any loss of precision.
+    return _with_f64_math(lambda x: (x[1:] + x[:-1]) / 2)(self.boundaries)
 
   @property
   def layer_thickness(self) -> np.ndarray:
-    return np.diff(self.boundaries)
+    return _with_f64_math(np.diff)(self.boundaries)
 
   @property
   def center_to_center(self) -> np.ndarray:
-    return np.diff(self.centers)
+    return _with_f64_math(np.diff)(self.centers)
 
   @property
   def layers(self) -> int:
@@ -112,6 +119,24 @@ class SigmaCoordinates:
   @classmethod
   def equidistant(cls, layers: int) -> SigmaCoordinates:
     boundaries = np.linspace(0, 1, layers + 1)
+    return cls(boundaries)
+
+  @classmethod
+  def from_centers(cls, centers: np.typing.ArrayLike):
+    """Create sigma coordinates from the centers of each layer."""
+    # The relationship between cell centers and boundaries is given by:
+    #   centers[i] = 0.5 * (boundaries[i] + boundaries[i + 1])
+    # Writing this as a matrix and dropping the column corresponding to
+    # boundaries[0] (fixed at zero), we have a linear system of N equations and
+    # N unknowns that we can solve to obtain cell boundaries.
+
+    def centers_to_boundaries(centers):
+      layers = len(centers)
+      bounds_to_centers = 0.5 * (np.eye(layers) + np.eye(layers, k=-1))
+      unpadded_bounds = np.linalg.solve(bounds_to_centers, centers)
+      return np.pad(unpadded_bounds, [(1, 0)])
+
+    boundaries = _with_f64_math(centers_to_boundaries)(centers)
     return cls(boundaries)
 
   def asdict(self):
@@ -409,8 +434,9 @@ def upwind_vertical_advection(
   x_diff_up = jnp.concatenate([x_diff_boundary_top, x_diff], axis=axis)
   x_diff_down = jnp.concatenate([x_diff, x_diff_boundary_bot], axis=axis)
   # tendency (i.e. r.h.s. has a negative sign).
-  return -(jnp.maximum(w_up, 0) * x_diff_up +
-           jnp.minimum(w_down, 0) * x_diff_down)
+  return -(
+      jnp.maximum(w_up, 0) * x_diff_up + jnp.minimum(w_down, 0) * x_diff_down
+  )
 
 
 # pylint: enable=invalid-name
