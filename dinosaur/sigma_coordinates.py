@@ -117,8 +117,10 @@ class SigmaCoordinates:
     return len(self.boundaries) - 1
 
   @classmethod
-  def equidistant(cls, layers: int) -> SigmaCoordinates:
-    boundaries = np.linspace(0, 1, layers + 1)
+  def equidistant(
+      cls, layers: int, dtype: np.typing.DTypeLike = np.float32
+  ) -> SigmaCoordinates:
+    boundaries = np.linspace(0, 1, layers + 1, dtype=dtype)
     return cls(boundaries)
 
   @classmethod
