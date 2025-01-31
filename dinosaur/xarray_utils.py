@@ -1041,7 +1041,10 @@ def coordinate_system_from_dataset_shape(
   else:
     raise ValueError('Dataset must provide lon/lat or longitude/latitude axes.')
   grid_cls = shape_to_grid_dict[lon.shape + lat.shape]
-  horizontal = grid_cls(latitude_spacing=infer_latitude_spacing(lat))
+  horizontal = grid_cls(
+      latitude_spacing=infer_latitude_spacing(lat),
+      radius=1.0,  # Note: only valid for NeuralGCM v1 models
+  )
   verify_grid_consistency(lon, lat, horizontal)
   if XR_LEVEL_NAME in ds:
     # we assume the default pressure coordinates for vertical discretization.

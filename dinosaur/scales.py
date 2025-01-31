@@ -41,7 +41,7 @@ RADIUS = 6.37122e6 * units.m
 ANGULAR_VELOCITY = OMEGA = 7.292e-5 / units.s
 
 # Acceleration due to gravity on Earth.
-GRAVITY_ACCELERATION = 9.80616 * units.m / units.s ** 2
+GRAVITY_ACCELERATION = 9.80616 * units.m / units.s**2
 
 # Specific heat capacity at constant pressure.
 ISOBARIC_HEAT_CAPACITY = 1004 * units.J / units.kilogram / units.degK
@@ -71,7 +71,7 @@ IDEAL_GAS_CONSTANT = ISOBARIC_HEAT_CAPACITY * KAPPA
 
 # Ideal gas constant for air with water vapor included
 # Generally approximated to 461.
-IDEAL_GAS_CONSTANT_H20 = 461. * units.J / units.kilogram / units.degK
+IDEAL_GAS_CONSTANT_H20 = 461.0 * units.J / units.kilogram / units.degK
 
 # Freezing point of Temperature in Kelvin
 # Used to convert between Kelvin and degrees Celsius
@@ -79,10 +79,10 @@ T_FREEZING = 273.15 * units.degK
 
 # Pressure of one atmosphere (standard pressure)
 # used to calculate potential temperature away from surface
-REFERENCE_PRESSURE = 101325. *units.pascal
+REFERENCE_PRESSURE = 101325.0 * units.pascal
 
 # Density of water in SI units
-WATER_DENSITY = 997 * units.kg / units.m ** 3
+WATER_DENSITY = 997 * units.kg / units.m**3
 
 #
 # Code for defining scales and non-dimensionalizing quantities.
@@ -99,8 +99,10 @@ def _get_dimension(quantity: Quantity) -> str:
   """Asserts `quantity` has a single dimension and returns that dimension."""
   exponents = list(quantity.dimensionality.values())
   if len(quantity.dimensionality) != 1 or exponents[0] != 1:
-    raise ValueError('All scales must describe a single dimension;'
-                     f'got dimensionality {quantity.dimensionality}')
+    raise ValueError(
+        'All scales must describe a single dimension;'
+        f'got dimensionality {quantity.dimensionality}'
+    )
   return str(quantity.dimensionality)
 
 
@@ -138,8 +140,8 @@ class Scale(abc.Mapping):
     ```
 
     Args:
-      *scales: `pint.Quantity`s indicating scales. The dimensionality of
-        the argument must be one of [current], [length], [luminosity], [mass],
+      *scales: `pint.Quantity`s indicating scales. The dimensionality of the
+        argument must be one of [current], [length], [luminosity], [mass],
         [printing_unit], [substance], [temperature], [time]. In particular, each
         scale must not have a 'compound' unit such as 'm / s'.
     """
@@ -160,18 +162,21 @@ class Scale(abc.Mapping):
     return len(self._scales)
 
   def __repr__(self) -> str:
-    return '\n'.join(f'{dimension}: {quantity}'
-                     for dimension, quantity in self._scales.items())
+    return '\n'.join(
+        f'{dimension}: {quantity}'
+        for dimension, quantity in self._scales.items()
+    )
 
-  def _scaling_factor(self,
-                      dimensionality: pint.util.UnitsContainer) -> Quantity:
+  def _scaling_factor(
+      self, dimensionality: pint.util.UnitsContainer
+  ) -> Quantity:
     """Returns the value used to scale quantities of given dimensionality."""
     factor = Quantity(1)
     for dimension, exponent in dimensionality.items():
       quantity = self._scales.get(dimension)
       if quantity is None:
         raise ValueError(f'No scale has been set for {dimension}.')
-      factor *= quantity ** exponent
+      factor *= quantity**exponent
     assert factor.check(dimensionality)
     return factor
 
@@ -205,13 +210,26 @@ class Scale(abc.Mapping):
     return dimensionalized.to(unit)  # pytype: disable=attribute-error  # jax-ndarray
 
 
-DEFAULT_SCALE = Scale(RADIUS,              # length
-                      1 / 2 / OMEGA,       # time
-                      1 * units.kilogram,  # mass
-                      1 * units.degK)      # temperature
+NEURALGCM_V1_SCALE = Scale(
+    RADIUS,  # length
+    1 / 2 / OMEGA,  # time
+    1 * units.kilogram,  # mass
+    1 * units.degK,  # temperature
+)
 
 ATMOSPHERIC_SCALE = Scale(
-    RADIUS,                  # length
-    1 / 2 / OMEGA,           # time
+    RADIUS,  # length
+    1 / 2 / OMEGA,  # time
     MASS_OF_DRY_ATMOSPHERE,  # mass
-    1 * units.degK)          # temperature
+    1 * units.degK,  # temperature
+)
+
+SI_SCALE = Scale(
+    1 * units.m,  # length
+    1 * units.s,  # time
+    1 * units.kilogram,  # mass
+    1 * units.degK,  # temperature
+)
+
+# TODO(shoyer): consider switching to SI_SCALE
+DEFAULT_SCALE = NEURALGCM_V1_SCALE

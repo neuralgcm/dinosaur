@@ -717,6 +717,7 @@ class Grid:
 
   def __post_init__(self):
     if self.radius is None:
+      # TODO(shoyer): consider updating this to scales.RADIUS instead
       object.__setattr__(self, 'radius', 1.0)
 
     if self.latitude_spacing not in LATITUDE_SPACINGS:
