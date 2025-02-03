@@ -73,16 +73,9 @@ IDEAL_GAS_CONSTANT = ISOBARIC_HEAT_CAPACITY * KAPPA
 # Generally approximated to 461.
 IDEAL_GAS_CONSTANT_H20 = 461.0 * units.J / units.kilogram / units.degK
 
-# Freezing point of Temperature in Kelvin
-# Used to convert between Kelvin and degrees Celsius
-T_FREEZING = 273.15 * units.degK
-
-# Pressure of one atmosphere (standard pressure)
-# used to calculate potential temperature away from surface
-REFERENCE_PRESSURE = 101325.0 * units.pascal
-
-# Density of water in SI units
+# Density of liquid water.
 WATER_DENSITY = 997 * units.kg / units.m**3
+
 
 #
 # Code for defining scales and non-dimensionalizing quantities.

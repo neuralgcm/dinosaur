@@ -42,14 +42,6 @@ Quantity = typing.Quantity
 
 OrographyInitFn = Callable[..., Array]
 
-SCALE = scales.DEFAULT_SCALE
-GRAVITY_ACCELERATION = SCALE.nondimensionalize(scales.GRAVITY_ACCELERATION)
-IDEAL_GAS_CONSTANT = SCALE.nondimensionalize(scales.IDEAL_GAS_CONSTANT)
-WATER_VAPOR_GAS_CONSTANT = SCALE.nondimensionalize(
-    scales.IDEAL_GAS_CONSTANT_H20
-)
-WATER_VAPOR_CP = SCALE.nondimensionalize(scales.WATER_VAPOR_CP)
-KAPPA = SCALE.nondimensionalize(scales.KAPPA)
 
 # All `einsum`s should be done at highest available precision.
 einsum = functools.partial(jnp.einsum, precision=jax.lax.Precision.HIGHEST)
@@ -86,6 +78,7 @@ def _asdict(state: State) -> dict[str, Any]:
       for field in state.fields
       if field.name != 'sim_time' or state.sim_time is not None
   }
+
 
 State.asdict = _asdict
 
@@ -271,9 +264,7 @@ def semi_lagrangian_vertical_advection_step(
 
 @dataclasses.dataclass(frozen=True)
 class PrimitiveEquationsSpecs:
-  """Records scales and physical constants used in the primitive equations.
-
-  By default uses units in which the radius and angular_velocity are set to `1`.
+  """Physical constants and scale used in the primitive equations.
 
   Attributes:
     radius: the non-dimensionalized radius of the domain.
@@ -359,7 +350,12 @@ class PrimitiveEquationsSpecs:
       kappa_si: Quantity = scales.KAPPA,
       scale: scales.ScaleProtocol = scales.DEFAULT_SCALE,
   ) -> PrimitiveEquationsSpecs:
-    """Constructs `PrimitiveEquantionSpecs` from SI constants."""
+    # pylint: disable=g-doc-args,g-doc-return-or-yield
+    """Constructs `PrimitiveEquantionSpecs` from constants with units.
+
+    By default uses units in which the radius and angular_velocity are set to
+    one.
+    """
     return cls(
         scale.nondimensionalize(radius_si),
         scale.nondimensionalize(angular_velocity_si),
@@ -370,6 +366,7 @@ class PrimitiveEquationsSpecs:
         scale.nondimensionalize(kappa_si),
         scale,
     )
+
 
 
 #  =============================================================================
@@ -405,7 +402,7 @@ def get_sigma_ratios(
 
 def get_geopotential_weights(
     coordinates: sigma_coordinates.SigmaCoordinates,
-    ideal_gas_constant: float = IDEAL_GAS_CONSTANT,
+    ideal_gas_constant: float,
 ) -> np.ndarray:
   """Returns a matrix of weights used to compute the geopotential.
 
@@ -441,7 +438,7 @@ def get_geopotential_weights(
 def get_geopotential_diff(
     temperature: Array,
     coordinates: sigma_coordinates.SigmaCoordinates,
-    ideal_gas_constant: float = IDEAL_GAS_CONSTANT,
+    ideal_gas_constant: float,
     method: str = 'dense',
     sharding: jax.sharding.NamedSharding | None = None,
 ) -> jax.Array:
@@ -479,8 +476,8 @@ def get_geopotential(
     reference_temperature: Array,
     orography: Array,
     coordinates: sigma_coordinates.SigmaCoordinates,
-    gravity_acceleration: float = GRAVITY_ACCELERATION,
-    ideal_gas_constant: float = IDEAL_GAS_CONSTANT,
+    gravity_acceleration: float,
+    ideal_gas_constant: float,
     sharding: jax.sharding.NamedSharding | None = None,
 ) -> jnp.ndarray:
   """Computes geopotential at sigma values determined by `coordinates`.
@@ -517,9 +514,9 @@ def get_geopotential_with_moisture(
     specific_humidity: typing.Array,
     nodal_orography: typing.Array,
     coordinates: sigma_coordinates.SigmaCoordinates,
-    gravity_acceleration: float = GRAVITY_ACCELERATION,
-    ideal_gas_constant: float = IDEAL_GAS_CONSTANT,
-    water_vapor_gas_constant: float = WATER_VAPOR_GAS_CONSTANT,
+    gravity_acceleration: float,
+    ideal_gas_constant: float,
+    water_vapor_gas_constant: float,
     sharding: jax.sharding.NamedSharding | None = None,
 ) -> jnp.ndarray:
   """Computes geopotential in nodal space using nodal temperature and `q`."""
@@ -535,7 +532,7 @@ def get_geopotential_with_moisture(
 def get_temperature_implicit_weights(
     coordinates: sigma_coordinates.SigmaCoordinates,
     reference_temperature: np.ndarray,
-    kappa: float = KAPPA,
+    kappa: float,
 ) -> np.ndarray:
   """Returns weights used to compute implicit terms for the temperature.
 
@@ -622,7 +619,7 @@ def get_temperature_implicit(
     divergence: Array,
     coordinates: sigma_coordinates.SigmaCoordinates,
     reference_temperature: np.ndarray,
-    kappa: float = KAPPA,
+    kappa: float,
     method: str = 'dense',
     sharding: jax.sharding.NamedSharding | None = None,
 ) -> jax.Array:
@@ -676,11 +673,7 @@ def _vertical_matvec_per_wavenumber(a: Array, x: Array) -> jax.Array:
 
 
 def _get_implicit_term_matrix(
-    eta,
-    coords,
-    reference_temperature,
-    kappa=KAPPA,
-    ideal_gas_constant=IDEAL_GAS_CONSTANT,
+    eta, coords, reference_temperature, kappa, ideal_gas_constant
 ) -> np.ndarray:
   """Returns a matrix corresponding to `PrimitiveEquations.implicit_terms`."""
 
@@ -833,6 +826,15 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
       sigma_coordinates.centered_vertical_advection
   )
   include_vertical_advection: bool = True
+
+  def __post_init__(self):
+    if not np.allclose(
+        self.coords.horizontal.radius, self.physics_specs.radius, rtol=1e-5
+    ):
+      raise ValueError(
+          'inconsistent radius between coordinates and constants: '
+          f'{self.coords.horizontal.radius=} != {self.physics_specs.radius=}'
+      )
 
   @property
   def coriolis_parameter(self) -> Array:

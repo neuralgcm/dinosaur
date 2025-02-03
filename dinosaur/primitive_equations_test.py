@@ -157,6 +157,8 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
               aux_features[xarray_utils.REF_TEMP_KEY],
               modal_orography,
               coords.vertical,
+              physics_specs.gravity_acceleration,
+              physics_specs.ideal_gas_constant,
           )
       )
       np.testing.assert_allclose(actual, expected_geopotential, atol=atol)
@@ -167,7 +169,10 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
       specific_humidity = jnp.zeros_like(temperature)
       nodal_orography = coords.horizontal.to_nodal(modal_orography)
       actual = primitive_equations.get_geopotential_with_moisture(
-          temperature, specific_humidity, nodal_orography, coords.vertical
+          temperature, specific_humidity, nodal_orography, coords.vertical,
+          physics_specs.gravity_acceleration,
+          physics_specs.ideal_gas_constant,
+          physics_specs.water_vapor_gas_constant,
       )
       np.testing.assert_allclose(actual, expected_geopotential, atol=atol)
 
@@ -402,11 +407,12 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
   def test_get_temperature_implicit_both_ways(self, reference_temperature):
     divergence = np.random.RandomState(0).randn(5, 1, 1)
     coordinates = sigma_coordinates.SigmaCoordinates.equidistant(5)
+    kappa = 2 / 7
     result_matvec = primitive_equations.get_temperature_implicit(
-        divergence, coordinates, reference_temperature, method='dense'
+        divergence, coordinates, reference_temperature, kappa, method='dense'
     )
     result_cumsum = primitive_equations.get_temperature_implicit(
-        divergence, coordinates, reference_temperature, method='sparse'
+        divergence, coordinates, reference_temperature, kappa, method='sparse'
     )
     np.testing.assert_allclose(result_matvec, result_cumsum, atol=1e-5)
 

@@ -237,7 +237,7 @@ class ShallowWaterTest(parameterized.TestCase):
     vertical_grid = layer_coordinates.LayerCoordinates(layers)
     coords = coordinate_systems.CoordinateSystem(grid, vertical_grid)
     physics_specs = shallow_water.ShallowWaterSpecs.from_si(
-        density * scales.WATER_DENSITY)
+        densities=density * scales.WATER_DENSITY)
 
     # Construct initial state.
     max_v = physics_specs.nondimensionalize(max_velocity)

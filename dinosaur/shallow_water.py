@@ -25,7 +25,6 @@ from dinosaur import scales
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
 from dinosaur import typing
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -58,6 +57,7 @@ einsum = functools.partial(jnp.einsum, precision=jax.lax.Precision.HIGHEST)
 @tree_math.struct
 class State:
   """Records the state of a system described by the shallow water equations."""
+
   vorticity: Array
   divergence: Array
   potential: Array
@@ -65,9 +65,7 @@ class State:
 
 @dataclasses.dataclass(frozen=True)
 class ShallowWaterSpecs:
-  """Records scales and physical constants used in the shallow water equations.
-
-  By default uses units in which the radius and angular_velocity are set to `1`.
+  """Physical constants and scale used in the shallow water equations.
 
   Attributes:
     densities: a non-decreasing vector of densities, starting from the top.
@@ -79,6 +77,7 @@ class ShallowWaterSpecs:
     scale: an instance implementing `ScaleProtocol` that will be used to
       (non-)dimensionalize quantities.
   """
+
   densities: Array
   radius: float
   angular_velocity: float
@@ -105,13 +104,19 @@ class ShallowWaterSpecs:
 
   @classmethod
   def from_si(
-      cls: Type[ShallowWaterSpecs],
+      cls,
       densities: Quantity = np.ones(1) * scales.WATER_DENSITY,
       radius_si: Quantity = scales.RADIUS,
       angular_velocity_si: Quantity = scales.ANGULAR_VELOCITY,
       gravity_acceleration_si: Quantity = scales.GRAVITY_ACCELERATION,
-      scale: scales.ScaleProtocol = scales.DEFAULT_SCALE) -> ShallowWaterSpecs:
-    """Constructs `ShallowWaterSpecs` from SI constants."""
+      scale: scales.ScaleProtocol = scales.DEFAULT_SCALE,
+  ) -> ShallowWaterSpecs:
+    # pylint: disable=g-doc-args,g-doc-return-or-yield
+    """Constructs `ShallowWaterSpecs` from constants with units.
+
+    By default uses units in which the radius and angular_velocity are set to
+    one.
+    """
     return cls(scale.nondimensionalize(densities),
                scale.nondimensionalize(radius_si),
                scale.nondimensionalize(angular_velocity_si),
@@ -129,8 +134,7 @@ class ShallowWaterSpecs:
 
 def state_to_nodal(state: State, grid: spherical_harmonic.Grid) -> State:
   """Converts a state to the spatial/nodal basis."""
-  return jax.tree.map(
-      lambda x: grid.to_nodal(grid.clip_wavenumbers(x)), state)
+  return jax.tree.map(lambda x: grid.to_nodal(grid.clip_wavenumbers(x)), state)
 
 
 def state_to_modal(state: State, grid: spherical_harmonic.Grid) -> State:
@@ -184,6 +188,7 @@ class ShallowWaterEquations(time_integration.ImplicitExplicitODE):
       describing the topography.
     reference_potential: an array of shape [layers] holding mean geopotential.
   """
+
   coords: coordinate_systems.CoordinateSystem
   physics_specs: ShallowWaterSpecs
   orography: Array
@@ -208,8 +213,11 @@ class ShallowWaterEquations(time_integration.ImplicitExplicitODE):
   def explicit_terms(self, state: State) -> State:
     """Computes explicit tendencies of the shallow water equations."""
     # we stack two components of the velocity to transform them together.
-    u = jnp.stack(spherical_harmonic.get_cos_lat_vector(
-        state.vorticity, state.divergence, self.coords.horizontal))
+    u = jnp.stack(
+        spherical_harmonic.get_cos_lat_vector(
+            state.vorticity, state.divergence, self.coords.horizontal
+        )
+    )
 
     # Switch to physical coordinates for spatial point-wise operations
     nodal_u = self.coords.horizontal.to_nodal(u)
@@ -224,16 +232,15 @@ class ShallowWaterEquations(time_integration.ImplicitExplicitODE):
 
     # Stack and unstack values to perform a single transform
     bge_nodal = jnp.concatenate(
-        [nodal_b, nodal_g, jnp.expand_dims(nodal_e, axis=0)], axis=0)
+        [nodal_b, nodal_g, jnp.expand_dims(nodal_e, axis=0)], axis=0
+    )
     bge = self.coords.horizontal.to_modal(bge_nodal)
     b, g, e = jnp.split(bge, [2, 4], axis=0)
     e = jnp.squeeze(e, axis=0)
 
     # Pressure gradients are computed as weighted sums across layers.
     # Note that this is the only interaction between layers.
-    p = einsum('ab,...bml->...aml',
-               self.density_ratios,
-               state.potential)
+    p = einsum('ab,...bml->...aml', self.density_ratios, state.potential)
     if self.orography is not None:
       p = p + self.orography
 
@@ -241,8 +248,8 @@ class ShallowWaterEquations(time_integration.ImplicitExplicitODE):
         -self.coords.horizontal.div_cos_lat(b)
     )
     explicit_divergence = self.coords.horizontal.clip_wavenumbers(
-        -self.coords.horizontal.laplacian(p + e) +
-        self.coords.horizontal.curl_cos_lat(b)
+        -self.coords.horizontal.laplacian(p + e)
+        + self.coords.horizontal.curl_cos_lat(b)
     )
     explicit_potential = self.coords.horizontal.clip_wavenumbers(
         -self.coords.horizontal.div_cos_lat(g)
@@ -254,22 +261,28 @@ class ShallowWaterEquations(time_integration.ImplicitExplicitODE):
     return State(
         vorticity=jnp.zeros_like(state.vorticity),
         divergence=-self.coords.horizontal.laplacian(state.potential),
-        potential=-self.ref_potential * state.divergence)
+        potential=-self.ref_potential * state.divergence,
+    )
 
   def implicit_inverse(self, state: State, step_size: float) -> State:
     """Computes the inverse `(1 - step_size * implicit_terms)⁻¹."""
     inverse_schur_complement = 1 / (
-        1 - step_size ** 2 * self.ref_potential *
-        self.coords.horizontal.laplacian_eigenvalues)
+        1
+        - step_size**2
+        * self.ref_potential
+        * self.coords.horizontal.laplacian_eigenvalues
+    )
     return State(
         vorticity=state.vorticity,
-        divergence=inverse_schur_complement * (
-            state.divergence -
-            step_size * self.coords.horizontal.laplacian(state.potential)
+        divergence=inverse_schur_complement
+        * (
+            state.divergence
+            - step_size * self.coords.horizontal.laplacian(state.potential)
         ),
-        potential=inverse_schur_complement * (
+        potential=inverse_schur_complement
+        * (
             -step_size * self.ref_potential * state.divergence + state.potential
-        )
+        ),
     )
 
 
@@ -279,7 +292,7 @@ def shallow_water_leapfrog_step(
     physics_specs: ShallowWaterSpecs,
     mean_potential: np.ndarray,
     orography: Array | None = None,
-    alpha: float = 0.5
+    alpha: float = 0.5,
 ) -> typing.TimeStepFn:
   """Returns a step function based on semi-implicit leapfrog integrator.
 
@@ -290,17 +303,19 @@ def shallow_water_leapfrog_step(
       physical constants used in the primitive equations.
     mean_potential: a vector of mean geopotentials g · h for each layer,
       starting from the top.
-    orography: the geopotential g · h corresponding to the orography
-      underlying the simulation. Must be in the spectral/modal basis.
+    orography: the geopotential g · h corresponding to the orography underlying
+      the simulation. Must be in the spectral/modal basis.
     alpha: a parameter used to weight previous and future terms in the implicit
       portion of the equation: `f_i(alpha * future + (1 - alpha) * previous)`
+
   Returns:
     A function that computes a single time step of the shallow water equations.
     The returned function takes `state_0` and `state_1` states and returns the
     next state.
   """
   shallow_water_ode = ShallowWaterEquations(
-      coords, physics_specs, orography, mean_potential)
+      coords, physics_specs, orography, mean_potential
+  )
   return time_integration.semi_implicit_leapfrog(shallow_water_ode, dt, alpha)
 
 
@@ -317,11 +332,13 @@ def shallow_water_leapfrog_trajectory(
 ) -> typing.TrajectoryFn:
   """Returns a trajectory function for shallow water equations."""
   step_fn = shallow_water_leapfrog_step(
-      coords, dt, physics_specs, mean_potential, orography, alpha)
+      coords, dt, physics_specs, mean_potential, orography, alpha
+  )
   step_fn = time_integration.step_with_filters(step_fn, filters)
   post_process_fn = lambda x: x[0]
   trajectory_fn = time_integration.trajectory_from_step(
-      step_fn, outer_steps, inner_steps, post_process_fn=post_process_fn)
+      step_fn, outer_steps, inner_steps, post_process_fn=post_process_fn
+  )
   return trajectory_fn
 
 
