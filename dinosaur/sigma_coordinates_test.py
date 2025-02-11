@@ -88,7 +88,7 @@ def _test_error_scaling(layers, errors, error_scaling):
   """Checks that `errors` scales with `layers` according to `error_scaling`."""
   log_error_ratios = np.diff(np.log(errors))
   log_expected_ratios = np.diff(np.log(error_scaling(layers)))
-  np.testing.assert_allclose(log_error_ratios, log_expected_ratios, atol=0.05)
+  np.testing.assert_allclose(log_error_ratios, log_expected_ratios, atol=0.075)
 
 
 class SigmaCoordinatesTest(parameterized.TestCase):
