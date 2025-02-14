@@ -393,6 +393,40 @@ def interp_sigma_to_pressure(
   return pytree_utils.tree_map_over_nonscalars(regrid, fields)
 
 
+def interp_sigma_to_sigma(
+    fields: typing.Pytree,
+    source_sigma: sigma_coordinates.SigmaCoordinates,
+    target_sigma: sigma_coordinates.SigmaCoordinates,
+    interpolate_fn: InterpolateFn = vertical_interpolation,
+) -> typing.Pytree:
+  """Interpolate 3D fields from source to target sigma levels."""
+  # inerpolate_fn operates on `x, xp, fp` (target, source loc, source vals).
+  # vmap over spatial axes for targets and source values.
+  interpolate_fn = jax.vmap(interpolate_fn, (None, None, -1), out_axes=-1)
+  interpolate_fn = jax.vmap(interpolate_fn, (None, None, -1), out_axes=-1)
+  # vmap over multiple vertical targets.
+  interpolate_fn = jax.vmap(interpolate_fn, (0, None, None), out_axes=0)
+  # vectorize leading dimensions.
+  interpolate_fn = jnp.vectorize(
+      interpolate_fn, signature='(a),(b),(b,x,y)->(a,x,y)'
+  )
+
+  regrid = lambda x: interpolate_fn(
+      target_sigma.centers, source_sigma.centers, x #currently I have an error
+  )
+
+  def cond_fn(x) -> bool:
+    x = jnp.asarray(x)
+    return x.ndim > 2
+
+  return pytree_utils.tree_map_where(
+      condition_fn=cond_fn,
+      f=regrid,
+      g=lambda x: x,
+      x=fields,
+  )
+
+
 @functools.partial(jax.jit, static_argnums=(1, 2))
 def interp_hybrid_to_sigma(
     fields: typing.Pytree,

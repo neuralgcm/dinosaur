@@ -96,6 +96,26 @@ class PressureLevelsTest(parameterized.TestCase):
     expected[3:, :, 1] = np.nan
     np.testing.assert_allclose(roundtripped, expected, atol=1e-6)
 
+  def test_interp_sigma_to_sigma(self):
+    source_sigma_coords = sigma_coordinates.SigmaCoordinates(
+        np.array([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    )
+    target_sigma_coords = sigma_coordinates.SigmaCoordinates(
+        np.array([0.0, 0.2, 0.3, 0.5, 0.7, 1.0])
+    )
+    field_value = np.array([1.0, 2.0, 4.0, 6.0, 8.0])
+    field_value = field_value[:, np.newaxis, np.newaxis]
+    fields = {'temperature': field_value}
+    expected_value = jnp.array([1, 1.75, 3, 5, 7.5])
+    expected_value = expected_value[:, np.newaxis, np.newaxis]
+    expected = {'temperature': expected_value}
+    actual = vertical_interpolation.interp_sigma_to_sigma(
+        fields,
+        source_sigma_coords,
+        target_sigma_coords,
+    )
+    np.testing.assert_allclose(actual['temperature'], expected['temperature'], atol=1e-6)
+
 
 class HybridCoordinatesTest(absltest.TestCase):
 

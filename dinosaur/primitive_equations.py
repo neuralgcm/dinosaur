@@ -518,11 +518,16 @@ def get_geopotential_with_moisture(
     ideal_gas_constant: float,
     water_vapor_gas_constant: float,
     sharding: jax.sharding.NamedSharding | None = None,
+    clouds: typing.Array | None = None,
 ) -> jnp.ndarray:
   """Computes geopotential in nodal space using nodal temperature and `q`."""
   gas_const_ratio = water_vapor_gas_constant / ideal_gas_constant
   surface_geopotential = nodal_orography * gravity_acceleration
-  virtual_temp = temperature * (1 + (gas_const_ratio - 1) * specific_humidity)
+  if clouds is None:
+    clouds = 0.0
+  virtual_temp = temperature * (
+      1 + (gas_const_ratio - 1) * specific_humidity - clouds
+  )
   geopotential_diff = get_geopotential_diff(
       virtual_temp, coordinates, ideal_gas_constant, sharding=sharding
   )
