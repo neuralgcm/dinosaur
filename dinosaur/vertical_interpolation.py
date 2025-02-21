@@ -200,6 +200,17 @@ class HybridCoordinates:
     assert 100 < a.max() < 1000
     return cls(a_boundaries=a, b_boundaries=b)
 
+
+  @classmethod
+  def GEOS72(cls) -> HybridCoordinates:  # pylint: disable=invalid-name
+    """Returns the 72 model levels used by NASA GEOS (e.g., in MERRA-2).
+
+    Pressure is returned in units of hPa.
+
+    For details, see the NASA MERRA documentation
+    """
+    return cls._from_resource_csv('data/geos72_hybrid_levels.csv')
+
   @classmethod
   def ECMWF137(cls) -> HybridCoordinates:  # pylint: disable=invalid-name
     """Returns the 137 model levels used by ECMWF's IFS (e.g., in ERA5).
