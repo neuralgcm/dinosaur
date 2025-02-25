@@ -169,7 +169,10 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
       specific_humidity = jnp.zeros_like(temperature)
       nodal_orography = coords.horizontal.to_nodal(modal_orography)
       actual = primitive_equations.get_geopotential_with_moisture(
-          temperature, specific_humidity, nodal_orography, coords.vertical,
+          temperature,
+          specific_humidity,
+          nodal_orography,
+          coords.vertical,
           physics_specs.gravity_acceleration,
           physics_specs.ideal_gas_constant,
           physics_specs.water_vapor_gas_constant,
@@ -576,7 +579,7 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
           kappa=1.4 * units.dimensionless,
           ideal_gas_constant=33 * units.J / units.kilogram / units.degK,
           step_size=0.3,
-          method='split',
+          implicit_inverse_method='split',
           seed=0,
       ),
       dict(
@@ -586,7 +589,7 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
           kappa=1.4 * units.dimensionless,
           ideal_gas_constant=33 * units.J / units.kilogram / units.degK,
           step_size=0.3,
-          method='blockwise',
+          implicit_inverse_method='blockwise',
           seed=0,
       ),
       dict(
@@ -596,7 +599,7 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
           kappa=1.4 * units.dimensionless,
           ideal_gas_constant=33 * units.J / units.kilogram / units.degK,
           step_size=0.3,
-          method='stacked',
+          implicit_inverse_method='stacked',
           seed=0,
       ),
       dict(
@@ -606,7 +609,7 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
           kappa=111 * units.dimensionless,
           ideal_gas_constant=1 * units.J / units.kilogram / units.degK,
           step_size=0.1,
-          method='split',
+          implicit_inverse_method='split',
           seed=1,
       ),
   )
@@ -618,7 +621,7 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
       kappa,
       ideal_gas_constant,
       step_size,
-      method,
+      implicit_inverse_method,
       seed,
   ):
     """`primitive_inverse` computes (1 - step_size · primitive_implicit)⁻¹."""
@@ -630,7 +633,11 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
     l, _ = coords.horizontal.modal_mesh
     modal_orography = np.zeros_like(l)
     primitive = primitive_equations.PrimitiveEquations(
-        reference_temperature, modal_orography, coords, physics_specs
+        reference_temperature,
+        modal_orography,
+        coords,
+        physics_specs,
+        implicit_inverse_method=implicit_inverse_method,
     )
     implicit_terms = primitive.implicit_terms(state)
     primitive_equations.validate_state_shape(implicit_terms, coords)
@@ -641,9 +648,7 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
         jitted_inverse = jax.jit(lambda s, t: primitive.implicit_inverse(s, t))  # pylint: disable=unnecessary-lambda
         _ = jitted_inverse(state - step_size * implicit_terms, step_size)
 
-    jitted_inverse = jax.jit(
-        lambda s: primitive.implicit_inverse(s, step_size, method)
-    )
+    jitted_inverse = jax.jit(lambda s: primitive.implicit_inverse(s, step_size))
     inverted_state = jitted_inverse(state - step_size * implicit_terms)
     primitive_equations.validate_state_shape(inverted_state, coords)
     assert_states_close(state, inverted_state, atol=1e-5)

@@ -368,7 +368,6 @@ class PrimitiveEquationsSpecs:
     )
 
 
-
 #  =============================================================================
 #  Helper Functions
 #
@@ -818,19 +817,31 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
       geopotential and temperature terms. 'sparse' uses a matrix-free
       calculation involving `cumsum`, and is faster only when the calculation
       uses vertical sharding.
+    implicit_inverse_method: 'split', 'stacked' or 'blockwise' method to use for
+      the implicit inverse calculation.
     vertical_advection: function to use for calculating tendencies from vertical
       advection.
+    include_vertical_advection: whether to include tendencies from vertical
+      advection or to drop it.
   """
 
   reference_temperature: np.ndarray
   orography: Array
   coords: coordinate_systems.CoordinateSystem
   physics_specs: PrimitiveEquationsSpecs
-  vertical_matmul_method: str | None = None
-  vertical_advection: Callable[..., jax.Array] = (
-      sigma_coordinates.centered_vertical_advection
+
+  vertical_matmul_method: str | None = dataclasses.field(
+      default=None, kw_only=True
   )
-  include_vertical_advection: bool = True
+  implicit_inverse_method: str = dataclasses.field(
+      default='split', kw_only=True
+  )
+  vertical_advection: Callable[..., jax.Array] = dataclasses.field(
+      default=sigma_coordinates.centered_vertical_advection, kw_only=True
+  )
+  include_vertical_advection: bool = dataclasses.field(
+      default=True, kw_only=True
+  )
 
   def __post_init__(self):
     if not np.allclose(
@@ -1135,20 +1146,12 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
     )
 
   @jax.named_call
-  def implicit_inverse(
-      self,
-      state: State,
-      step_size: float,
-      method: str = 'split',
-  ) -> State:
+  def implicit_inverse(self, state: State, step_size: float) -> State:
     """Computes the inverse `(1 - step_size * implicit_terms)⁻¹.
 
     Args:
       state: the `State` to which the inverse will be applied.
       step_size: a value that depends on the choice of time integration method.
-      method: 'split', 'stacked' or 'blockwise' method to use for this
-        calculation. 'blockwise' may be faster than the default 'split' in cases
-        where vertical matrix-vector products are expensive.
 
     Returns:
       The result of applying `(1 - step_size * implicit_terms)⁻¹.
@@ -1183,7 +1186,7 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
     def named_vertical_matvec(name):
       return jax.named_call(_vertical_matvec_per_wavenumber, name=name)
 
-    if method == 'split':
+    if self.implicit_inverse_method == 'split':
       # Directly invert the implicit matrix, and apply vertical matrix-vector
       # products to each term. This is the fastest method in the unsharded case.
       inverse = np.linalg.inv(implicit_matrix)
@@ -1223,7 +1226,7 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
           )
       )
 
-    elif method == 'stacked':
+    elif self.implicit_inverse_method == 'stacked':
       # Apply the matrix inverse once to concatenated inputs, then split.
       # This version exists mostly for pedagogical reasons. Numerically it is
       # doing the same calculation as 'split', but it turns out to be slower on
@@ -1240,7 +1243,7 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
       inverted_temperature_variation = stacked_inverse[temp]
       inverted_log_surface_pressure = stacked_inverse[logp]
 
-    elif method == 'blockwise':
+    elif self.implicit_inverse_method == 'blockwise':
       # Use blockwise matrix inversion to reduce the number of matrix-vector
       # products. This is potentially faster in cases where matrix-vector
       # products are expensive, such as in the case of sharding across vertical
@@ -1335,7 +1338,9 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
           temp_logp_inverse[:, -1:, -1:], logp_part
       )
     else:
-      raise ValueError(f'invalid {method=}')
+      raise ValueError(
+          f'invalid implicit_inverse_method {self.implicit_inverse_method}'
+      )
 
     inverted_vorticity = state.vorticity
     inverted_tracers = state.tracers
