@@ -18,7 +18,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import importlib
-from typing import Any, Callable, Dict, Sequence, Union
+from typing import Any, Callable, Dict, Sequence, TypeVar, Union
 
 import dinosaur
 from dinosaur import pytree_utils
@@ -393,14 +393,21 @@ def interp_sigma_to_pressure(
   return pytree_utils.tree_map_over_nonscalars(regrid, fields)
 
 
-def interp_sigma_to_sigma(
+SigmaOrPressure = TypeVar(
+    'SigmaOrPressure',
+    sigma_coordinates.SigmaCoordinates,
+    PressureCoordinates,
+)
+
+
+def _interp_centers_to_centers(
     fields: typing.Pytree,
-    source_sigma: sigma_coordinates.SigmaCoordinates,
-    target_sigma: sigma_coordinates.SigmaCoordinates,
+    source_sigma: SigmaOrPressure,
+    target_sigma: SigmaOrPressure,
     interpolate_fn: InterpolateFn = vertical_interpolation,
 ) -> typing.Pytree:
-  """Interpolate 3D fields from source to target sigma levels."""
-  # inerpolate_fn operates on `x, xp, fp` (target, source loc, source vals).
+  """Interpolate 3D fields on either sigma or pressure coordinates."""
+  # interpolate_fn operates on `x, xp, fp` (target, source loc, source vals).
   # vmap over spatial axes for targets and source values.
   interpolate_fn = jax.vmap(interpolate_fn, (None, None, -1), out_axes=-1)
   interpolate_fn = jax.vmap(interpolate_fn, (None, None, -1), out_axes=-1)
@@ -412,7 +419,7 @@ def interp_sigma_to_sigma(
   )
 
   regrid = lambda x: interpolate_fn(
-      target_sigma.centers, source_sigma.centers, x #currently I have an error
+      target_sigma.centers, source_sigma.centers, x  # currently I have an error
   )
 
   def cond_fn(x) -> bool:
@@ -425,6 +432,10 @@ def interp_sigma_to_sigma(
       g=lambda x: x,
       x=fields,
   )
+
+
+interp_sigma_to_sigma = _interp_centers_to_centers
+interp_pressure_to_pressure = _interp_centers_to_centers
 
 
 @functools.partial(jax.jit, static_argnums=(1, 2))
@@ -530,11 +541,11 @@ class Regridder:
   """Regrid vertically, from hybrid to sigma coordinates."""
 
   # TODO(shoyer): support more generic vertical coordinate systems.
-  source_grid: HybridCoordinates
-  target_grid: sigma_coordinates.SigmaCoordinates
+  source_grid: HybridCoordinates | PressureCoordinates
+  target_grid: sigma_coordinates.SigmaCoordinates | PressureCoordinates
 
   def __call__(
-      self, field: typing.Array, surface_pressure: typing.Array
+      self, field: typing.Array, surface_pressure: typing.Array | None
   ) -> jnp.ndarray:
     raise NotImplementedError
 
@@ -544,8 +555,12 @@ class ConservativeRegridder(Regridder):
   """Regrid with conservative interpolation."""
 
   def __call__(
-      self, field: typing.Array, surface_pressure: typing.Array
+      self, field: typing.Array, surface_pressure: typing.Array | None
   ) -> jnp.ndarray:
+    if surface_pressure is None:
+      raise ValueError(
+          'surface_pressure is required for hybrid to sigma regridding'
+      )
     return regrid_hybrid_to_sigma(
         field, self.source_grid, self.target_grid, surface_pressure
     )
@@ -556,8 +571,26 @@ class BilinearRegridder(Regridder):
   """Regrid with bilinear interpolation."""
 
   def __call__(
-      self, field: typing.Array, surface_pressure: typing.Array
+      self, field: typing.Array, surface_pressure: typing.Array | None
   ) -> jnp.ndarray:
-    return interp_hybrid_to_sigma(
-        field, self.source_grid, self.target_grid, surface_pressure
-    )
+    if isinstance(self.source_grid, HybridCoordinates) and isinstance(
+        self.target_grid, sigma_coordinates.SigmaCoordinates
+    ):
+      if surface_pressure is None:
+        raise ValueError(
+            'surface_pressure is required for hybrid to sigma regridding'
+        )
+      return interp_hybrid_to_sigma(
+          field, self.source_grid, self.target_grid, surface_pressure
+      )
+    elif isinstance(self.source_grid, PressureCoordinates) and isinstance(
+        self.target_grid, PressureCoordinates
+    ):
+      return interp_pressure_to_pressure(
+          field, self.source_grid, self.target_grid
+      )
+    else:
+      raise ValueError(
+          f'Unsupported source grid type: {type(self.source_grid)} '
+          f'and target grid type: {type(self.target_grid)}'
+      )

@@ -812,7 +812,7 @@ class XarrayUtilsTest(parameterized.TestCase):
 
       regridder = regridder_cls(old_coords, new_coords)
       ds_regridded = xarray_utils.regrid_vertical(
-          ds, surface_pressure, regridder, dim='z'
+          ds, surface_pressure, regridder, in_dim='z', out_dim='sigma'
       )
 
       expected_sizes = {'sigma': 4, 'longitude': 10, 'latitude': 12}
@@ -830,7 +830,7 @@ class XarrayUtilsTest(parameterized.TestCase):
       })
       regridder = regridder_cls(old_coords, new_coords)
       ds_regridded = xarray_utils.regrid_vertical(
-          ds, surface_pressure, regridder, dim='z'
+          ds, surface_pressure, regridder, in_dim='z', out_dim='sigma'
       )
       expected_sizes = {'time': 2, 'sigma': 4, 'longitude': 10, 'latitude': 12}
       self.assertEqual(ds_regridded.sizes, expected_sizes)

@@ -264,16 +264,56 @@ def get_regrid_func(
   ) -> tuple[xarray_beam.Key, xarray.Dataset]:
 
     if 'level' in chunk.dims and vertical_regridder is not None:
-      surface_pressure = chunk.coords['surface_pressure']
-      assert surface_pressure.attrs['units'] == 'Pa', surface_pressure.attrs
-      surface_pressure_in_hPa = surface_pressure / 100  # pylint: disable=invalid-name
-      chunk = chunk.drop_vars('surface_pressure')
-      chunk = xarray_utils.regrid_vertical(
-          chunk, surface_pressure_in_hPa, vertical_regridder, dim='level'
-      )
-      # vertical regridding (currently) maps from hybrid to sigma coordinates
-      assert 'level' not in chunk.dims and 'sigma' in chunk.dims
-      key = key.with_offsets(level=None, sigma=0)  # no vertical chunking
+      match (
+          vertical_regridder.source_grid,
+          vertical_regridder.target_grid,
+      ):
+        case (
+            vertical_interpolation.HybridCoordinates(),
+            sigma_coordinates.SigmaCoordinates(),
+        ):
+          surface_pressure = chunk.coords['surface_pressure']
+          if surface_pressure.attrs.get('units') != 'Pa':
+            raise ValueError(
+                f'surface_pressure units must be "Pa", but got '
+                f'{surface_pressure.attrs.get("units")=}'
+            )
+          surface_pressure_in_hPa = surface_pressure / 100  # pylint: disable=invalid-name
+          chunk = chunk.drop_vars('surface_pressure')
+          chunk = xarray_utils.regrid_vertical(
+              chunk,
+              surface_pressure_in_hPa,
+              vertical_regridder,
+              in_dim='level',
+              out_dim='sigma',
+          )
+          # Switch dimension name from 'level' to 'sigma'.
+          assert 'level' not in chunk.dims and 'sigma' in chunk.dims
+          key = key.with_offsets(level=None, sigma=0)  # no vertical chunking
+
+        case (
+            vertical_interpolation.PressureCoordinates(),
+            vertical_interpolation.PressureCoordinates(),
+        ):
+          # Surface pressure is not needed for pressure-to-pressure
+          # interpolation.
+          chunk = xarray_utils.regrid_vertical(
+              chunk,
+              surface_pressure=None,
+              regridder=vertical_regridder,
+              in_dim='level',
+              out_dim='level',
+          )
+          # Vertical dimension name remains 'level'.
+          assert 'sigma' not in chunk.dims and 'level' in chunk.dims
+          key = key.with_offsets(level=0)  # keep level, no vertical chunking
+
+        case _:
+          raise ValueError(
+              'Unsupported vertical regridding combination: '
+              f'source={type(vertical_regridder.source_grid)}, '
+              f'target={type(vertical_regridder.target_grid)}'
+          )
 
     chunk = xarray_utils.regrid_horizontal(chunk, horizontal_regridder)
     return key, chunk
@@ -290,10 +330,12 @@ def get_template(
   new_lon = np.rad2deg(horizontal_regridder.target_grid.longitudes)
   new_lat = np.rad2deg(horizontal_regridder.target_grid.latitudes)
 
-  if vertical_regridder is not None:
-    # drop surface pressure that we added into coordinates to enable vertical
-    # regridding
-    source_ds = source_ds.drop_vars(['surface_pressure'])
+  if vertical_regridder is not None and isinstance(
+      vertical_regridder.source_grid, vertical_interpolation.HybridCoordinates
+  ):
+    # drop surface pressure that we added into coordinates for hybrid regridding
+    if 'surface_pressure' in source_ds.coords:
+      source_ds = source_ds.drop_vars(['surface_pressure'])
 
   # Data variables are lazy, coordinates are not
   template = (
@@ -304,23 +346,46 @@ def get_template(
   )
 
   if vertical_regridder is not None:
-
-    def replace_level_with_sigma(x):
-      if 'level' not in x.dims:
-        return x
-
-      axis = x.get_axis_num('level')
-      sigmas = vertical_regridder.target_grid.centers
-      return x.isel(level=0, drop=True).expand_dims(sigma=sigmas, axis=axis)
-
-    if not isinstance(
-        vertical_regridder.target_grid, sigma_coordinates.SigmaCoordinates
+    match (
+        vertical_regridder.source_grid,
+        vertical_regridder.target_grid,
     ):
-      raise ValueError(
-          f'vertical_regridder.target_grid={vertical_regridder.target_grid=} '
-          'is not a SigmaCoordinates object'
-      )
-    template = template.map(replace_level_with_sigma)
+      case (
+          vertical_interpolation.HybridCoordinates(),
+          sigma_coordinates.SigmaCoordinates(),
+      ):
+
+        def replace_level_with_sigma(x):
+          if 'level' not in x.dims:
+            return x
+          axis = x.get_axis_num('level')
+          sigmas = vertical_regridder.target_grid.centers
+          return x.isel(level=0, drop=True).expand_dims(sigma=sigmas, axis=axis)
+
+        template = template.map(replace_level_with_sigma)
+
+      case (
+          vertical_interpolation.PressureCoordinates(),
+          vertical_interpolation.PressureCoordinates(),
+      ):
+
+        def update_pressure_levels(x):
+          if 'level' not in x.dims:
+            return x
+          axis = x.get_axis_num('level')
+          new_levels = vertical_regridder.target_grid.centers
+          return x.isel(level=0, drop=True).expand_dims(
+              level=new_levels, axis=axis
+          )
+
+        template = template.map(update_pressure_levels)
+
+      case _:
+        raise ValueError(
+            'Unsupported vertical regridding combination: '
+            f'source={type(vertical_regridder.source_grid)}, '
+            f'target={type(vertical_regridder.target_grid)}'
+        )
 
   return template
 
@@ -347,7 +412,21 @@ def get_output_chunks(
 
   if vertical_regridder is not None:
     del output_chunks['level']
-    output_chunks['sigma'] = -1
+
+    if isinstance(
+        vertical_regridder.target_grid, sigma_coordinates.SigmaCoordinates
+    ):
+      output_chunks['sigma'] = -1
+    elif isinstance(
+        vertical_regridder.target_grid,
+        vertical_interpolation.PressureCoordinates,
+    ):
+      output_chunks['level'] = -1
+    else:
+      raise ValueError(
+          'Unsupported vertical regridding target grid: '
+          f'{type(vertical_regridder.target_grid)}'
+      )
 
   return output_chunks
 
