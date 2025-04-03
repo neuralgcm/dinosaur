@@ -460,16 +460,6 @@ def get_geopotential_diff(
     raise ValueError(f'unknown {method=} for get_geopotential_diff')
 
 
-# In the spectral basis, a constant field of ones has this value in entry
-# [0, 0]. This is a consequence of the way we normalize Legendre polynomials.
-_CONSTANT_NORMALIZATION_FACTOR = 3.5449077
-
-
-def _add_constant(x: jnp.ndarray, c: float | Array) -> jnp.ndarray:
-  """Adds the constant `c` to the array `x` in the spectral basis."""
-  return x.at[..., 0, 0].add(_CONSTANT_NORMALIZATION_FACTOR * c)
-
-
 def get_geopotential(
     temperature_variation: Array,
     reference_temperature: Array,
@@ -501,7 +491,9 @@ def get_geopotential(
     to the center of the planet.
   """
   surface_geopotential = orography * gravity_acceleration
-  temperature = _add_constant(temperature_variation, reference_temperature)
+  temperature = spherical_harmonic.add_constant(
+      temperature_variation, reference_temperature
+  )
   geopotential_diff = get_geopotential_diff(
       temperature, coordinates, ideal_gas_constant, sharding=sharding
   )

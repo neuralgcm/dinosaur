@@ -1139,6 +1139,16 @@ class Grid:
     return einsum('y,...xy->...', w, z)
 
 
+# In the spectral basis, a constant field of ones has this value in entry
+# [0, 0]. This is a consequence of the way we normalize Legendre polynomials.
+_CONSTANT_NORMALIZATION_FACTOR = 3.5449077
+
+
+def add_constant(x: jnp.ndarray, c: float | Array) -> jnp.ndarray:
+  """Adds the constant `c` to the array `x` in the spectral basis."""
+  return x.at[..., 0, 0].add(_CONSTANT_NORMALIZATION_FACTOR * c)
+
+
 @jax.named_call
 def get_cos_lat_vector(
     vorticity: Array,
