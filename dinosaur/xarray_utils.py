@@ -1277,15 +1277,18 @@ def regrid_vertical(
   Returns:
     Regridded data.
   """
+  source_grid = regridder.source_grid
+  target_grid = regridder.target_grid
+
   if in_dim not in data.dims:
     raise ValueError(
         f"Vertical dimension {in_dim!r} not found in data: {data.dims}"
     )
 
-  if regridder.source_grid.layers != data.sizes[in_dim]:
+  if source_grid.layers != data.sizes[in_dim]:
     raise ValueError(
         'inconsistent vertical dimension size between data and source grid:'
-        f' {data.sizes[in_dim]} vs {regridder.source_grid.layers}'
+        f' {data.sizes[in_dim]} vs {source_grid.layers}'
     )
 
   # We parallelize vertical regridding with dask in order to reduce peak memory
@@ -1296,7 +1299,7 @@ def regrid_vertical(
   if compute_chunks is None:
     compute_chunks = {'latitude': 32, 'longitude': 32}
 
-  match (regridder.source_grid, regridder.target_grid):
+  match (source_grid, target_grid):
     case (
         vertical_interpolation.HybridCoordinates(),
         sigma_coordinates.SigmaCoordinates(),
@@ -1308,7 +1311,7 @@ def regrid_vertical(
 
       def regrid_chunk_hybrid_to_sigma(field, surface_pressure):
         chunks = list(field.chunks)
-        chunks[-3] = (regridder.target_grid.layers,)
+        chunks[-3] = (target_grid.layers,)
         return dask.array.map_blocks(
             regridder,
             field,
@@ -1337,9 +1340,18 @@ def regrid_vertical(
         vertical_interpolation.PressureCoordinates(),
     ):
 
+      assert isinstance(source_grid, vertical_interpolation.PressureCoordinates)
+      if not np.allclose(
+          data.coords[in_dim], source_grid.centers, rtol=1e-5
+      ):
+        raise ValueError(
+            'inconsistent vertical dimension between data and source grid:'
+            f' {data.coords[in_dim]} vs {source_grid.centers}'
+        )
+
       def regrid_chunk_pressure_to_pressure(field):
         chunks = list(field.chunks)
-        chunks[-3] = (regridder.target_grid.layers,)
+        chunks[-3] = (target_grid.layers,)
         return dask.array.map_blocks(
             lambda x: regridder(x, surface_pressure=None),
             field,
