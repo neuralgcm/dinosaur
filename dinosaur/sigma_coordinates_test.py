@@ -60,7 +60,7 @@ exponential_derivative = exponential_integral = exponential_function
 # pylint: enable=unbalanced-tuple-unpacking
 
 
-def test_cases():
+def _test_cases():
   # Note that the test cases use far more layers that we will use in practice.
   # We do this to test numerical accuracy against closed form derivatives and
   # integrals.
@@ -137,7 +137,7 @@ class SigmaCoordinatesTest(parameterized.TestCase):
     np.testing.assert_array_equal(coordinates.boundaries, expected_boundaries)
     np.testing.assert_array_equal(coordinates.centers, centers)
 
-  @parameterized.named_parameters(*test_cases())
+  @parameterized.named_parameters(*_test_cases())
   def test_centered_difference(
       self, test_function, derivative_function, layers, grid_resolution, **_
   ):
@@ -155,7 +155,7 @@ class SigmaCoordinatesTest(parameterized.TestCase):
         expected_derivative, computed_derivative, atol=1e-3
     )
 
-  @parameterized.named_parameters(*test_cases())
+  @parameterized.named_parameters(*_test_cases())
   def test_cumulative_sigma_integral_downward(
       self, test_function, integral_function, layers, grid_resolution, **_
   ):
@@ -195,7 +195,7 @@ class SigmaCoordinatesTest(parameterized.TestCase):
           expected_integral[-1], computed_integral[-1], atol=1e-2
       )
 
-  @parameterized.named_parameters(*test_cases())
+  @parameterized.named_parameters(*_test_cases())
   def test_cumulative_sigma_integral_upward(
       self, test_function, integral_function, layers, grid_resolution, **_
   ):
@@ -235,7 +235,7 @@ class SigmaCoordinatesTest(parameterized.TestCase):
           expected_integral[0], computed_integral[0], atol=1e-2
       )
 
-  @parameterized.named_parameters(*test_cases())
+  @parameterized.named_parameters(*_test_cases())
   def test_log_sigma_integral_downward(
       self, test_function, integral_function, layers, grid_resolution, **_
   ):
@@ -280,7 +280,7 @@ class SigmaCoordinatesTest(parameterized.TestCase):
           expected_integral[-1], computed_integral[-1], atol=1e-2
       )
 
-  @parameterized.named_parameters(*test_cases())
+  @parameterized.named_parameters(*_test_cases())
   def test_log_sigma_integral_upward(
       self, test_function, integral_function, layers, grid_resolution, **_
   ):
@@ -328,7 +328,7 @@ class SigmaCoordinatesTest(parameterized.TestCase):
           expected_integral[0], computed_integral[0], atol=1e-2
       )
 
-  @parameterized.named_parameters(*test_cases())
+  @parameterized.named_parameters(*_test_cases())
   def test_vertical_advection_helper(
       self, test_function, derivative_function, layers, grid_resolution, **_
   ):

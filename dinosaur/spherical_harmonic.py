@@ -743,6 +743,7 @@ class Grid:
       longitude_offset: float = 0.0,
       spherical_harmonics_impl: SphericalHarmonicsImpl = RealSphericalHarmonics,
       radius: float | None = None,
+      spmd_mesh: jax.sharding.Mesh | None = None,
   ) -> Grid:
     """Construct a `Grid` by specifying only wavenumbers."""
 
@@ -760,6 +761,7 @@ class Grid:
         longitude_offset=longitude_offset,
         spherical_harmonics_impl=spherical_harmonics_impl,
         radius=radius,
+        spmd_mesh=spmd_mesh,
     )
 
   @classmethod
@@ -771,6 +773,7 @@ class Grid:
       longitude_offset: float = 0.0,
       radius: float | None = None,
       spherical_harmonics_impl: SphericalHarmonicsImpl = RealSphericalHarmonics,
+      spmd_mesh: jax.sharding.Mesh | None = None,
   ) -> Grid:
     """Construct a `Grid` by specifying max wavenumber & the number of nodes.
 
@@ -784,6 +787,9 @@ class Grid:
       radius: radius of the sphere. If `None` a default values of `1` is used.
       spherical_harmonics_impl: class providing an implementation of spherical
         harmonics.
+      spmd_mesh: mesh to use for parallelism in the single program multiple
+        device (SPMD) paradigm with distributed JAX arrays, if any. Required if
+        using model parallelism.
 
     Returns:
       Constructed Grid object.
@@ -798,6 +804,7 @@ class Grid:
         longitude_offset=longitude_offset,
         spherical_harmonics_impl=spherical_harmonics_impl,
         radius=radius,
+        spmd_mesh=spmd_mesh,
     )
 
   # The factory methods below return "standard" grids that appear in the
