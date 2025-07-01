@@ -36,7 +36,7 @@ dependencies = [
 ]
 
 [project.urls]
-source-code = "https://github.com/neuralgcm/dinosaur"
+source = "https://github.com/neuralgcm/dinosaur"
 
 [project.optional-dependencies]
 tests = [
