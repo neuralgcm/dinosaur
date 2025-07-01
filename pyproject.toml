@@ -8,13 +8,13 @@ package-data = {dinosaur = ["data/*"]}
 
 [project]
 name = "dinosaur"
-version = "1.3.3"  # keep sync with __init__.py
+version = "1.3.4"  # keep sync with __init__.py
 description = "Differentiable Dynamics for Global Atmospheric Modeling 🦖"
 authors = [
     {name = "Google LLC", email = "noreply@google.com"},
 ]
 readme = "README.md"
-license = {file = "LICENSE"}
+license = "Apache-2.0"
 requires-python = ">=3.10"
 # TODO(shoyer): thin these down
 dependencies = [
@@ -34,6 +34,9 @@ dependencies = [
     # "xarray-beam",  # TODO(shoyer): figure out how to install Beam in CI
     "xarray-tensorstore",
 ]
+
+[project.urls]
+source-code = "https://github.com/neuralgcm/dinosaur"
 
 [project.optional-dependencies]
 tests = [
