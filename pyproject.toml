@@ -22,7 +22,7 @@ dependencies = [
     "jaxlib",
     "numpy",
     "pint",
-    "scipy",
+    "scipy",`
     "scikit-learn",
     "tree-math",
     # these packages below are only required for xarray-utils, and really
