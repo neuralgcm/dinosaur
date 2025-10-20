@@ -143,6 +143,29 @@ class HorizontalInterpolationTest(parameterized.TestCase):
     np.testing.assert_allclose(out_valid.mean(), in_valid.mean(), atol=0.1)
     np.testing.assert_allclose(outputs[out_valid], 1.0)
 
+  @parameterized.named_parameters(
+      {
+          'testcase_name': 'bilinear',
+          'regridder_cls': horizontal_interpolation.BilinearRegridder,
+      },
+      {
+          'testcase_name': 'nearest',
+          'regridder_cls': horizontal_interpolation.NearestRegridder,
+      },
+  )
+  def test_regridding_exact(self, regridder_cls):
+    source_grid = spherical_harmonic.Grid(
+        longitude_nodes=4, latitude_nodes=3
+    )
+    target_grid = spherical_harmonic.Grid(
+        longitude_nodes=2, latitude_nodes=3
+    )
+    regridder = regridder_cls(source_grid, target_grid)
+    inputs = np.array([[0, 1, 2], [4, 5, 6], [7, 8, 9], [10, 11, 12]])
+    expected = np.array([[0, 1, 2], [7, 8, 9]])
+    actual = regridder(inputs)
+    np.testing.assert_allclose(expected, actual, atol=1e-6)
+
 
 if __name__ == '__main__':
   absltest.main()
