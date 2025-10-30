@@ -36,7 +36,6 @@ import numpy as np
 import pandas as pd
 from sklearn import neighbors
 import xarray
-import xarray_tensorstore
 
 
 # pylint: disable=g-bare-generic
@@ -198,7 +197,7 @@ def open_dataset(
 ) -> xarray.Dataset:  # pylint: disable=redefined-builtin
   """Load a dataset from either Zarr or NetCDF."""
   if is_dir(path):
-    return xarray_tensorstore.open_zarr(path, **kwargs)
+    return xarray.open_zarr(path, **kwargs)
   else:
     return open_netcdf(path, **kwargs)
 
