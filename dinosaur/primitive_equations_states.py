@@ -1,11 +1,11 @@
 # Copyright 2023 Google LLC
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     https://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,11 +18,12 @@ from typing import Callable
 
 from dinosaur import coordinate_systems
 from dinosaur import filtering
+from dinosaur import hybrid_coordinates
 from dinosaur import primitive_equations
 from dinosaur import scales
+from dinosaur import sigma_coordinates
 from dinosaur import typing
 from dinosaur import xarray_utils
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -91,9 +92,9 @@ def isothermal_rest_atmosphere(
       raise ValueError(f'Expected surface_height to have shape {lat.shape}, '
                        f'got {surface_height.shape}')
 
-  def _get_vorticity(sigma, lon, lat):
+  def _get_vorticity(level, lon, lat):
     """Computes vorticity at sigma-level as a function of lon, lat."""
-    del sigma, lon  # unused.
+    del level, lon  # unused.
     return jnp.zeros_like(lat)
 
   def _get_surface_pressure(lon, lat, rng_key):
@@ -129,8 +130,10 @@ def isothermal_rest_atmosphere(
     return surface_pressure + p1 * perturbation
 
   def random_state_fn(rng_key: jnp.ndarray) -> primitive_equations.State:
-    nodal_vorticity = jnp.stack(
-        [_get_vorticity(sigma, lon, lat) for sigma in coords.vertical.centers])
+    nodal_vorticity = jnp.stack([
+        _get_vorticity(level, lon, lat)
+        for level in range(coords.vertical.layers)
+    ])
     modal_vorticity = coords.horizontal.to_modal(nodal_vorticity)
     nodal_surface_pressure = _get_surface_pressure(lon, lat, rng_key)
     return primitive_equations.State(
@@ -180,8 +183,8 @@ def steady_state_jw(
     t0: Quantity = 288. * units.degK,
     delta_t: Quantity = 4.8e5 * units.degK,
     gamma: Quantity = 0.005 * units.degK / units.m,
-    sigma_tropo: float = 0.2,
-    sigma0: float = 0.252,
+    eta_tropo: float = 0.2,
+    eta0: float = 0.252,
 ) -> tuple[Callable[..., primitive_equations.State], typing.AuxFeatures]:
   """Returns a function that generates steady state and static features.
 
@@ -206,8 +209,8 @@ def steady_state_jw(
     t0: horizontal mean temperature at the surface.
     delta_t: empirical temperature difference.
     gamma: temperature lapse rate.
-    sigma_tropo: tropopause level in sigma coordinates.
-    sigma0: a sigma constant used to define sigma_nu in specification of the
+    eta_tropo: tropopause level in eta coordinates.
+    eta0: an eta constant used to define sigma_nu in specification of the
       initial state.
 
   Returns:
@@ -225,56 +228,56 @@ def steady_state_jw(
   r_gas = physics_specs.R
   omega = physics_specs.angular_velocity
 
-  def _get_reference_temperature(sigma):
-    """Computes reference temperature for a given sigma level."""
-    top_mean_t = t0 * sigma ** (r_gas * gamma / g)
-    if sigma < sigma_tropo:
-      return top_mean_t + delta_t * (sigma_tropo - sigma) ** 5
+  def _get_reference_temperature(eta):
+    """Computes reference temperature for a given eta level."""
+    top_mean_t = t0 * eta ** (r_gas * gamma / g)
+    if eta < eta_tropo:
+      return top_mean_t + delta_t * (eta_tropo - eta) ** 5
     else:
       return top_mean_t
 
-  def _get_reference_geopotential(sigma):
-    """Computes reference geopotential for a given sigma level."""
-    top_mean_potential = (t0 * g / gamma) * (1 - sigma ** (r_gas * gamma / g))
-    if sigma < sigma_tropo:
+  def _get_reference_geopotential(eta):
+    """Computes reference geopotential for a given eta level."""
+    top_mean_potential = (t0 * g / gamma) * (1 - eta ** (r_gas * gamma / g))
+    if eta < eta_tropo:
       return top_mean_potential - r_gas * delta_t * (
-          (np.log(sigma / sigma_tropo) + 137 / 60) * sigma_tropo ** 5 -
-          5 * sigma * sigma_tropo ** 4 + 5 * (sigma ** 2) * (sigma_tropo ** 3) -
-          (10 / 3) * (sigma_tropo ** 2) * sigma ** 3 +
-          (5 / 4) * sigma_tropo * sigma ** 4 - (sigma ** 5) / 5
+          (np.log(eta / eta_tropo) + 137 / 60) * eta_tropo ** 5 -
+          5 * eta * eta_tropo ** 4 + 5 * (eta ** 2) * (eta_tropo ** 3) -
+          (10 / 3) * (eta_tropo ** 2) * eta ** 3 +
+          (5 / 4) * eta_tropo * eta ** 4 - (eta ** 5) / 5
       )
     else:
       return top_mean_potential
 
-  def _get_geopotential(lat, lon, sigma):
-    """Computes geopotential at sigma-level as a function of lat."""
+  def _get_geopotential(lat, lon, eta):
+    """Computes geopotential at eta-level as a function of lat."""
     del lon  # unused.
-    sigma_nu = (sigma - sigma0) * np.pi / 2
-    return _get_reference_geopotential(sigma) + u0 * np.cos(sigma_nu) ** 1.5 * (
+    eta_nu = (eta - eta0) * np.pi / 2
+    return _get_reference_geopotential(eta) + u0 * np.cos(eta_nu) ** 1.5 * (
         ((-2 * np.sin(lat) ** 6 * (np.cos(lat) ** 2 + 1 / 3) + 10 / 63) *
-         u0 * np.cos(sigma_nu) ** (3 / 2)) +
+         u0 * np.cos(eta_nu) ** (3 / 2)) +
         ((1.6 * (np.cos(lat) ** 3) * (np.sin(lat) ** 2 + 2 / 3) - np.pi / 4) *
          a * omega)
     )
 
-  def _get_temperature_variation(lat, lon, sigma):
-    """Computes temperature variation at sigma-level as a function of lat."""
+  def _get_temperature_variation(lat, lon, eta):
+    """Computes temperature variation at eta-level as a function of lat."""
     del lon  # unused.
-    sigma_nu = (sigma - sigma0) * np.pi / 2
-    cos_𝜎ν = np.cos(sigma_nu)  # pylint: disable=invalid-name
-    sin_𝜎ν = np.sin(sigma_nu)  # pylint: disable=invalid-name
-    return 0.75 * (sigma * np.pi * u0 / r_gas) * sin_𝜎ν * np.sqrt(cos_𝜎ν) * (
+    eta_nu = (eta - eta0) * np.pi / 2
+    cos_𝜂ν = np.cos(eta_nu)  # pylint: disable=invalid-name
+    sin_𝜂ν = np.sin(eta_nu)  # pylint: disable=invalid-name
+    return 0.75 * (eta * np.pi * u0 / r_gas) * sin_𝜂ν * np.sqrt(cos_𝜂ν) * (
         ((-2 * (np.cos(lat) ** 2 + 1 / 3) * np.sin(lat) ** 6 + 10 / 63) *
-         2 * u0 * cos_𝜎ν ** (3 / 2)) +
+         2 * u0 * cos_𝜂ν ** (3 / 2)) +
         ((1.6 * (np.cos(lat) ** 3) * (np.sin(lat) ** 2 + 2 / 3) - np.pi / 4) *
          a * omega)
     )
 
-  def _get_vorticity(lat, lon, sigma):
-    """Computes vorticity at sigma-level as a function of lat."""
+  def _get_vorticity(lat, lon, eta):
+    """Computes vorticity at eta-level as a function of lat."""
     del lon  # unused.
-    sigma_nu = (sigma - sigma0) * np.pi / 2
-    return ((-4 * u0 / a) * (np.cos(sigma_nu) ** (3 / 2)) *
+    eta_nu = (eta - eta0) * np.pi / 2
+    return ((-4 * u0 / a) * (np.cos(eta_nu) ** (3 / 2)) *
             np.sin(lat) * np.cos(lat) * (2 - 5 * np.sin(lat) ** 2))
 
   def _get_surface_pressure(lat, lon,):
@@ -284,17 +287,25 @@ def steady_state_jw(
 
   lon, sin_lat = coords.horizontal.nodal_mesh
   lat = np.arcsin(sin_lat)
+  levels = coords.vertical
+  if isinstance(levels, hybrid_coordinates.HybridCoordinates):
+    etas = levels.get_eta(p0)
+  elif isinstance(levels, sigma_coordinates.SigmaCoordinates):
+    etas = levels.centers
+  else:
+    raise ValueError(f'Unsupported vertical coordinate system: {levels}')
+
   def initial_state_fn(
       rng_key: jnp.ndarray | None = None
   ) -> primitive_equations.State:
     del rng_key  # unused.
     nodal_vorticity = np.stack(
-        [_get_vorticity(lat, lon, sigma) for sigma in coords.vertical.centers])
+        [_get_vorticity(lat, lon, eta) for eta in etas])
+
     modal_vorticity = coords.horizontal.to_modal(nodal_vorticity)
     nodal_temperature_variation = np.stack(
-        [_get_temperature_variation(lat, lon, sigma)
-         for sigma in coords.vertical.centers])
-    # shift in log_surf_pressure due to custom units doesn't affect dynamics.
+        [_get_temperature_variation(lat, lon, eta)
+         for eta in etas])
     log_nodal_surface_pressure = np.log(_get_surface_pressure(lat, lon))
     state = primitive_equations.State(
         vorticity=modal_vorticity,
@@ -307,9 +318,9 @@ def steady_state_jw(
 
   orography = _get_geopotential(lat, lon, 1.) / g
   geopotential = np.stack(
-      [_get_geopotential(lat, lon, sigma) for sigma in coords.vertical.centers])
+      [_get_geopotential(lat, lon, eta) for eta in etas])
   reference_temperatures = np.stack(
-      [_get_reference_temperature(sigma) for sigma in coords.vertical.centers])
+      [_get_reference_temperature(eta) for eta in etas])
   aux_features = {
       xarray_utils.GEOPOTENTIAL_KEY: geopotential,
       xarray_utils.OROGRAPHY: orography,
@@ -353,36 +364,53 @@ def baroclinic_perturbation_jw(
   u_p = physics_specs.nondimensionalize(u_perturb)
   a = physics_specs.radius
 
-  def _get_vorticity_perturbation(lat, lon, sigma):
-    del sigma  # unused.
+  def _get_vorticity_perturbation(lat, lon, eta):
+    del eta  # unused.
     x = (np.sin(lat_location) * np.sin(lat) +
          np.cos(lat_location) * np.cos(lat) * np.cos(lon - lon_location))
     r = a * np.arccos(x)
     R = a * perturbation_radius  # pylint: disable=invalid-name
+    # Handle potential division by zero in the square root
+    sqrt_arg = 1 - x**2
+    # small epsilon to avoid sqrt of zero
+    sqrt_val = np.sqrt(np.maximum(sqrt_arg, 1e-12))
     return (u_p / a) * np.exp(-(r / R) ** 2) * (
         np.tan(lat) - (2 * ((a / R) ** 2) * np.arccos(x)) *
         (np.sin(lat_location) * np.cos(lat) -
          np.cos(lat_location) * np.sin(lat) * np.cos(lon - lon_location)) /
-        (np.sqrt(1 - x ** 2)))
+        sqrt_val)
 
-  def _get_divergence_perturbation(lat, lon, sigma):
-    del sigma  # unused.
+  def _get_divergence_perturbation(lat, lon, eta):
+    del eta  # unused.
     x = (np.sin(lat_location) * np.sin(lat) +
          np.cos(lat_location) * np.cos(lat) * np.cos(lon - lon_location))
     r = a * np.arccos(x)
     R = a * perturbation_radius  # pylint: disable=invalid-name
+    # Handle potential division by zero in the square root
+    sqrt_arg = 1 - x**2
+    # small epsilon to avoid sqrt of zero
+    sqrt_val = np.sqrt(np.maximum(sqrt_arg, 1e-12))
     return (-2 * u_p * a / (R ** 2)) * np.exp(-(r / R) ** 2) * np.arccos(x) * (
         (np.cos(lat_location) * np.sin(lon - lon_location)) /
-        (np.sqrt(1 - x ** 2)))
+        sqrt_val)
 
   lon, sin_lat = coords.horizontal.nodal_mesh
   lat = np.arcsin(sin_lat)
+  levels = coords.vertical
+  if isinstance(levels, hybrid_coordinates.HybridCoordinates):
+    # perturbation is independent of levels, so we use a fixed ref pressure.
+    etas = levels.get_eta(1000.0)
+  elif isinstance(levels, sigma_coordinates.SigmaCoordinates):
+    etas = levels.centers
+  else:
+    raise ValueError(f'Unsupported vertical coordinate system: {levels}')
+
   nodal_vorticity = np.stack(
-      [_get_vorticity_perturbation(lat, lon, sigma)
-       for sigma in coords.vertical.centers])
+      [_get_vorticity_perturbation(lat, lon, eta)
+       for eta in etas])
   nodal_divergence = np.stack(
-      [_get_divergence_perturbation(lat, lon, sigma)
-       for sigma in coords.vertical.centers])
+      [_get_divergence_perturbation(lat, lon, eta)
+       for eta in etas])
   modal_vorticity = coords.horizontal.to_modal(nodal_vorticity)
   modal_divergence = coords.horizontal.to_modal(nodal_divergence)
   state = primitive_equations.State(
@@ -417,8 +445,8 @@ def gaussian_scalar(
   """
   a = physics_specs.radius
 
-  def _get_field_values(lat, lon, sigma):
-    del sigma  # unused.
+  def _get_field_values(lat, lon, level):
+    del level  # unused.
     x = (np.sin(lat_location) * np.sin(lat) +
          np.cos(lat_location) * np.cos(lat) * np.cos(lon - lon_location))
     r = a * np.arccos(x)
@@ -428,5 +456,8 @@ def gaussian_scalar(
   lon, sin_lat = coords.horizontal.nodal_mesh
   lat = np.arcsin(sin_lat)
   return coords.horizontal.to_modal(
-      np.stack([_get_field_values(lat, lon, sigma)
-                for sigma in coords.vertical.centers]))
+      np.stack([
+          _get_field_values(lat, lon, level)
+          for level in range(coords.vertical.layers)
+      ])
+  )

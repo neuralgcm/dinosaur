@@ -1,11 +1,11 @@
 # Copyright 2023 Google LLC
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     https://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -16,6 +16,7 @@
 
 from absl.testing import absltest
 from absl.testing import parameterized
+from dinosaur import hybrid_coordinates
 from dinosaur import sigma_coordinates
 from dinosaur import vertical_interpolation
 import jax.numpy as jnp
@@ -120,7 +121,7 @@ class PressureLevelsTest(parameterized.TestCase):
 class HybridCoordinatesTest(absltest.TestCase):
 
   def test_ecmwf_137(self):
-    coords = vertical_interpolation.HybridCoordinates.ECMWF137()
+    coords = hybrid_coordinates.HybridCoordinates.ECMWF137()
     self.assertEqual(coords.layers, 137)
 
     # spot check ph (half-level, on the boundary) from row 84 in the table
@@ -129,7 +130,7 @@ class HybridCoordinatesTest(absltest.TestCase):
     self.assertAlmostEqual(expected, actual, places=3)
 
   def test_ufs_127(self):
-    coords = vertical_interpolation.HybridCoordinates.UFS127()
+    coords = hybrid_coordinates.HybridCoordinates.UFS127()
     self.assertEqual(coords.layers, 127)
 
     # spot check pf (full-level, centered) from row 80 in the table
@@ -140,7 +141,7 @@ class HybridCoordinatesTest(absltest.TestCase):
     self.assertAlmostEqual(expected, actual, places=1)
 
   def test_to_approx_sigma_coords(self):
-    hybrid_coords = vertical_interpolation.HybridCoordinates(
+    hybrid_coords = hybrid_coordinates.HybridCoordinates(
         # pressure bounds at [0, 500, 800, 1000]
         a_boundaries=np.array([0, 500, 300, 0]),
         b_boundaries=np.array([0, 0, 0.5, 1.0]),
@@ -166,7 +167,7 @@ class HybridCoordinatesTest(absltest.TestCase):
 
   def test_interp_hybrid_to_sigma(self):
     sigma_coords = sigma_coordinates.SigmaCoordinates.equidistant(5)
-    hybrid_coords = vertical_interpolation.HybridCoordinates(
+    hybrid_coords = hybrid_coordinates.HybridCoordinates(
         # pressure bounds at [0, 400, 800, 1000] -> centers at [200, 600, 900]
         a_boundaries=np.array([0, 400, 300, 0]),
         b_boundaries=np.array([0, 0, 0.5, 1.0]),
@@ -183,7 +184,7 @@ class HybridCoordinatesTest(absltest.TestCase):
 
   def test_regrid_hybrid_to_sigma(self):
     sigma_coords = sigma_coordinates.SigmaCoordinates.equidistant(5)
-    hybrid_coords = vertical_interpolation.HybridCoordinates(
+    hybrid_coords = hybrid_coordinates.HybridCoordinates(
         # at pressures boundaries [0, 30, 75, 200, 450, 700, 850, 1000]
         a_boundaries=np.array([0, 30, 75, 200, 300, 300, 150, 0]),
         b_boundaries=np.array([0, 0, 0, 0, 0.15, 0.4, 0.7, 1]),

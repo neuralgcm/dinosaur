@@ -1,11 +1,11 @@
 # Copyright 2023 Google LLC
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     https://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,6 +18,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 from dinosaur import coordinate_systems
 from dinosaur import horizontal_interpolation
+from dinosaur import hybrid_coordinates
 from dinosaur import layer_coordinates
 from dinosaur import primitive_equations
 from dinosaur import primitive_equations_states
@@ -796,7 +797,7 @@ class XarrayUtilsTest(parameterized.TestCase):
       dict(regridder_cls=vertical_interpolation.ConservativeRegridder),
   )
   def test_regrid_vertical(self, regridder_cls):
-    old_coords = vertical_interpolation.HybridCoordinates(
+    old_coords = hybrid_coordinates.HybridCoordinates(
         a_boundaries=np.array([0, 400, 300, 0]),
         b_boundaries=np.array([0, 0, 0.5, 1.0]),
     )

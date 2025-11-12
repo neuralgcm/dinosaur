@@ -18,6 +18,7 @@ from absl.testing import absltest
 from absl.testing import flagsaver
 import apache_beam as beam
 from dinosaur import horizontal_interpolation
+from dinosaur import hybrid_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import vertical_interpolation
 from dinosaur.pipelines import regrid
@@ -172,8 +173,8 @@ class RegridTest(absltest.TestCase):
         ),
         target_grid=spherical_harmonic.Grid.TL31(),
     )
-    ecmwf_coords = vertical_interpolation.HybridCoordinates.ECMWF137()
-    ufs_coords = vertical_interpolation.HybridCoordinates.UFS127()
+    ecmwf_coords = hybrid_coordinates.HybridCoordinates.ECMWF137()
+    ufs_coords = hybrid_coordinates.HybridCoordinates.UFS127()
     vertical_regridder = vertical_interpolation.ConservativeRegridder(
         source_grid=ecmwf_coords,
         target_grid=ufs_coords.to_approx_sigma_coords(16),

@@ -1,11 +1,11 @@
 # Copyright 2023 Google LLC
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     https://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -21,6 +21,7 @@ from typing import Any, Callable, Mapping, MutableMapping, Sequence, TypeVar
 import dask.array
 from dinosaur import coordinate_systems
 from dinosaur import horizontal_interpolation
+from dinosaur import hybrid_coordinates
 from dinosaur import layer_coordinates
 from dinosaur import primitive_equations
 from dinosaur import scales
@@ -1300,7 +1301,7 @@ def regrid_vertical(
 
   match (source_grid, target_grid):
     case (
-        vertical_interpolation.HybridCoordinates(),
+        hybrid_coordinates.HybridCoordinates(),
         sigma_coordinates.SigmaCoordinates(),
     ):
       if surface_pressure is None:

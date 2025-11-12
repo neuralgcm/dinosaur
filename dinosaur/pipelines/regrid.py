@@ -24,6 +24,7 @@ from typing import Any, Callable
 
 import apache_beam as beam
 from dinosaur import horizontal_interpolation
+from dinosaur import hybrid_coordinates
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import vertical_interpolation
@@ -269,7 +270,7 @@ def get_regrid_func(
           vertical_regridder.target_grid,
       ):
         case (
-            vertical_interpolation.HybridCoordinates(),
+            hybrid_coordinates.HybridCoordinates(),
             sigma_coordinates.SigmaCoordinates(),
         ):
           surface_pressure = chunk.coords['surface_pressure']
@@ -331,7 +332,7 @@ def get_template(
   new_lat = np.rad2deg(horizontal_regridder.target_grid.latitudes)
 
   if vertical_regridder is not None and isinstance(
-      vertical_regridder.source_grid, vertical_interpolation.HybridCoordinates
+      vertical_regridder.source_grid, hybrid_coordinates.HybridCoordinates
   ):
     # drop surface pressure that we added into coordinates for hybrid regridding
     if 'surface_pressure' in source_ds.coords:
@@ -351,7 +352,7 @@ def get_template(
         vertical_regridder.target_grid,
     ):
       case (
-          vertical_interpolation.HybridCoordinates(),
+          hybrid_coordinates.HybridCoordinates(),
           sigma_coordinates.SigmaCoordinates(),
       ):
 
