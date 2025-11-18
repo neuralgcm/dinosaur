@@ -38,6 +38,7 @@ from dinosaur import scales
 from dinosaur import shallow_water
 from dinosaur import shallow_water_states
 from dinosaur import spherical_harmonic
+from dinosaur import time_integration
 
 import jax
 import jax.numpy as jnp
@@ -151,20 +152,25 @@ class ShallowWaterTest(parameterized.TestCase):
     orography = None  # no orography in the geostrophic flow test case.
 
     # Set up time integration of the shallow water equations.
-    default_filters = shallow_water.default_filters(grid, dt)
-    trajectory_fn = shallow_water.shallow_water_leapfrog_trajectory(
-        coords, dt, physics_specs, inner_steps, outer_steps, mean_potential,
-        orography, default_filters)
+    equation = shallow_water.ShallowWaterEquations(
+        coords, physics_specs, orography, mean_potential
+    )
+    step_fn = time_integration.imex_rk_sil3(equation, dt)
+    filters = [
+        time_integration.exponential_step_filter(grid, dt),
+    ]
+    step_fn = time_integration.step_with_filters(step_fn, filters)
+    trajectory_fn = time_integration.trajectory_from_step(
+        step_fn, outer_steps, inner_steps)
 
     # Constructs steady state from a zonal velocity field.
     lat = np.arccos(grid.cos_lat)
     velocity = jnp.stack([velocity_function(lat)] * layers)
-    state_0 = state_1 = shallow_water_states.multi_layer(
+    initial_state = shallow_water_states.multi_layer(
         velocity, density, coords)
-    initial_state = (state_0, state_1)
 
     # Quantities that will be used to compute relative errors.
-    init_potential = grid.to_nodal(state_0.potential)
+    init_potential = grid.to_nodal(initial_state.potential)
     init_potential_l2 = np.sqrt(np.square(init_potential).sum())
 
     # Compute the potentials at several time steps and compare them to the
@@ -256,11 +262,10 @@ class ShallowWaterTest(parameterized.TestCase):
 
     divergence = jnp.zeros_like(delta_potential)
 
-    state_0 = state_1 = shallow_water.State(
+    initial_state = shallow_water.State(
         vorticity=vorticity,
         divergence=divergence,
         potential=delta_potential - orography / layers)
-    initial_state = (state_0, state_1)
 
     # Set up time stepping.
     total_time = physics_specs.nondimensionalize(total_time)
@@ -270,15 +275,21 @@ class ShallowWaterTest(parameterized.TestCase):
     outer_steps = int(total_time / save_every)
 
     # Set up time integration of the shallow water equations.
-    default_filters = shallow_water.default_filters(grid, dt)
-    trajectory_fn = shallow_water.shallow_water_leapfrog_trajectory(
-        coords, dt, physics_specs, inner_steps, outer_steps, mean_potential,
-        orography, default_filters)
+    equation = shallow_water.ShallowWaterEquations(
+        coords, physics_specs, orography, mean_potential
+    )
+    step_fn = time_integration.imex_rk_sil3(equation, dt)
+    filters = [
+        time_integration.exponential_step_filter(grid, dt),
+    ]
+    step_fn = time_integration.step_with_filters(step_fn, filters)
+    trajectory_fn = time_integration.trajectory_from_step(
+        step_fn, outer_steps, inner_steps)
 
     # Perform integration and check conservation of mass.
     _, trajectory = trajectory_fn(initial_state)
     initial_mass = _compute_mass(
-        grid, state_0.potential, mean_potential, density)
+        grid, initial_state.potential, mean_potential, density)
     masses = _compute_mass(
         grid, trajectory.potential, mean_potential, density)
     np.testing.assert_allclose(masses, initial_mass, rtol=1e-6)

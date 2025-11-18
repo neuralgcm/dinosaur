@@ -212,20 +212,18 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
     primitive = primitive_equations.PrimitiveEquations(
         ref_temps, modal_orography, coords, physics_specs
     )
-    step_fn = time_integration.semi_implicit_leapfrog(primitive, dt)
-    filters = (
-        time_integration.exponential_leapfrog_step_filter(
+    step_fn = time_integration.imex_rk_sil3(primitive, dt)
+    filters = [
+        time_integration.exponential_step_filter(
             coords.horizontal, dt
         ),
-        time_integration.robert_asselin_leapfrog_filter(0.05),
-    )
+    ]
     step_fn = time_integration.step_with_filters(step_fn, filters)
-    post_process_fn = lambda x: x[0]  # select slices of leapfrog tuple.
     trajectory_fn = time_integration.trajectory_from_step(
-        step_fn, outer_steps, inner_steps, post_process_fn=post_process_fn
+        step_fn, outer_steps, inner_steps
     )
     trajectory_fn = jax.jit(trajectory_fn)
-    input_state = (state, state)
+    input_state = state
     _, trajectory = trajectory_fn(input_state)
     trajectory = jax.device_get(trajectory)
 
