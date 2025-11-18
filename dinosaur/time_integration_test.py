@@ -1,11 +1,11 @@
 # Copyright 2023 Google LLC
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     https://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -22,13 +22,12 @@ from absl.testing import parameterized
 
 from dinosaur import time_integration
 import jax
-from jax import config
 from jax import tree_util
 
 import jax.numpy as jnp
 import numpy as np
 
-config.update('jax_enable_x64', True)
+jax.config.update('jax_enable_x64', True)
 
 
 def assert_allclose(x, y, rtol=1e-7, atol=0, err_msg=''):
@@ -69,7 +68,7 @@ ALL_TEST_PROBLEMS = [
          outer_steps=5,
          initial_state=np.ones(10),
          closed_form=lambda x0, t: x0,
-         tolerances=[1e-12] * 6),
+         tolerances=[1e-12] * 5),
     # x(t) = 5 * t * np.ones(3)
     dict(testcase_name='_constant_derivative',
          explicit_terms=lambda x: 5 * jnp.ones_like(x),
@@ -80,7 +79,7 @@ ALL_TEST_PROBLEMS = [
          outer_steps=5,
          initial_state=np.ones(3),
          closed_form=lambda x0, t: x0 + 5 * t,
-         tolerances=[1e-12] * 6),
+         tolerances=[1e-12] * 5),
     # x(t) = np.arange(3) * np.exp(t)
     # Uses explicit terms only.
     dict(testcase_name='_linear_derivative_explicit',
@@ -92,7 +91,7 @@ ALL_TEST_PROBLEMS = [
          outer_steps=5,
          initial_state=np.arange(3.0),
          closed_form=lambda x0, t: np.arange(3) * jnp.exp(t),
-         tolerances=[5e-2, 1e-4, 1e-6, 1e-9, 1e-6, 5e-2]),
+         tolerances=[5e-2, 1e-4, 1e-6, 1e-9, 1e-6]),
     # x(t) = np.arange(3) * np.exp(t)
     # Uses implicit terms only.
     dict(testcase_name='_linear_derivative_implicit',
@@ -104,7 +103,7 @@ ALL_TEST_PROBLEMS = [
          outer_steps=5,
          initial_state=np.arange(3.0),
          closed_form=lambda x0, t: np.arange(3) * jnp.exp(t),
-         tolerances=[5e-2, 5e-5, 1e-5, 1e-5, 3e-5, 5e-2]),
+         tolerances=[5e-2, 5e-5, 1e-5, 1e-5, 3e-5]),
     # x(t) = np.arange(3) * np.exp(t)
     # Splits the equation into an implicit and explicit term.
     dict(testcase_name='_linear_derivative_semi_implicit',
@@ -116,7 +115,7 @@ ALL_TEST_PROBLEMS = [
          outer_steps=5,
          initial_state=np.arange(3) * np.exp(0),
          closed_form=lambda x0, t: np.arange(3.0) * jnp.exp(t),
-         tolerances=[1e-4, 2e-5, 2e-6, 1e-6, 2e-5, 1e-4]),
+         tolerances=[1e-4, 2e-5, 2e-6, 1e-6, 2e-5]),
     dict(testcase_name='_harmonic_oscillator_explicit',
          explicit_terms=lambda x: jnp.stack([x[1], -x[0]]),
          implicit_terms=jnp.zeros_like,
@@ -126,7 +125,7 @@ ALL_TEST_PROBLEMS = [
          outer_steps=5,
          initial_state=np.ones(2),
          closed_form=harmonic_oscillator,
-         tolerances=[1e-2, 3e-5, 6e-8, 5e-11, 6e-8, 1e-2]),
+         tolerances=[1e-2, 3e-5, 6e-8, 5e-11, 6e-8]),
     dict(testcase_name='_harmonic_oscillator_implicit',
          explicit_terms=jnp.zeros_like,
          implicit_terms=lambda x: jnp.stack([x[1], -x[0]]),
@@ -137,7 +136,7 @@ ALL_TEST_PROBLEMS = [
          outer_steps=5,
          initial_state=np.ones(2),
          closed_form=harmonic_oscillator,
-         tolerances=[1e-2, 2e-5, 2e-6, 1e-6, 6e-6, 1e-2]),
+         tolerances=[1e-2, 2e-5, 2e-6, 1e-6, 6e-6]),
 ]
 
 
@@ -147,7 +146,6 @@ ALL_TIME_STEPPERS = [
     time_integration.crank_nicolson_rk3,
     time_integration.crank_nicolson_rk4,
     time_integration.imex_rk_sil3,
-    time_integration.semi_implicit_leapfrog,
 ]
 
 
@@ -201,17 +199,9 @@ class TimeIntegrationTest(parameterized.TestCase):
       with self.subTest(time_stepper.__name__):
         equation = CustomODE(explicit_terms, implicit_terms, implicit_inverse)
         semi_implicit_step = time_stepper(equation, dt)
-        if time_stepper == time_integration.semi_implicit_leapfrog:
-          input_state = (closed_form(initial_state, 0 * dt),
-                         closed_form(initial_state, 1 * dt))
-          post_process_fn = lambda x: x[0]
-          trajectory_fn = time_integration.trajectory_from_step(
-              semi_implicit_step, outer_steps, inner_steps,
-              post_process_fn=post_process_fn)
-        else:
-          input_state = initial_state
-          trajectory_fn = time_integration.trajectory_from_step(
-              semi_implicit_step, outer_steps, inner_steps)
+        input_state = initial_state
+        trajectory_fn = time_integration.trajectory_from_step(
+            semi_implicit_step, outer_steps, inner_steps)
         _, actual = trajectory_fn(input_state)
         np.testing.assert_allclose(expected, actual, atol=atol, rtol=0)
 
@@ -224,17 +214,11 @@ class TimeIntegrationTest(parameterized.TestCase):
     u0 = {'x': 1.0, 'y': 1.0}
     for time_stepper in ALL_TIME_STEPPERS:
       with self.subTest(time_stepper.__name__):
-        if time_stepper != time_integration.semi_implicit_leapfrog:
-          u1 = time_stepper(equation, 1.0)(u0)
-          self.assertEqual(u0, u1)
-        else:
-          u0_leapfrog = (u0, u0)
-          u1_leapfrog = time_stepper(equation, 1.0)(u0_leapfrog)
-          self.assertEqual(u0_leapfrog[0], u1_leapfrog[0])
-          self.assertEqual(u0_leapfrog[1], u1_leapfrog[1])
+        u1 = time_stepper(equation, 1.0)(u0)
+        self.assertEqual(u0, u1)
 
   def test_multiple_equations(self):
-    tolerances = [1e-4, 2e-5, 2e-6, 1e-6, 2e-5, 1e-4]
+    tolerances = [1e-4, 2e-5, 2e-6, 1e-6, 2e-5]
     dt = 1e-2
     inner_steps = 20
     outer_steps = 5
@@ -257,17 +241,9 @@ class TimeIntegrationTest(parameterized.TestCase):
       for atol, time_stepper in zip(tolerances, ALL_TIME_STEPPERS):
         with self.subTest(time_stepper.__name__):
           semi_implicit_step = time_stepper(equation, dt)
-          if time_stepper == time_integration.semi_implicit_leapfrog:
-            input_state = (closed_form(initial_state, 0 * dt),
-                           closed_form(initial_state, 1 * dt))
-            post_process_fn = lambda x: x[0]
-            trajectory_fn = time_integration.trajectory_from_step(
-                semi_implicit_step, outer_steps, inner_steps,
-                post_process_fn=post_process_fn)
-          else:
-            input_state = initial_state
-            trajectory_fn = time_integration.trajectory_from_step(
-                semi_implicit_step, outer_steps, inner_steps)
+          input_state = initial_state
+          trajectory_fn = time_integration.trajectory_from_step(
+              semi_implicit_step, outer_steps, inner_steps)
           _, actual = trajectory_fn(input_state)
           np.testing.assert_allclose(expected, actual, atol=atol, rtol=0)
 
@@ -292,17 +268,9 @@ class TimeIntegrationTest(parameterized.TestCase):
       for atol, time_stepper in zip(tolerances, ALL_TIME_STEPPERS):
         with self.subTest(time_stepper.__name__):
           semi_implicit_step = time_stepper(equation, dt)
-          if time_stepper == time_integration.semi_implicit_leapfrog:
-            input_state = (closed_form(initial_state, 0 * dt),
-                           closed_form(initial_state, 1 * dt))
-            post_process_fn = lambda x: x[0]
-            trajectory_fn = time_integration.trajectory_from_step(
-                semi_implicit_step, outer_steps, inner_steps,
-                post_process_fn=post_process_fn)
-          else:
-            input_state = initial_state
-            trajectory_fn = time_integration.trajectory_from_step(
-                semi_implicit_step, outer_steps, inner_steps)
+          input_state = initial_state
+          trajectory_fn = time_integration.trajectory_from_step(
+              semi_implicit_step, outer_steps, inner_steps)
           _, actual = trajectory_fn(input_state)
           np.testing.assert_allclose(expected['s'], actual['s'], atol=atol)
 
