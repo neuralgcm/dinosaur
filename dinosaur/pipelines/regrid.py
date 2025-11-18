@@ -293,6 +293,31 @@ def get_regrid_func(
           key = key.with_offsets(level=None, sigma=0)  # no vertical chunking
 
         case (
+            hybrid_coordinates.HybridCoordinates(),
+            hybrid_coordinates.HybridCoordinates(),
+        ):
+          surface_pressure = chunk.coords['surface_pressure']
+          if surface_pressure.attrs.get('units') != 'Pa':
+            raise ValueError(
+                f'surface_pressure units must be "Pa", but got '
+                f'{surface_pressure.attrs.get("units")=}'
+            )
+          surface_pressure_in_hPa = surface_pressure / 100  # pylint: disable=invalid-name
+          chunk = chunk.drop_vars('surface_pressure')
+          chunk = xarray_utils.regrid_vertical(
+              chunk,
+              surface_pressure_in_hPa,
+              vertical_regridder,
+              in_dim='level',
+              out_dim='hybrid',
+          )
+          # logging.info('Chunk dims after regrid_vertical: %s', chunk.dims)
+          assert 'level' not in chunk.dims and 'hybrid' in chunk.dims
+          # Switch dimension name from 'level' to 'hybrid'.
+          # chunk = chunk.rename({'level': 'hybrid'})
+          # logging.info('Chunk dims after rename: %s', chunk.dims)
+          key = key.with_offsets(level=None, hybrid=0)  # no vertical chunking
+        case (
             vertical_interpolation.PressureCoordinates(),
             vertical_interpolation.PressureCoordinates(),
         ):
@@ -366,6 +391,21 @@ def get_template(
         template = template.map(replace_level_with_sigma)
 
       case (
+          hybrid_coordinates.HybridCoordinates(),
+          hybrid_coordinates.HybridCoordinates(),
+      ):
+
+        def replace_level_with_hybrid(x):
+          if 'level' not in x.dims:
+            return x
+          axis = x.get_axis_num('level')
+          hybrid_levels = vertical_regridder.target_grid.centers
+          return x.isel(level=0, drop=True).expand_dims(
+              hybrid=hybrid_levels, axis=axis
+          )
+
+        template = template.map(replace_level_with_hybrid)
+      case (
           vertical_interpolation.PressureCoordinates(),
           vertical_interpolation.PressureCoordinates(),
       ):
@@ -423,6 +463,11 @@ def get_output_chunks(
         vertical_interpolation.PressureCoordinates,
     ):
       output_chunks['level'] = -1
+    elif isinstance(
+        vertical_regridder.target_grid,
+        hybrid_coordinates.HybridCoordinates,
+    ):
+      output_chunks['hybrid'] = -1
     else:
       raise ValueError(
           'Unsupported vertical regridding target grid: '
