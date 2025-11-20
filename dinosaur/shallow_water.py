@@ -18,19 +18,19 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Callable, Sequence, Type
+from typing import Sequence
 
 from dinosaur import coordinate_systems
 from dinosaur import scales
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
 from dinosaur import typing
+from dinosaur import units
 import jax
 import jax.numpy as jnp
 import numpy as np
 import tree_math
 
-units = scales.units
 
 Array = typing.Array
 Numeric = typing.Numeric
@@ -63,65 +63,8 @@ class State:
   potential: Array
 
 
-@dataclasses.dataclass(frozen=True)
-class ShallowWaterSpecs:
-  """Physical constants and scale used in the shallow water equations.
-
-  Attributes:
-    densities: a non-decreasing vector of densities, starting from the top.
-    radius: the non-dimensionalized radius of the domain.
-    angular_velocity: the non-dimensionalized angular velocity of the rotating
-      domain.
-    gravity_acceleration: the non-dimensionalized value of gravitational
-      acceleration.
-    scale: an instance implementing `ScaleProtocol` that will be used to
-      (non-)dimensionalize quantities.
-  """
-
-  densities: Array
-  radius: float
-  angular_velocity: float
-  gravity_acceleration: float
-  scale: scales.ScaleProtocol
-
-  @property
-  def g(self) -> float:
-    """Alias for `gravity_acceleration`."""
-    return self.gravity_acceleration
-
-  @property
-  def num_layers(self) -> int:
-    """Returns number of layers in the equation."""
-    return self.densities.size
-
-  def nondimensionalize(self, quantity: Quantity) -> Numeric:
-    """Non-dimensionalizes and rescales `quantity`."""
-    return self.scale.nondimensionalize(quantity)
-
-  def dimensionalize(self, value: Numeric, unit: units.Unit) -> Quantity:
-    """Rescales and adds units to the given non-dimensional value."""
-    return self.scale.dimensionalize(value, unit)
-
-  @classmethod
-  def from_si(
-      cls,
-      densities: Quantity = np.ones(1) * scales.WATER_DENSITY,
-      radius_si: Quantity = scales.RADIUS,
-      angular_velocity_si: Quantity = scales.ANGULAR_VELOCITY,
-      gravity_acceleration_si: Quantity = scales.GRAVITY_ACCELERATION,
-      scale: scales.ScaleProtocol = scales.DEFAULT_SCALE,
-  ) -> ShallowWaterSpecs:
-    # pylint: disable=g-doc-args,g-doc-return-or-yield
-    """Constructs `ShallowWaterSpecs` from constants with units.
-
-    By default uses units in which the radius and angular_velocity are set to
-    one.
-    """
-    return cls(scale.nondimensionalize(densities),
-               scale.nondimensionalize(radius_si),
-               scale.nondimensionalize(angular_velocity_si),
-               scale.nondimensionalize(gravity_acceleration_si),
-               scale)
+# For backwards compatibility.
+ShallowWaterSpecs = units.SimUnits
 
 
 #  =============================================================================
@@ -190,9 +133,10 @@ class ShallowWaterEquations(time_integration.ImplicitExplicitODE):
   """
 
   coords: coordinate_systems.CoordinateSystem
-  physics_specs: ShallowWaterSpecs
+  physics_specs: units.SimUnitsProtocol
   orography: Array
   reference_potential: Array
+  densities: Array = dataclasses.field(default_factory=lambda: np.ones((1,)))
 
   @property
   def coriolis_parameter(self) -> Array:
@@ -203,7 +147,7 @@ class ShallowWaterEquations(time_integration.ImplicitExplicitODE):
   @property
   def density_ratios(self) -> Array:
     """Returns `density_ratios` with spatial dimensions appended."""
-    return get_density_ratios(self.physics_specs.densities)
+    return get_density_ratios(self.densities)
 
   @property
   def ref_potential(self) -> Array:
@@ -289,9 +233,10 @@ class ShallowWaterEquations(time_integration.ImplicitExplicitODE):
 def shallow_water_leapfrog_step(
     coords: coordinate_systems.CoordinateSystem,
     dt: float,
-    physics_specs: ShallowWaterSpecs,
+    physics_specs: units.SimUnitsProtocol,
     mean_potential: np.ndarray,
     orography: Array | None = None,
+    densities: np.ndarray = np.ones((1,)),
     alpha: float = 0.5,
 ) -> typing.TimeStepFn:
   """Returns a step function based on semi-implicit leapfrog integrator.
@@ -305,6 +250,7 @@ def shallow_water_leapfrog_step(
       starting from the top.
     orography: the geopotential g · h corresponding to the orography underlying
       the simulation. Must be in the spectral/modal basis.
+    densities: a vector of densities for each layer.
     alpha: a parameter used to weight previous and future terms in the implicit
       portion of the equation: `f_i(alpha * future + (1 - alpha) * previous)`
 
@@ -314,7 +260,7 @@ def shallow_water_leapfrog_step(
     next state.
   """
   shallow_water_ode = ShallowWaterEquations(
-      coords, physics_specs, orography, mean_potential
+      coords, physics_specs, orography, mean_potential, densities=densities
   )
   return time_integration.semi_implicit_leapfrog(shallow_water_ode, dt, alpha)
 
@@ -322,17 +268,18 @@ def shallow_water_leapfrog_step(
 def shallow_water_leapfrog_trajectory(
     coords: coordinate_systems.CoordinateSystem,
     dt: float,
-    physics_specs: ShallowWaterSpecs,
+    physics_specs: units.SimUnitsProtocol,
     inner_steps: int,
     outer_steps: int,
     mean_potential: np.ndarray,
     orography: Array | None = None,
+    densities: np.ndarray = np.ones((1,)),
     filters: Sequence[typing.PyTreeStepFilterFn] = (),
     alpha: float = 0.5,
 ) -> typing.TrajectoryFn:
   """Returns a trajectory function for shallow water equations."""
   step_fn = shallow_water_leapfrog_step(
-      coords, dt, physics_specs, mean_potential, orography, alpha
+      coords, dt, physics_specs, mean_potential, orography, densities, alpha
   )
   step_fn = time_integration.step_with_filters(step_fn, filters)
   post_process_fn = lambda x: x[0]
