@@ -27,6 +27,7 @@ import tree_math
 Array = np.ndarray | jnp.ndarray
 ArrayOrArrayTuple = Array | tuple[Array, ...]
 Numeric = float | int | Array
+Unit = scales.Unit
 Quantity = scales.Quantity
 PRNGKeyArray = Any
 

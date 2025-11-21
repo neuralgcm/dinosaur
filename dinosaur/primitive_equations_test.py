@@ -22,12 +22,11 @@ from dinosaur import spherical_harmonic
 from dinosaur import time_integration
 from dinosaur import xarray_utils
 import jax
-from jax import config
 import jax.numpy as jnp
 import numpy as np
 
 
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
 
 units = scales.units
 

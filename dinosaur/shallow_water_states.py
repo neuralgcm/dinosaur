@@ -201,6 +201,7 @@ def get_height(
 def barotropic_instability_tc(
     coords: coordinate_systems.CoordinateSystem,
     physics_specs: Any,
+    densities: Array = np.ones((1,)),
 ) -> tuple[Callable[..., shallow_water.State], typing.AuxFeatures]:
   """Returns a function that generates random states and static features.
 
@@ -210,6 +211,7 @@ def barotropic_instability_tc(
   Args:
     coords: horizontal and vertical descritization.
     physics_specs: physics specs describing global physical parameters.
+    densities: a non-decreasing vector of densities, starting from the top.
 
   Returns:
     random_state_fn: function that generates a randomized initial state.
@@ -227,7 +229,7 @@ def barotropic_instability_tc(
     # then adding a small 'bump' to the potential.
     zonal_velocity = jnp.stack([get_zonal_velocity(lat, parameters)
                                 for _ in range(coords.vertical.layers)])
-    steady = multi_layer(zonal_velocity, physics_specs.densities, coords)
+    steady = multi_layer(zonal_velocity, densities, coords)
     bump_potential = coords.horizontal.to_modal(
         get_height(*coords.horizontal.nodal_mesh, parameters) * physics_specs.g)
     initial_state = shallow_water.State(

@@ -23,11 +23,11 @@ from dinosaur import layer_coordinates
 from dinosaur import primitive_equations
 from dinosaur import primitive_equations_states
 from dinosaur import scales
-from dinosaur import shallow_water
 from dinosaur import shallow_water_states
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
+from dinosaur import units
 from dinosaur import vertical_interpolation
 from dinosaur import xarray_utils
 import jax
@@ -230,9 +230,9 @@ class XarrayUtilsTest(parameterized.TestCase):
   def test_shallow_water_eq_data_to_xarray(
       self, samples, time_steps, dt, layers, wavenumbers, attrs
   ):
-    physics_specs = shallow_water.ShallowWaterSpecs.from_si(
-        np.ones((layers,)) * scales.WATER_DENSITY
-    )
+    physics_specs = units.SimUnits.from_si()
+    densities = np.ones((layers,)) * scales.WATER_DENSITY
+    nondim_densities = physics_specs.nondimensionalize(densities)
     grid = spherical_harmonic.Grid.with_wavenumbers(
         wavenumbers, radius=physics_specs.radius
     )
@@ -244,9 +244,7 @@ class XarrayUtilsTest(parameterized.TestCase):
     lat = np.arcsin(sin_lat)
     velocity_function = lambda lat: np.cos(lat) ** 2 / 5
     velocity = np.stack([velocity_function(lat)] * layers)
-    state = shallow_water_states.multi_layer(
-        velocity, physics_specs.densities, coords
-    )
+    state = shallow_water_states.multi_layer(velocity, nondim_densities, coords)
 
     trajectory = jax.tree.map(
         lambda *args: np.stack(args), *([state] * time_steps)

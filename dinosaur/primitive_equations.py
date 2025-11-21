@@ -22,11 +22,11 @@ from typing import Any, Callable, Mapping, Sequence
 
 from dinosaur import coordinate_systems
 from dinosaur import jax_numpy_utils
-from dinosaur import scales
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
 from dinosaur import typing
+from dinosaur import units
 from dinosaur import vertical_interpolation
 import jax
 from jax import lax
@@ -34,7 +34,6 @@ import jax.numpy as jnp
 import numpy as np
 import tree_math
 
-units = scales.units
 
 Array = typing.Array
 Numeric = typing.Numeric
@@ -262,110 +261,8 @@ def semi_lagrangian_vertical_advection_step(
   return jax.tree_util.tree_map(interpolate, state)
 
 
-@dataclasses.dataclass(frozen=True)
-class PrimitiveEquationsSpecs:
-  """Physical constants and scale used in the primitive equations.
-
-  Attributes:
-    radius: the non-dimensionalized radius of the domain.
-    angular_velocity: the non-dimensionalized angular velocity of the rotating
-      domain.
-    gravity_acceleration: the non-dimensionalized value of gravitational
-      acceleration.
-    ideal_gas_constant: the non-dimensionalized gas constant.
-    water_vapor_gas_constant: the non-dimensionalized gas constant for vapor.
-    water_vapor_isobaric_heat_capacity: isobaric heat capacity of vapor.
-    kappa: `ideal_gas_constant / Cp` where  Cp is the isobaric heat capacity.
-    scale: an instance implementing `ScaleProtocol` that will be used to
-      (non-)dimensionalize quantities.
-  """
-
-  radius: float
-  angular_velocity: float
-  gravity_acceleration: float
-  ideal_gas_constant: float
-  water_vapor_gas_constant: float
-  water_vapor_isobaric_heat_capacity: float
-  kappa: float
-  scale: scales.ScaleProtocol
-
-  @property
-  def R(self) -> float:
-    """Alias for `ideal_gas_constant`."""
-    return self.ideal_gas_constant
-
-  @property
-  def R_vapor(self) -> float:
-    """Alias for `ideal_gas_constant`."""
-    return self.water_vapor_gas_constant
-
-  @property
-  def g(self) -> float:
-    """Alias for `gravity_acceleration`."""
-    return self.gravity_acceleration
-
-  @property
-  def Cp(self) -> float:
-    """Isobaric heat capacity."""
-    return self.ideal_gas_constant / self.kappa
-
-  @property
-  def Cp_vapor(self) -> float:
-    """Alias for `water_vapor_isobaric_heat_capacity`."""
-    return self.water_vapor_isobaric_heat_capacity
-
-  def nondimensionalize(self, quantity: Quantity) -> Numeric:
-    """Non-dimensionalizes and rescales `quantity`."""
-    return self.scale.nondimensionalize(quantity)
-
-  def nondimensionalize_timedelta64(self, timedelta: np.timedelta64) -> Numeric:
-    """Non-dimensionalizes and rescales a numpy timedelta."""
-    base_unit = 's'
-    return self.scale.nondimensionalize(
-        timedelta / np.timedelta64(1, base_unit) * units(base_unit)
-    )
-
-  def dimensionalize(self, value: Numeric, unit: units.Unit) -> Quantity:
-    """Rescales and adds units to the given non-dimensional value."""
-    return self.scale.dimensionalize(value, unit)
-
-  def dimensionalize_timedelta64(self, value: Numeric) -> np.timedelta64:
-    """Rescales and casts the given non-dimensional value to timedelta64."""
-    base_unit = 's'  # return value is rounded down to nearest base_unit
-    dt = self.scale.dimensionalize(value, units(base_unit)).m
-    if isinstance(dt, np.ndarray):
-      return dt.astype(f'timedelta64[{base_unit}]')
-    else:
-      return np.timedelta64(int(dt), base_unit)
-
-  @classmethod
-  def from_si(
-      cls,
-      radius_si: Quantity = scales.RADIUS,
-      angular_velocity_si: Quantity = scales.ANGULAR_VELOCITY,
-      gravity_acceleration_si: Quantity = scales.GRAVITY_ACCELERATION,
-      ideal_gas_constant_si: Quantity = scales.IDEAL_GAS_CONSTANT,
-      water_vapor_gas_constant_si: Quantity = scales.IDEAL_GAS_CONSTANT_H20,
-      water_vapor_isobaric_heat_capacity_si: Quantity = scales.WATER_VAPOR_CP,
-      kappa_si: Quantity = scales.KAPPA,
-      scale: scales.ScaleProtocol = scales.DEFAULT_SCALE,
-  ) -> PrimitiveEquationsSpecs:
-    # pylint: disable=g-doc-args,g-doc-return-or-yield
-    """Constructs `PrimitiveEquantionSpecs` from constants with units.
-
-    By default uses units in which the radius and angular_velocity are set to
-    one.
-    """
-    return cls(
-        scale.nondimensionalize(radius_si),
-        scale.nondimensionalize(angular_velocity_si),
-        scale.nondimensionalize(gravity_acceleration_si),
-        scale.nondimensionalize(ideal_gas_constant_si),
-        scale.nondimensionalize(water_vapor_gas_constant_si),
-        scale.nondimensionalize(water_vapor_isobaric_heat_capacity_si),
-        scale.nondimensionalize(kappa_si),
-        scale,
-    )
+# For backwards compatibility.
+PrimitiveEquationsSpecs = units.SimUnits
 
 
 #  =============================================================================
@@ -820,7 +717,7 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
   reference_temperature: np.ndarray
   orography: Array
   coords: coordinate_systems.CoordinateSystem
-  physics_specs: PrimitiveEquationsSpecs
+  physics_specs: units.SimUnitsProtocol
 
   vertical_matmul_method: str | None = dataclasses.field(
       default=None, kw_only=True
