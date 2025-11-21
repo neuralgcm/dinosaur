@@ -32,6 +32,7 @@ jobs:
         cache: 'pip'
     - name: Install Dinosaur
       run: |
+        pip install google-crc32c
         pip install -e .[tests]
     - name: Run unit tests
       # TODO(shoyer): re-enable regrid_test once we figure out how to install Beam on GitHub actions

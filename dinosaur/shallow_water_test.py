@@ -26,11 +26,11 @@ At present, the tests cover only test case 2 from the paper, "Steady State
 Nonlinear Zonal Geostrophic Flow." We plan to add additional test cases as we
 build out the feature set of the solver.
 """
+
 import unittest
 
 from absl.testing import absltest
 from absl.testing import parameterized
-
 from dinosaur import associated_legendre
 from dinosaur import coordinate_systems
 from dinosaur import layer_coordinates
@@ -39,12 +39,12 @@ from dinosaur import shallow_water
 from dinosaur import shallow_water_states
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
-
+from dinosaur import units
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-units = scales.units
+
 jax.config.parse_flags_with_absl()
 
 
@@ -146,14 +146,20 @@ class ShallowWaterTest(parameterized.TestCase):
     vertical_grid = layer_coordinates.LayerCoordinates(layers)
     coords = coordinate_systems.CoordinateSystem(grid, vertical_grid)
     density = np.array([density_ratio ** n for n in range(layers)][::-1])
-    physics_specs = shallow_water.ShallowWaterSpecs.from_si(
-        density * scales.WATER_DENSITY)
+    physics_specs = units.SimUnits.from_si()
+    nondim_densities = physics_specs.nondimensionalize(
+        density * scales.WATER_DENSITY
+    )
     mean_potential = np.ones(layers) * mean_potential
     orography = None  # no orography in the geostrophic flow test case.
 
     # Set up time integration of the shallow water equations.
     equation = shallow_water.ShallowWaterEquations(
-        coords, physics_specs, orography, mean_potential
+        coords,
+        physics_specs,
+        orography,
+        mean_potential,
+        densities=nondim_densities,
     )
     step_fn = time_integration.imex_rk_sil3(equation, dt)
     filters = [
@@ -167,7 +173,8 @@ class ShallowWaterTest(parameterized.TestCase):
     lat = np.arccos(grid.cos_lat)
     velocity = jnp.stack([velocity_function(lat)] * layers)
     initial_state = shallow_water_states.multi_layer(
-        velocity, density, coords)
+        velocity, nondim_densities, coords
+    )
 
     # Quantities that will be used to compute relative errors.
     init_potential = grid.to_nodal(initial_state.potential)
@@ -198,30 +205,30 @@ class ShallowWaterTest(parameterized.TestCase):
       dict(wavenumbers=128,
            layers=1,
            density_ratio=.9,
-           max_velocity=20 * units.meter / units.second,
-           mountain_height=0 * units.meter,
-           atmosphere_thickness=5960 * units.meter,
-           total_time=15 * units.day,
-           save_every=6 * units.hour,
-           dt=60 * units.second),
+           max_velocity=20 * scales.units.meter / scales.units.second,
+           mountain_height=0 * scales.units.meter,
+           atmosphere_thickness=5960 * scales.units.meter,
+           total_time=15 * scales.units.day,
+           save_every=6 * scales.units.hour,
+           dt=60 * scales.units.second),
       dict(wavenumbers=128,
            layers=1,
            density_ratio=.9,
-           max_velocity=20 * units.meter / units.second,
-           mountain_height=2000 * units.meter,
-           atmosphere_thickness=5960 * units.meter,
-           total_time=15 * units.day,
-           save_every=6 * units.hour,
-           dt=60 * units.second),
+           max_velocity=20 * scales.units.meter / scales.units.second,
+           mountain_height=2000 * scales.units.meter,
+           atmosphere_thickness=5960 * scales.units.meter,
+           total_time=15 * scales.units.day,
+           save_every=6 * scales.units.hour,
+           dt=60 * scales.units.second),
       dict(wavenumbers=64,
            layers=3,
            density_ratio=.9,
-           max_velocity=25 * units.meter / units.second,
-           mountain_height=3000 * units.meter,
-           atmosphere_thickness=7000 * units.meter,
-           total_time=15 * units.day,
-           save_every=6 * units.hour,
-           dt=60 * units.second),
+           max_velocity=25 * scales.units.meter / scales.units.second,
+           mountain_height=3000 * scales.units.meter,
+           atmosphere_thickness=7000 * scales.units.meter,
+           total_time=15 * scales.units.day,
+           save_every=6 * scales.units.hour,
+           dt=60 * scales.units.second),
   )
   def testFlowOverAMountainMassConservation(
       self, wavenumbers, layers, density_ratio, max_velocity, mountain_height,
@@ -242,8 +249,10 @@ class ShallowWaterTest(parameterized.TestCase):
     density = np.array([density_ratio ** n for n in range(layers)][::-1])
     vertical_grid = layer_coordinates.LayerCoordinates(layers)
     coords = coordinate_systems.CoordinateSystem(grid, vertical_grid)
-    physics_specs = shallow_water.ShallowWaterSpecs.from_si(
-        densities=density * scales.WATER_DENSITY)
+    physics_specs = units.SimUnits.from_si()
+    nondim_densities = physics_specs.nondimensionalize(
+        density * scales.WATER_DENSITY
+    )
 
     # Construct initial state.
     max_v = physics_specs.nondimensionalize(max_velocity)
@@ -276,7 +285,11 @@ class ShallowWaterTest(parameterized.TestCase):
 
     # Set up time integration of the shallow water equations.
     equation = shallow_water.ShallowWaterEquations(
-        coords, physics_specs, orography, mean_potential
+        coords,
+        physics_specs,
+        orography,
+        mean_potential,
+        densities=nondim_densities,
     )
     step_fn = time_integration.imex_rk_sil3(equation, dt)
     filters = [
@@ -289,9 +302,11 @@ class ShallowWaterTest(parameterized.TestCase):
     # Perform integration and check conservation of mass.
     _, trajectory = trajectory_fn(initial_state)
     initial_mass = _compute_mass(
-        grid, initial_state.potential, mean_potential, density)
+        grid, initial_state.potential, mean_potential, nondim_densities
+    )
     masses = _compute_mass(
-        grid, trajectory.potential, mean_potential, density)
+        grid, trajectory.potential, mean_potential, nondim_densities
+    )
     np.testing.assert_allclose(masses, initial_mass, rtol=1e-6)
 
 
