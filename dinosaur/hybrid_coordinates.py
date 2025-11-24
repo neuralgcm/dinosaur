@@ -21,6 +21,7 @@ import functools
 import importlib
 
 import dinosaur
+from dinosaur import jax_numpy_utils
 from dinosaur import sigma_coordinates
 from dinosaur import typing
 import jax
@@ -34,6 +35,202 @@ einsum = functools.partial(jnp.einsum, precision=lax.Precision.HIGHEST)
 # For consistency with commonly accepted notation, we use Greek letters within
 # some of the functions below.
 # pylint: disable=invalid-name
+
+
+def _slice_shape_along_axis(
+    x: np.ndarray,
+    axis: int,
+    slice_width: int = 1,
+) -> tuple[int, ...]:
+  """Returns a shape of `x` sliced along `axis` with width `slice_width`."""
+  x_shape = list(x.shape)
+  x_shape[axis] = slice_width
+  return tuple(x_shape)
+
+
+@jax.named_call
+def cumulative_integral_over_pressure(
+    x: Array,
+    surface_pressure: Array,
+    coordinates: HybridCoordinates,
+    axis: int = -3,
+    downward: bool = True,
+    cumsum_method: str = 'dot',
+    sharding: jax.sharding.NamedSharding | None = None,
+) -> jax.Array:
+  """Approximates cumulative integral of `x` with respect to pressure."""
+  if coordinates.layers != x.shape[axis]:
+    raise ValueError(
+        '`x.shape[axis]` must be equal to `coordinates.layers`;'
+        f'got {x.shape[axis]} and {coordinates.layers}.'
+    )
+  a_thickness = coordinates.pressure_thickness
+  b_thickness = coordinates.sigma_thickness
+  a_thickness = a_thickness.astype(x.dtype)[:, np.newaxis, np.newaxis]
+  b_thickness = b_thickness.astype(x.dtype)[:, np.newaxis, np.newaxis]
+  dp = a_thickness + b_thickness * surface_pressure
+  xdp = x * dp
+  if downward:
+    return jax_numpy_utils.cumsum(
+        xdp, axis, method=cumsum_method, sharding=sharding
+    )
+  else:
+    return jax_numpy_utils.reverse_cumsum(
+        xdp, axis, method=cumsum_method, sharding=sharding
+    )
+
+
+@jax.named_call
+def integral_over_pressure(
+    x: Array,
+    surface_pressure: Array,
+    coordinates: HybridCoordinates,
+    axis: int = -3,
+    keepdims: bool = True,
+) -> jax.Array:
+  """Approximates definite integral of `x` over pressure."""
+  if coordinates.layers != x.shape[axis]:
+    raise ValueError(
+        '`x.shape[axis]` must be equal to `coordinates.layers`;'
+        f'got {x.shape[axis]} and {coordinates.layers}.'
+    )
+  a_thickness = coordinates.pressure_thickness
+  b_thickness = coordinates.sigma_thickness
+  a_thickness = a_thickness.astype(x.dtype)[:, np.newaxis, np.newaxis]
+  b_thickness = b_thickness.astype(x.dtype)[:, np.newaxis, np.newaxis]
+  dp = a_thickness + b_thickness * surface_pressure
+  xdp = x * dp
+  return xdp.sum(axis=axis, keepdims=keepdims)
+
+
+@jax.named_call
+def cumulative_integral_over_sigma(
+    x: Array,
+    coordinates: HybridCoordinates,
+    axis: int = -3,
+    downward: bool = True,
+    cumsum_method: str = 'dot',
+    sharding: jax.sharding.NamedSharding | None = None,
+) -> jax.Array:
+  """Approximates cumulative integral of `x` over `dσ` variables."""
+  # Note: This integral only includes the sigma and not the pressure component.
+  if coordinates.layers != x.shape[axis]:
+    raise ValueError(
+        '`x.shape[axis]` must be equal to `coordinates.layers`;'
+        f'got {x.shape[axis]} and {coordinates.layers}.'
+    )
+  x_axes = range(x.ndim)
+  d_sigma = coordinates.sigma_thickness
+  d_sigma_axes = [x_axes[axis]]
+  x_d_sigma = einsum(x, x_axes, d_sigma, d_sigma_axes, x_axes)
+  if downward:
+    return jax_numpy_utils.cumsum(
+        x_d_sigma, axis, method=cumsum_method, sharding=sharding
+    )
+  else:
+    return jax_numpy_utils.reverse_cumsum(
+        x_d_sigma, axis, method=cumsum_method, sharding=sharding
+    )
+
+
+@jax.named_call
+def integral_over_sigma(
+    x: Array,
+    coordinates: HybridCoordinates,
+    axis: int = -3,
+    keepdims: bool = True,
+) -> jax.Array:
+  """Approximates definite integral of `x` over `sigma` coordinate."""
+  if coordinates.layers != x.shape[axis]:
+    raise ValueError(
+        '`x.shape[axis]` must be equal to `coordinates.layers`;'
+        f'got {x.shape[axis]} and {coordinates.layers}.'
+    )
+  x_axes = range(x.ndim)
+  d_sigma = coordinates.sigma_thickness
+  d_sigma_axes = [x_axes[axis]]
+  x_d_sigma = einsum(x, x_axes, d_sigma, d_sigma_axes, x_axes)
+  return x_d_sigma.sum(axis=axis, keepdims=keepdims)
+
+
+def centered_difference(
+    x: Array,
+    coordinates: HybridCoordinates,
+    axis: int = -3,
+) -> Array:
+  """Derivative of `x` with respect to `η` along specified `axis`.
+
+  The derivative is approximated as
+
+  (∂x / ∂η)[n + ½] ≈ (x[n + 1] - x[n]) / (η[n + 1] - η[n])
+
+  So, the derivatives will be located on the 'boundaries' between layers and
+  will consist of one fewer values than `x`.
+
+  Args:
+    x: an array of values with `x.shape[axis] == coordinates.layers`. These
+      values are "located" at `coordinates` layer centers.
+    coordinates: a `HybridCoordinates` object describing the vertical
+      coordinates to differentiate against. Must satisfy `coordinates.layers ==
+      x.shape[axis]`.
+    axis: the axis along which to approximate the derivative. Defaults to -3
+      since this is the axis we typically use to index layers.
+
+  Returns:
+    An array `x_η` with `x_η.shape[axis] == x.shape[axis] - 1`,
+    containing approximate values of the derivative at of `x` at
+    `coordinates.internal_boundaries`.
+  """
+  if coordinates.layers != x.shape[axis]:
+    raise ValueError(
+        '`x.shape[axis]` must be equal to `coordinates.layers`; '
+        f'got {x.shape[axis]} and {coordinates.layers}.'
+    )
+
+  dx = jax_numpy_utils.diff(x, axis=axis)
+  dx_axes = range(dx.ndim)
+  inv_dη = 1 / coordinates.center_to_center
+  inv_dη_axes = [dx_axes[axis]]
+  return einsum(dx, dx_axes, inv_dη, inv_dη_axes, dx_axes, precision='float32')
+
+
+@jax.named_call
+def centered_vertical_advection(
+    w: Array,
+    x: Array,
+    coordinates: HybridCoordinates,
+    axis: int = -3,
+    w_boundary_values: tuple[Array, Array] | None = None,
+    dx_dη_boundary_values: tuple[Array, Array] | None = None,
+) -> jnp.ndarray:
+  """Compute vertical advection using 2nd order finite differences."""
+  if w_boundary_values is None:
+    w_slc_shape = _slice_shape_along_axis(w, axis)
+    w_boundary_values = (
+        jnp.zeros(w_slc_shape, dtype=jax.dtypes.canonicalize_dtype(w.dtype)),
+        jnp.zeros(w_slc_shape, dtype=jax.dtypes.canonicalize_dtype(w.dtype)),
+    )
+  if dx_dη_boundary_values is None:
+    x_slc_shape = _slice_shape_along_axis(x, axis)
+    dx_dη_boundary_values = (
+        jnp.zeros(x_slc_shape, dtype=jax.dtypes.canonicalize_dtype(x.dtype)),
+        jnp.zeros(x_slc_shape, dtype=jax.dtypes.canonicalize_dtype(x.dtype)),
+    )
+
+  w_boundary_top, w_boundary_bot = w_boundary_values
+  w = jnp.concatenate([w_boundary_top, w, w_boundary_bot], axis=axis)
+
+  x_diff = centered_difference(x, coordinates, axis)
+  x_diff_boundary_top, x_diff_boundary_bot = dx_dη_boundary_values
+  x_diff = jnp.concatenate(
+      [x_diff_boundary_top, x_diff, x_diff_boundary_bot], axis=axis
+  )
+
+  w_times_x_diff = w * x_diff
+  return -0.5 * (
+      lax.slice_in_dim(w_times_x_diff, 1, None, axis=axis)
+      + lax.slice_in_dim(w_times_x_diff, 0, -1, axis=axis)
+  )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -98,14 +295,14 @@ class HybridCoordinates:
 
     This uses a power-law strategy to blend from pressure to sigma.
 
-    The vertical domain is defined by a master coordinate `eta` in [0, 1].
-    The distribution of `eta` is stretched to concentrate levels near the
+    The vertical domain is defined by a master coordinate `η` in [0, 1].
+    The distribution of `η` is stretched to concentrate levels near the
     surface.
 
     The pressure is then split into A and B coefficients such that:
-        P(eta) = A(eta) * p_ref + B(eta) * p_s
+        P(η) = A(η) * p_ref + B(η) * p_s
 
-    When p_s == p_ref, the total pressure is exactly P(eta).
+    When p_s == p_ref, the total pressure is exactly P(η).
 
     Args:
         n_levels: Number of vertical layers (resulting in n_levels + 1
