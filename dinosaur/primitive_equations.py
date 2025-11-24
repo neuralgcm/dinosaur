@@ -82,9 +82,6 @@ def _asdict(state: State) -> dict[str, Any]:
 State.asdict = _asdict
 
 
-StateWithTime = State  # deprecated alias
-
-
 class StateShapeError(Exception):
   """Exceptions for unexpected state shapes."""
 
@@ -121,8 +118,18 @@ def validate_state_shape(
       )
 
 
+@jax.named_call
+def _vertical_matvec(a: Array, x: Array) -> jax.Array:
+  return einsum('gh,...hml->...gml', a, x)
+
+
+@jax.named_call
+def _vertical_matvec_per_wavenumber(a: Array, x: Array) -> jax.Array:
+  return einsum('lgh,...hml->...gml', a, x)
+
+
 @tree_math.struct
-class DiagnosticState:
+class DiagnosticStateSigma:
   """Stores nodal diagnostic values used to compute explicit tendencies.
 
   The expected shapes of the state are described in terms of # of layers `h`,
@@ -157,10 +164,10 @@ class DiagnosticState:
 
 
 @jax.named_call
-def compute_diagnostic_state(
+def compute_diagnostic_state_sigma(
     state: State,
     coords: coordinate_systems.CoordinateSystem,
-) -> DiagnosticState:
+) -> DiagnosticStateSigma:
   """Computes DiagnosticState in nodal basis based on the modal `state`."""
 
   # TODO(dkochkov) Investigate clipping hyperparameters.
@@ -203,7 +210,7 @@ def compute_diagnostic_state(
   sigma_dot_full = lax.slice_in_dim(
       sum_𝜎 * lax.slice_in_dim(f_full, -1, None) - f_full, 0, -1
   )
-  return DiagnosticState(
+  return DiagnosticStateSigma(
       vorticity=nodal_vorticity,
       divergence=nodal_divergence,
       temperature_variation=nodal_temperature_variation,
@@ -229,11 +236,13 @@ def _vertical_interp(x, xp, fp):
   return interpolate_fn(x, xp, fp)
 
 
-def compute_vertical_velocity(
+def compute_vertical_velocity_sigma(
     state: State, coords: coordinate_systems.CoordinateSystem
 ) -> jax.Array:
   """Calculate vertical velocity at the center of each layer."""
-  sigma_dot_boundaries = compute_diagnostic_state(state, coords).sigma_dot_full
+  sigma_dot_boundaries = compute_diagnostic_state_sigma(
+      state, coords
+  ).sigma_dot_full
   assert sigma_dot_boundaries.ndim == 3
   # This matches the default boundary conditions for vertical velocity
   # from sigma_coordinates.centered_vertical_advection
@@ -241,11 +250,11 @@ def compute_vertical_velocity(
   return 0.5 * (sigma_dot_padded[1:] + sigma_dot_padded[:-1])
 
 
-def semi_lagrangian_vertical_advection_step(
+def semi_lagrangian_vertical_advection_step_sigma(
     state: State, coords: coordinate_systems.CoordinateSystem, dt: float
 ) -> State:
   """Take a first-order step for semi-Lagrangian vertical advection."""
-  velocity = compute_vertical_velocity(state, coords)
+  velocity = compute_vertical_velocity_sigma(state, coords)
   target = coords.vertical.centers
   source = target[:, jnp.newaxis, jnp.newaxis] - dt * velocity
 
@@ -261,11 +270,7 @@ def semi_lagrangian_vertical_advection_step(
   return jax.tree_util.tree_map(interpolate, state)
 
 
-# For backwards compatibility.
-PrimitiveEquationsSpecs = units.SimUnits
-
-
-#  =============================================================================
+# ==============================================================================
 #  Helper Functions
 #
 #  Functions used to compute individual terms and intermediate values for the
@@ -296,7 +301,7 @@ def get_sigma_ratios(
   return alpha
 
 
-def get_geopotential_weights(
+def get_geopotential_weights_sigma(
     coordinates: sigma_coordinates.SigmaCoordinates,
     ideal_gas_constant: float,
 ) -> np.ndarray:
@@ -331,7 +336,7 @@ def get_geopotential_weights(
   return ideal_gas_constant * weights
 
 
-def get_geopotential_diff(
+def get_geopotential_diff_sigma(
     temperature: Array,
     coordinates: sigma_coordinates.SigmaCoordinates,
     ideal_gas_constant: float,
@@ -340,7 +345,7 @@ def get_geopotential_diff(
 ) -> jax.Array:
   """Calculate the implicit geopotential term."""
   if method == 'dense':
-    weights = get_geopotential_weights(coordinates, ideal_gas_constant)
+    weights = get_geopotential_weights_sigma(coordinates, ideal_gas_constant)
     return _vertical_matvec(weights, temperature)
   elif method == 'sparse':
     alpha = ideal_gas_constant * get_sigma_ratios(coordinates)
@@ -357,72 +362,59 @@ def get_geopotential_diff(
     raise ValueError(f'unknown {method=} for get_geopotential_diff')
 
 
-def get_geopotential(
-    temperature_variation: Array,
-    reference_temperature: Array,
-    orography: Array,
-    coordinates: sigma_coordinates.SigmaCoordinates,
+def get_geopotential_on_sigma(
+    temperature: typing.Array,
+    specific_humidity: typing.Array | None = None,
+    clouds: typing.Array | None = None,
+    *,
+    nodal_orography: typing.Array,
+    sigma: sigma_coordinates.SigmaCoordinates,
     gravity_acceleration: float,
     ideal_gas_constant: float,
+    water_vapor_gas_constant: float | None = None,
     sharding: jax.sharding.NamedSharding | None = None,
 ) -> jnp.ndarray:
-  """Computes geopotential at sigma values determined by `coordinates`.
+  """Computes geopotential in nodal space using nodal temperature and moisture.
+
+  If `specific_humidity` is None, computes dry geopotential. If clouds are
+  provided, the cloud condensation is subtracted from the virtual temperature.
 
   Args:
-    temperature_variation: temperature variation in spectral basis.
-    reference_temperature: a vector of reference temperatures, indexed by layer.
-      Temperature in each layer is described as a deviation from this reference
-      value.
-    orography: the topography of the surface of the planet, in the spectral
-      basis.
-    coordinates: the `SigmaCoordinates` object describing the spacing of layers
-      in 𝜎 coordinates.
-    gravity_acceleration: the non-dimensionalized value of gravitational
-      acceleration.
-    ideal_gas_constant: the non-dimensionalized gas constant.
-    sharding: JAX sharding for temperature_variation and outputs.
+    temperature: nodal values of temperature.
+    specific_humidity: nodal values of specific humidity. If provided, moisture
+      effects are included in geopotential calculation.
+    clouds: nodal values of cloud condensate.
+    nodal_orography: nodal values of orography.
+    sigma: sigma coordinates.
+    gravity_acceleration: gravity.
+    ideal_gas_constant: ideal gas constant for dry air.
+    water_vapor_gas_constant: ideal gas constant for water vapor. Must be
+      provided if `specific_humidity` is provided.
+    sharding: optional sharding.
 
   Returns:
-    An array containing the geopotential in the spectral basis. Note that the
-    geopotential is computed relative to the radius of the planet, not relative
-    to the center of the planet.
+    Nodal geopotential.
   """
-  surface_geopotential = orography * gravity_acceleration
-  temperature = spherical_harmonic.add_constant(
-      temperature_variation, reference_temperature
-  )
-  geopotential_diff = get_geopotential_diff(
-      temperature, coordinates, ideal_gas_constant, sharding=sharding
-  )
-  return surface_geopotential + geopotential_diff
-
-
-def get_geopotential_with_moisture(
-    temperature: typing.Array,
-    specific_humidity: typing.Array,
-    nodal_orography: typing.Array,
-    coordinates: sigma_coordinates.SigmaCoordinates,
-    gravity_acceleration: float,
-    ideal_gas_constant: float,
-    water_vapor_gas_constant: float,
-    sharding: jax.sharding.NamedSharding | None = None,
-    clouds: typing.Array | None = None,
-) -> jnp.ndarray:
-  """Computes geopotential in nodal space using nodal temperature and `q`."""
-  gas_const_ratio = water_vapor_gas_constant / ideal_gas_constant
   surface_geopotential = nodal_orography * gravity_acceleration
-  if clouds is None:
-    clouds = 0.0
-  virtual_temp = temperature * (
-      1 + (gas_const_ratio - 1) * specific_humidity - clouds
-  )
-  geopotential_diff = get_geopotential_diff(
-      virtual_temp, coordinates, ideal_gas_constant, sharding=sharding
+  if specific_humidity is not None:
+    if water_vapor_gas_constant is None:
+      raise ValueError(
+          'Must provide `water_vapor_gas_constant` with `specific_humidity`.'
+      )
+    gas_const_ratio = water_vapor_gas_constant / ideal_gas_constant
+    cloud_effect = 0.0 if clouds is None else clouds
+    virtual_temp = temperature * (
+        1 + (gas_const_ratio - 1) * specific_humidity - cloud_effect
+    )
+  else:
+    virtual_temp = temperature
+  geopotential_diff = get_geopotential_diff_sigma(
+      virtual_temp, sigma, ideal_gas_constant, sharding=sharding
   )
   return surface_geopotential + geopotential_diff
 
 
-def get_temperature_implicit_weights(
+def get_temperature_implicit_weights_sigma(
     coordinates: sigma_coordinates.SigmaCoordinates,
     reference_temperature: np.ndarray,
     kappa: float,
@@ -508,7 +500,7 @@ def get_temperature_implicit_weights(
   return (h0 - k - k_shifted) * coordinates.layer_thickness
 
 
-def get_temperature_implicit(
+def get_temperature_implicit_sigma(
     divergence: Array,
     coordinates: sigma_coordinates.SigmaCoordinates,
     reference_temperature: np.ndarray,
@@ -517,7 +509,7 @@ def get_temperature_implicit(
     sharding: jax.sharding.NamedSharding | None = None,
 ) -> jax.Array:
   """Calculate the implicit temperature term."""
-  weights = -get_temperature_implicit_weights(
+  weights = -get_temperature_implicit_weights_sigma(
       coordinates, reference_temperature, kappa
   )
 
@@ -547,25 +539,7 @@ def get_temperature_implicit(
     raise ValueError(f'unknown {method=} for get_temperature_implicit')
 
 
-@jax.named_call
-def _vertical_matvec(a: Array, x: Array) -> jax.Array:
-  """Matrix-vector product `a.x` taken along the "vertical" axis, -3."""
-  return einsum('gh,...hml->...gml', a, x)
-
-
-@jax.named_call
-def _vertical_matvec_per_wavenumber(a: Array, x: Array) -> jax.Array:
-  """Same as `_vertical_matvec` but maps across `total_wavenumber`."""
-  # It turns out it's faster to use regular jnp.einsum here instead of
-  # jax_numpy_utils.sharded_einsum even in the vertical sharding case, because
-  # we use relatively few vertical layers so the dominant cost of the einsum
-  # is inter-core communication rather than MXU operations. XLA SPMD ends up
-  # implementing this einsum by replicating inputs across all shards, which it
-  # can reuse for each of a handful calls to `_vertical_matvec_per_wavenumber`.
-  return einsum('lgh,...hml->...gml', a, x)
-
-
-def _get_implicit_term_matrix(
+def _get_implicit_term_matrix_sigma(
     eta, coords, reference_temperature, kappa, ideal_gas_constant
 ) -> np.ndarray:
   """Returns a matrix corresponding to `PrimitiveEquations.implicit_terms`."""
@@ -574,9 +548,9 @@ def _get_implicit_term_matrix(
   # implicit term matrix.
   eye = np.eye(coords.vertical.layers)[np.newaxis]
   lam = coords.horizontal.laplacian_eigenvalues
-  g = get_geopotential_weights(coords.vertical, ideal_gas_constant)
+  g = get_geopotential_weights_sigma(coords.vertical, ideal_gas_constant)
   r = ideal_gas_constant
-  h = get_temperature_implicit_weights(
+  h = get_temperature_implicit_weights_sigma(
       coords.vertical, reference_temperature, kappa
   )
   t = reference_temperature[:, np.newaxis]
@@ -682,16 +656,18 @@ def filtered_modal_orography(
 
 
 #  =============================================================================
-#  The `PrimitiveEquations` Class
+#  The `PrimitiveEquations` Classes
 #
-#  The `PrimitiveEquations` class expresses the primitive equations in a form
-#  that is appropriate for semi-implicit time stepping.
+#  The `PrimitiveEquationsBase` class expresses the general structure of the
+#  primitive equations organized to be solved via semi-implicit time stepping.
+#  Subclasses `PrimitiveEquationsSigma` and `PrimitiveEquationsHybrid` then
+#  complete the implementation for sigma- and hybrid-coordinate systems.
 #  =============================================================================
 
 
 @dataclasses.dataclass
-class PrimitiveEquations(time_integration.ImplicitExplicitODE):
-  """A semi-implicit description of the primitive equations.
+class PrimitiveEquationsBase(time_integration.ImplicitExplicitODE):
+  """Base class for semi-implicit primitive equations.
 
   Attributes:
     reference_temperature: An array of shape [layers]. All temperature values
@@ -699,8 +675,8 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
     orography: An array of shape `coords.horizontal.modal_shape` describing the
       topography in modal representation.
     coords: horizontal and vertical descritization.
-    physics_specs: an `PrimitiveEquationSpecs` object describing the scales and
-      physical constants used in the primitive equations.
+    physics_specs: object holding physical constants and schema for converting
+      between dimensional and nondimensional quantities.
     vertical_matmul_method: 'dense' or 'sparse', indicating the method to use
       for vertical matrix multiplications inside calculations of implicit
       geopotential and temperature terms. 'sparse' uses a matrix-free
@@ -708,28 +684,30 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
       uses vertical sharding.
     implicit_inverse_method: 'split', 'stacked' or 'blockwise' method to use for
       the implicit inverse calculation.
-    vertical_advection: function to use for calculating tendencies from vertical
-      advection.
     include_vertical_advection: whether to include tendencies from vertical
       advection or to drop it.
+    humidity_key: Key for specific humidity in tracers dict. If provided,
+      moisture effects are included in the dynamics.
+    cloud_keys: Keys for cloud water species in tracers dict. If provided, cloud
+      effects are included in virtual temperature calculation.
   """
 
   reference_temperature: np.ndarray
   orography: Array
   coords: coordinate_systems.CoordinateSystem
   physics_specs: units.SimUnitsProtocol
-
   vertical_matmul_method: str | None = dataclasses.field(
       default=None, kw_only=True
   )
   implicit_inverse_method: str = dataclasses.field(
       default='split', kw_only=True
   )
-  vertical_advection: Callable[..., jax.Array] = dataclasses.field(
-      default=sigma_coordinates.centered_vertical_advection, kw_only=True
-  )
   include_vertical_advection: bool = dataclasses.field(
       default=True, kw_only=True
+  )
+  humidity_key: str | None = dataclasses.field(default=None, kw_only=True)
+  cloud_keys: tuple[str, ...] | None = dataclasses.field(
+      default=None, kw_only=True
   )
 
   def __post_init__(self):
@@ -740,6 +718,31 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
           'inconsistent radius between coordinates and constants: '
           f'{self.coords.horizontal.radius=} != {self.physics_specs.radius=}'
       )
+    if self.cloud_keys is not None and self.humidity_key is None:
+      raise ValueError('cloud_keys requires humidity_key to be set.')
+
+  def _get_tracer(self, state_or_aux_state: Any, key: str) -> Array:
+    if key not in state_or_aux_state.tracers:
+      raise ValueError(
+          f'`{key}` is not found in tracers: '
+          f'{state_or_aux_state.tracers.keys()}.'
+      )
+    return state_or_aux_state.tracers[key]
+
+  def _get_specific_humidity(self, state_or_aux_state: Any) -> Array:
+    """Extracts `speicific_humidity` from tracers."""
+    if self.humidity_key is None:
+      raise ValueError('humidity_key is not set.')
+    return self._get_tracer(state_or_aux_state, self.humidity_key)
+
+  def _cloud_virtual_t_adjustment(self, aux_state: Any) -> Array:
+    """Extracts adjustment to the virtual temperature due to clouds."""
+    adjustment = jnp.asarray(0.0)
+    if self.cloud_keys is not None:
+      for key in self.cloud_keys:
+        # clouds reduce the virtual temperature, hence the negative sign.
+        adjustment -= self._get_tracer(aux_state, key)
+    return adjustment
 
   @property
   def coriolis_parameter(self) -> Array:
@@ -755,7 +758,166 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
   @jax.named_call
   def _vertical_tendency(self, w: Array, x: Array) -> Array:
     """Computes vertical nodal tendency of `x` due to vertical_velocity `w`."""
-    return self.vertical_advection(w, x, self.coords.vertical)
+    # subclasses must define `vertical_advection` attribute.
+    return self.vertical_advection(w, x, self.coords.vertical)  # pytype: disable=attribute-error
+
+  @jax.named_call
+  def kinetic_energy_tendency(self, aux_state: Any) -> Array:
+    """Computes explicit tendency of divergence due to kinetic energy term."""
+    nodal_cos_lat_u2 = jnp.stack(aux_state.cos_lat_u) ** 2
+    kinetic = nodal_cos_lat_u2.sum(0) * self.coords.horizontal.sec2_lat / 2
+    return -self.coords.horizontal.laplacian(
+        self.coords.horizontal.to_modal(kinetic)
+    )
+
+  @jax.named_call
+  def orography_tendency(self) -> Array:
+    """Computes orography contribution to div tendency due to geopotential."""
+    # this term should broadcast correctly as layers are leading indices.
+    return -self.physics_specs.g * self.coords.horizontal.laplacian(
+        self.orography
+    )
+
+  @jax.named_call
+  def horizontal_scalar_advection(
+      self,
+      scalar: Array,
+      aux_state: Any,
+  ) -> tuple[Array, Array]:
+    """Computes explicit tendency of `scalar` due to horizontal advection."""
+    u, v = aux_state.cos_lat_u
+    nodal_terms = scalar * aux_state.divergence
+    modal_terms = -div_sec_lat(u * scalar, v * scalar, self.coords.horizontal)
+    return nodal_terms, modal_terms
+
+  def _get_geopotential_diff(
+      self,
+      temperature_diff: Array,
+      method: str,
+      sharding: jax.sharding.NamedSharding | None,
+  ) -> Array:
+    """Returns geopotential difference."""
+    # Must be implemented by subclasses. Depends on the vertical discretization.
+    raise NotImplementedError()
+
+  @jax.named_call
+  def divergence_tendency_due_to_humidity(
+      self,
+      state: State,
+      aux_state: Any,
+  ) -> Array:
+    """Computes divergence tendencies from geopotential and pressure terms.
+
+    These tendencies account for moisture-induced terms in the dycore that
+    need to be accounted for explicitly. The terms computer here specifically
+    correspond to laplacian of moist part of:
+      1: ∆(R * (Tv - T) * log(surface_pressure))
+      2: ∆(Φ(Tv) - Φ(T))
+
+    Args:
+      state: spectral state of the system for which tendencies are computed.
+      aux_state: diagnostic state with pre-computed nodal values.
+
+    Returns:
+      Divergence tendencies induced by moisture in geopotential and pressure
+      terms in spectral representation.
+    """
+    method = self.vertical_matmul_method
+    if method is None:
+      mesh = self.coords.spmd_mesh
+      method = 'sparse' if mesh is not None and mesh.shape['z'] > 1 else 'dense'
+
+    q = self._get_specific_humidity(aux_state)
+    physics_specs = self.physics_specs
+    # corresponds to the contribution of the difference of (virtual - normal)
+    # temperature times laplacian of log surface pressure.
+    nodal_laplacian_lsp = self.coords.horizontal.to_nodal(
+        self.coords.horizontal.laplacian(state.log_surface_pressure)
+    )
+    nodal_laplacian_correction_term = (
+        q
+        * nodal_laplacian_lsp
+        * self.T_ref
+        * (physics_specs.R_vapor - physics_specs.R)
+    )
+    # corresponds to the term that differentiates the spatially dependent part
+    # of reference virtual temperature.
+    q_modal = self._get_specific_humidity(state)
+    cos_lat_grad_q = self.coords.horizontal.cos_lat_grad(q_modal, clip=False)
+    nodal_cos_lat_grad_q = self.coords.horizontal.to_nodal(cos_lat_grad_q)
+    coefficient = self.T_ref * (physics_specs.R_vapor - physics_specs.R)
+    nodal_dot_term = (
+        coefficient
+        * self.coords.horizontal.sec2_lat
+        * (
+            nodal_cos_lat_grad_q[0] * aux_state.cos_lat_grad_log_sp[0]
+            + nodal_cos_lat_grad_q[1] * aux_state.cos_lat_grad_log_sp[1]
+        )
+    )
+
+    # TODO(dkochkov) Consider computing T_ref * q part implicitly.
+    temperature = aux_state.temperature_variation + self.T_ref
+    temperature_diff = (
+        q * temperature * (physics_specs.R_vapor / physics_specs.R - 1)
+    )
+    geopotential_diff = self._get_geopotential_diff(
+        temperature_diff,
+        method=method,
+        sharding=self.coords.dycore_sharding,
+    )
+
+    return -self.coords.horizontal.laplacian(
+        self.coords.horizontal.to_modal(geopotential_diff)
+    ) - self.coords.horizontal.to_modal(
+        nodal_dot_term + nodal_laplacian_correction_term
+    )
+
+  @jax.named_call
+  def vorticity_tendency_due_to_humidity(
+      self,
+      state: State,
+      aux_state: Any,
+  ) -> Array:
+    """Computes vorticity tendencies due to humidity."""
+    physics_specs = self.physics_specs
+    q_modal = self._get_specific_humidity(state)
+    cos_lat_grad_q = self.coords.horizontal.cos_lat_grad(q_modal, clip=False)
+    nodal_cos_lat_grad_q = self.coords.horizontal.to_nodal(cos_lat_grad_q)
+    nodal_cos_lat_grad_log_sp = aux_state.cos_lat_grad_log_sp
+    coefficient = self.T_ref * (physics_specs.R_vapor - physics_specs.R)
+    nodal_curl_term = (
+        coefficient
+        * self.coords.horizontal.sec2_lat
+        * (
+            nodal_cos_lat_grad_log_sp[0] * nodal_cos_lat_grad_q[1]
+            - nodal_cos_lat_grad_log_sp[1] * nodal_cos_lat_grad_q[0]
+        )
+    )
+    return self.coords.horizontal.to_modal(nodal_curl_term)
+
+
+@dataclasses.dataclass
+class PrimitiveEquationsSigma(PrimitiveEquationsBase):
+  """Primitive Equations solved on terrain following sigma coordinates."""
+
+  vertical_advection: Callable[..., jax.Array] = dataclasses.field(
+      default=sigma_coordinates.centered_vertical_advection, kw_only=True
+  )
+
+  def _get_geopotential_diff(
+      self,
+      temperature_diff: Array,
+      method: str,
+      sharding: jax.sharding.NamedSharding | None,
+  ) -> Array:
+    """Returns geopotential difference in sigma coordinates."""
+    return get_geopotential_diff_sigma(
+        temperature_diff,
+        self.coords.vertical,
+        self.physics_specs.R,
+        method=method,
+        sharding=sharding,
+    )
 
   @jax.named_call
   def _t_omega_over_sigma_sp(
@@ -794,26 +956,9 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
     return temperature_field * (v_dot_grad_log_sp - g_part)
 
   @jax.named_call
-  def kinetic_energy_tendency(self, aux_state: DiagnosticState) -> Array:
-    """Computes explicit tendency of divergence due to kinetic energy term."""
-    nodal_cos_lat_u2 = jnp.stack(aux_state.cos_lat_u) ** 2
-    kinetic = nodal_cos_lat_u2.sum(0) * self.coords.horizontal.sec2_lat / 2
-    return -self.coords.horizontal.laplacian(
-        self.coords.horizontal.to_modal(kinetic)
-    )
-
-  @jax.named_call
-  def orography_tendency(self) -> Array:
-    """Computes orography contribution to div tendency due to geopotential."""
-    # this term should broadcast correctly as layers are leading indices.
-    return -self.physics_specs.g * self.coords.horizontal.laplacian(
-        self.orography
-    )
-
-  @jax.named_call
   def curl_and_div_tendencies(
       self,
-      aux_state: DiagnosticState,
+      aux_state: DiagnosticStateSigma,
   ) -> tuple[Array, Array]:
     """Computes curl and divergence tendencies for vorticity ζ and divergence 𝛅.
 
@@ -848,7 +993,18 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
     else:
       sigma_dot_u = 0
       sigma_dot_v = 0
-    rt = self.physics_specs.R * aux_state.temperature_variation
+
+    if self.humidity_key is None:
+      adjustment = 1.0
+    else:
+      q = self._get_specific_humidity(aux_state)
+      gas_const_ratio = self.physics_specs.R_vapor / self.physics_specs.R
+      moisture_contribution = (gas_const_ratio - 1) * q
+      adjustment = 1 + moisture_contribution
+      if self.cloud_keys is not None:
+        adjustment += self._cloud_virtual_t_adjustment(aux_state)
+    rt = self.physics_specs.R * aux_state.temperature_variation * adjustment
+
     grad_log_ps_u, grad_log_ps_v = aux_state.cos_lat_grad_log_sp
     vertical_term_u = (sigma_dot_u + rt * grad_log_ps_u) * sec2_lat
     vertical_term_v = (sigma_dot_v + rt * grad_log_ps_v) * sec2_lat
@@ -870,7 +1026,7 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
   @jax.named_call
   def nodal_temperature_vertical_tendency(
       self,
-      aux_state: DiagnosticState,
+      aux_state: DiagnosticStateSigma,
   ) -> Array | float:
     """Computes explicit vertical tendency of the temperature."""
     # two types of terms of sigma_dot * ∂T/∂𝜎
@@ -888,20 +1044,8 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
     return tendency
 
   @jax.named_call
-  def horizontal_scalar_advection(
-      self,
-      scalar: Array,
-      aux_state: DiagnosticState,
-  ) -> tuple[Array, Array]:
-    """Computes explicit tendency of `scalar` due to horizontal advection."""
-    u, v = aux_state.cos_lat_u
-    nodal_terms = scalar * aux_state.divergence
-    modal_terms = -div_sec_lat(u * scalar, v * scalar, self.coords.horizontal)
-    return nodal_terms, modal_terms
-
-  @jax.named_call
   def nodal_temperature_adiabatic_tendency(
-      self, aux_state: DiagnosticState
+      self, aux_state: DiagnosticStateSigma
   ) -> Array:
     """Computes explicit temperature tendency due to adiabatic processes."""
     g_explicit = aux_state.u_dot_grad_log_sp
@@ -909,13 +1053,36 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
     mean_t_part = self._t_omega_over_sigma_sp(
         self.T_ref, g_explicit, aux_state.u_dot_grad_log_sp
     )
-    variation_t_part = self._t_omega_over_sigma_sp(
-        aux_state.temperature_variation, g_full, aux_state.u_dot_grad_log_sp
-    )
-    return self.physics_specs.kappa * (mean_t_part + variation_t_part)
+    if self.humidity_key is None:
+      variation_t_part = self._t_omega_over_sigma_sp(
+          aux_state.temperature_variation, g_full, aux_state.u_dot_grad_log_sp
+      )
+      return self.physics_specs.kappa * (mean_t_part + variation_t_part)
+    else:
+      gas_const_ratio = self.physics_specs.R_vapor / self.physics_specs.R
+      heat_capacity_ratio = self.physics_specs.Cp_vapor / self.physics_specs.Cp
+      q = self._get_specific_humidity(aux_state)
+      # Here Tv refers to virtual temperature. The terms below capture
+      # tendencies from full temperature variation and moist T_ref terms.
+      variation_temperature_component = aux_state.temperature_variation * (
+          (1 + (gas_const_ratio - 1) * q) / (1 + (heat_capacity_ratio - 1) * q)
+      )
+      humidity_reference_component = self.T_ref * (
+          ((gas_const_ratio - heat_capacity_ratio) * q)
+          / (1 + (heat_capacity_ratio - 1) * q)
+      )
+      variation_and_humidity_terms = (
+          variation_temperature_component + humidity_reference_component
+      )
+      variation_and_Tv_part = self._t_omega_over_sigma_sp(
+          variation_and_humidity_terms, g_full, aux_state.u_dot_grad_log_sp
+      )
+      return self.physics_specs.kappa * (mean_t_part + variation_and_Tv_part)
 
   @jax.named_call
-  def nodal_log_pressure_tendency(self, aux_state: DiagnosticState) -> Array:
+  def nodal_log_pressure_tendency(
+      self, aux_state: DiagnosticStateSigma
+  ) -> Array:
     """Computes explicit tendency of the log_surface_pressure."""
     # computes -∑G[i] * ∆𝜎[i] where G[i] = u[i] · ∇(log(ps)).
     g = aux_state.u_dot_grad_log_sp
@@ -924,11 +1091,22 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
   @jax.named_call
   def explicit_terms(self, state: State) -> State:
     """Computes explicit tendencies of the primitive equations."""
-    aux_state = compute_diagnostic_state(state, self.coords)
+    aux_state = compute_diagnostic_state_sigma(state, self.coords)
     # tendencies that are computed in modal representation
-    vorticity_tendency, divergence_dot = self.curl_and_div_tendencies(aux_state)
+    vorticity_dot, divergence_dot = self.curl_and_div_tendencies(aux_state)
     kinetic_energy_tendency = self.kinetic_energy_tendency(aux_state)
     orography_tendency = self.orography_tendency()
+
+    if self.humidity_key is not None:
+      humidity_vort_correction_tendency = (
+          self.vorticity_tendency_due_to_humidity(state, aux_state)
+      )
+      humidity_div_correction_tendency = (
+          self.divergence_tendency_due_to_humidity(state, aux_state)
+      )
+      vorticity_dot += humidity_vort_correction_tendency
+      divergence_dot += humidity_div_correction_tendency
+
     horizontal_tendency_fn = functools.partial(
         self.horizontal_scalar_advection, aux_state=aux_state
     )
@@ -954,6 +1132,7 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
     )
     # combining tendencies
     to_modal_fn = self.coords.horizontal.to_modal
+    vorticity_tendency = vorticity_dot
     divergence_tendency = (
         divergence_dot + kinetic_energy_tendency + orography_tendency
     )
@@ -997,7 +1176,7 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
       mesh = self.coords.spmd_mesh
       method = 'sparse' if mesh is not None and mesh.shape['z'] > 1 else 'dense'
 
-    geopotential_diff = get_geopotential_diff(
+    geopotential_diff = get_geopotential_diff_sigma(
         state.temperature_variation,
         self.coords.vertical,
         self.physics_specs.R,
@@ -1013,7 +1192,7 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
     divergence_implicit = -self.coords.horizontal.laplacian(
         geopotential_diff + rt_log_p
     )
-    temperature_variation_implicit = get_temperature_implicit(
+    temperature_variation_implicit = get_temperature_implicit_sigma(
         state.divergence,
         self.coords.vertical,
         self.reference_temperature,
@@ -1056,7 +1235,7 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
           '`jax.jit(lambda s: primitive.inverse_terms(s, eta=eta))(state)`.'
       )
 
-    implicit_matrix = _get_implicit_term_matrix(
+    implicit_matrix = _get_implicit_term_matrix_sigma(
         step_size,
         self.coords,
         self.reference_temperature,
@@ -1175,7 +1354,7 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
       η = step_size
       λ = self.coords.horizontal.laplacian_eigenvalues
 
-      gt = get_geopotential_diff(
+      gt = get_geopotential_diff_sigma(
           state.temperature_variation,
           self.coords.vertical,
           self.physics_specs.R,
@@ -1196,7 +1375,7 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
       )
       temp_logp_inverse = np.linalg.inv(np.eye(layers + 1) - HG)
 
-      hd = -get_temperature_implicit(
+      hd = -get_temperature_implicit_sigma(
           state.divergence,
           self.coords.vertical,
           self.reference_temperature,
@@ -1244,318 +1423,141 @@ class PrimitiveEquations(time_integration.ImplicitExplicitODE):
     )
 
 
-PrimitiveEquationsWithTime = PrimitiveEquations  # deprecated alias
+###############################################################################
+# Deprecated aliases for backwards compatibility.
+################################################################################
+
+DiagnosticState = DiagnosticStateSigma
+semi_lagrangian_vertical_advection_step = (
+    semi_lagrangian_vertical_advection_step_sigma
+)
+compute_diagnostic_state = compute_diagnostic_state_sigma
+PrimitiveEquationsSpecs = units.SimUnits
+StateWithTime = State
 
 
-@dataclasses.dataclass
-class MoistPrimitiveEquations(PrimitiveEquations):
-  """Primitive equations that take into account humidity and advance time."""
+class PrimitiveEquations(PrimitiveEquationsSigma):
+  """Deprecated alias for backwards compatibility."""
 
-  def _get_specific_humidity(self, aux_state: DiagnosticState) -> Array:
-    """Extracts `speicific_humidity` from tracers in DiagnosticState."""
-    if 'specific_humidity' not in aux_state.tracers:
-      raise ValueError(
-          '`specific_humidity` is not found in tracers: '
-          f'{aux_state.tracers.keys()}.'
-      )
-    return aux_state.tracers['specific_humidity']
-
-  def _virtual_temperature(self, aux_state, moisture_contribution):
-    """Calculates the virtual temperature without the contribution of clouds."""
-    return (
-        self.physics_specs.R
-        * aux_state.temperature_variation
-        * (1 + moisture_contribution)
-    )
-
-  @jax.named_call
-  def curl_and_div_tendencies(
+  def __init__(
       self,
-      aux_state: DiagnosticState,
-  ) -> tuple[Array, Array]:
-    """Computes curl and divergence tendencies for vorticity ζ and divergence 𝛅.
+      reference_temperature: np.ndarray,
+      orography: Array,
+      coords: coordinate_systems.CoordinateSystem,
+      physics_specs: units.SimUnitsProtocol,
+      *,
+      vertical_matmul_method: str | None = None,
+      implicit_inverse_method: str = 'split',
+      vertical_advection: Callable[
+          ..., jax.Array
+      ] = sigma_coordinates.centered_vertical_advection,
+      include_vertical_advection: bool = True,
+  ):
+    super().__init__(
+        reference_temperature,
+        orography,
+        coords,
+        physics_specs,
+        vertical_matmul_method=vertical_matmul_method,
+        implicit_inverse_method=implicit_inverse_method,
+        vertical_advection=vertical_advection,
+        include_vertical_advection=include_vertical_advection,
+        humidity_key=None,
+        cloud_keys=None,
+    )
 
-    Computes to explicit tendencies (dζ_dt, d𝛅_dt) to due to curl and divergence
-    terms in the primitive equations, with account for humidity by using virtual
-    temperature instead of thermodynamic temperature.
-    See `curl_and_div_tendencies` in PrimitiveEquations for details or ECMWFs
-    notes http://shortn/_CDj2woFwzv.
 
-    Args:
-      aux_state: diagnostic state with pre-computed nodal values.
+PrimitiveEquationsWithTime = PrimitiveEquations
 
-    Returns:
-      Tuple of divergence and vorticity tendencies due to curl and divergence
-      terms in the primitive equations.
-    """
-    gas_const_ratio = self.physics_specs.R_vapor / self.physics_specs.R
-    q = self._get_specific_humidity(aux_state)
-    moisture_contribution = (gas_const_ratio - 1) * q
-    sec2_lat = self.coords.horizontal.sec2_lat
-    # note the cos_lat cancels out with sec2_lat and cos in derivative ops.
-    u, v = aux_state.cos_lat_u
-    total_vorticity = aux_state.vorticity + self.coriolis_parameter
-    # note that u, v are switched to correspond to `k ✕ v = (-v, u)`.
-    nodal_vorticity_u = -v * total_vorticity * sec2_lat
-    nodal_vorticity_v = u * total_vorticity * sec2_lat
-    # vertical and pressure gradient terms
-    d𝜎_dt = aux_state.sigma_dot_full
-    if self.include_vertical_advection:
-      # vertical tendency is equal to `-1 * dot{sigma} * u`, hence negation here
-      sigma_dot_u = -self._vertical_tendency(d𝜎_dt, u)
-      sigma_dot_v = -self._vertical_tendency(d𝜎_dt, v)
-    else:
-      sigma_dot_u = 0
-      sigma_dot_v = 0
-    # we use virtual temperature Tv in these tendencies to accound for humidity.
-    rTv = self._virtual_temperature(aux_state, moisture_contribution)
-    grad_log_ps_u, grad_log_ps_v = aux_state.cos_lat_grad_log_sp
-    vertical_term_u = (sigma_dot_u + rTv * grad_log_ps_u) * sec2_lat
-    vertical_term_v = (sigma_dot_v + rTv * grad_log_ps_v) * sec2_lat
-    combined_u = self.coords.horizontal.to_modal(
-        nodal_vorticity_u + vertical_term_u
-    )
-    combined_v = self.coords.horizontal.to_modal(
-        nodal_vorticity_v + vertical_term_v
-    )
-    # computing tendencies
-    dζ_dt = -self.coords.horizontal.curl_cos_lat(
-        (combined_u, combined_v), clip=False
-    )
-    d𝛅_dt = -self.coords.horizontal.div_cos_lat(
-        (combined_u, combined_v), clip=False
-    )
-    return (dζ_dt, d𝛅_dt)
 
-  @jax.named_call
-  def nodal_temperature_adiabatic_tendency(
-      self, aux_state: DiagnosticState
-  ) -> Array:
-    """Computes explicit temperature tendency due to adiabatic processes."""
-    gas_const_ratio = self.physics_specs.R_vapor / self.physics_specs.R
-    heat_capacity_ratio = self.physics_specs.Cp_vapor / self.physics_specs.Cp
-    g_explicit = aux_state.u_dot_grad_log_sp
-    g_full = g_explicit + aux_state.divergence
-    q = self._get_specific_humidity(aux_state)
-    mean_t_part = self._t_omega_over_sigma_sp(
-        self.T_ref, g_explicit, aux_state.u_dot_grad_log_sp
-    )
-    # Here Tv refers to virtual temperature. The terms below capture
-    # tendencies from full temperature variation and moist T_ref terms.
-    variation_temperature_component = aux_state.temperature_variation * (
-        (1 + (gas_const_ratio - 1) * q) / (1 + (heat_capacity_ratio - 1) * q)
-    )
-    humidity_reference_component = self.T_ref * (
-        ((gas_const_ratio - heat_capacity_ratio) * q)
-        / (1 + (heat_capacity_ratio - 1) * q)
-    )
-    variation_and_humidity_terms = (
-        variation_temperature_component + humidity_reference_component
-    )
-    variation_and_Tv_part = self._t_omega_over_sigma_sp(
-        variation_and_humidity_terms, g_full, aux_state.u_dot_grad_log_sp
-    )
-    return self.physics_specs.kappa * (mean_t_part + variation_and_Tv_part)
+class MoistPrimitiveEquations(PrimitiveEquationsSigma):
+  """Deprecated alias for backwards compatibility."""
 
-  @jax.named_call
-  def divergence_tendency_due_to_humidity(
+  def __init__(
       self,
-      state: State,
-      aux_state: DiagnosticState,
-  ) -> Array:
-    """Computes divergence tendencies from geopotential and pressure terms.
-
-    These tendencies account for moisture-induced terms in the dycore that
-    need to be accounted for explicitly. The terms computer here specifically
-    correspond to laplacian of moist part of:
-      1: ∆(R * (Tv - T) * log(surface_pressure))
-      2: ∆(Φ(Tv) - Φ(T))
-
-    Args:
-      state: spectral state of the system for which tendencies are computed.
-      aux_state: diagnostic state with pre-computed nodal values.
-
-    Returns:
-      Divergence tendencies induced by moisture in geopotential and pressure
-      terms in spectral representation.
-    """
-    method = self.vertical_matmul_method
-    if method is None:
-      mesh = self.coords.spmd_mesh
-      method = 'sparse' if mesh is not None and mesh.shape['z'] > 1 else 'dense'
-
-    q = self._get_specific_humidity(aux_state)
-    physics_specs = self.physics_specs
-    # corresponds to the contribution of the difference of (virtual - normal)
-    # temperature times laplacian of log surface pressure.
-    nodal_laplacian_lsp = self.coords.horizontal.to_nodal(
-        self.coords.horizontal.laplacian(state.log_surface_pressure)
-    )
-    nodal_laplacian_correction_term = (
-        q
-        * nodal_laplacian_lsp
-        * self.T_ref
-        * (physics_specs.R_vapor - physics_specs.R)
-    )
-    # corresponds to the term that differentiates the spatially dependent part
-    # of reference virtual temperature.
-    q_modal = self._get_specific_humidity(state)
-    cos_lat_grad_q = self.coords.horizontal.cos_lat_grad(q_modal, clip=False)
-    nodal_cos_lat_grad_q = self.coords.horizontal.to_nodal(cos_lat_grad_q)
-    coefficient = self.T_ref * (physics_specs.R_vapor - physics_specs.R)
-    nodal_dot_term = (
-        coefficient
-        * self.coords.horizontal.sec2_lat
-        * (
-            nodal_cos_lat_grad_q[0] * aux_state.cos_lat_grad_log_sp[0]
-            + nodal_cos_lat_grad_q[1] * aux_state.cos_lat_grad_log_sp[1]
-        )
+      reference_temperature: np.ndarray,
+      orography: Array,
+      coords: coordinate_systems.CoordinateSystem,
+      physics_specs: units.SimUnitsProtocol,
+      *,
+      vertical_matmul_method: str | None = None,
+      implicit_inverse_method: str = 'split',
+      vertical_advection: Callable[
+          ..., jax.Array
+      ] = sigma_coordinates.centered_vertical_advection,
+      include_vertical_advection: bool = True,
+  ):
+    super().__init__(
+        reference_temperature,
+        orography,
+        coords,
+        physics_specs,
+        vertical_matmul_method=vertical_matmul_method,
+        implicit_inverse_method=implicit_inverse_method,
+        vertical_advection=vertical_advection,
+        include_vertical_advection=include_vertical_advection,
+        humidity_key='specific_humidity',
+        cloud_keys=None,
     )
 
-    # TODO(dkochkov) Consider computing T_ref * q part implicitly.
-    temperature = aux_state.temperature_variation + self.T_ref
-    temperature_diff = (
-        q * temperature * (physics_specs.R_vapor / physics_specs.R - 1)
-    )
-    geopotential_diff = get_geopotential_diff(
-        temperature_diff,
-        self.coords.vertical,
-        physics_specs.R,
-        method=method,
-        sharding=self.coords.dycore_sharding,
-    )
 
-    return -self.coords.horizontal.laplacian(
-        self.coords.horizontal.to_modal(geopotential_diff)
-    ) - self.coords.horizontal.to_modal(
-        nodal_dot_term + nodal_laplacian_correction_term
-    )
+class MoistPrimitiveEquationsWithCloudMoisture(PrimitiveEquationsSigma):
+  """Deprecated alias for backwards compatibility."""
 
-  @jax.named_call
-  def vorticity_tendency_due_to_humidity(
+  def __init__(
       self,
-      state: State,
-      aux_state: DiagnosticState,
-  ) -> Array:
-    physics_specs = self.physics_specs
-    q_modal = self._get_specific_humidity(state)
-    cos_lat_grad_q = self.coords.horizontal.cos_lat_grad(q_modal, clip=False)
-    nodal_cos_lat_grad_q = self.coords.horizontal.to_nodal(cos_lat_grad_q)
-    nodal_cos_lat_grad_log_sp = aux_state.cos_lat_grad_log_sp
-    coefficient = self.T_ref * (physics_specs.R_vapor - physics_specs.R)
-    nodal_curl_term = (
-        coefficient
-        * self.coords.horizontal.sec2_lat
-        * (
-            nodal_cos_lat_grad_log_sp[0] * nodal_cos_lat_grad_q[1]
-            - nodal_cos_lat_grad_log_sp[1] * nodal_cos_lat_grad_q[0]
-        )
-    )
-    return self.coords.horizontal.to_modal(nodal_curl_term)
-
-  @jax.named_call
-  def explicit_terms(self, state: StateWithTime) -> StateWithTime:
-    """Evaluates explicit terms in the ODE."""
-    aux_state = compute_diagnostic_state(state, self.coords)
-    # tendencies that are computed in modal representation
-    vorticity_dot, divergence_dot = self.curl_and_div_tendencies(aux_state)
-    humidity_vort_correction_tendency = self.vorticity_tendency_due_to_humidity(
-        state, aux_state
-    )
-    kinetic_energy_tendency = self.kinetic_energy_tendency(aux_state)
-    orography_tendency = self.orography_tendency()
-    humidity_div_correction_tendency = self.divergence_tendency_due_to_humidity(
-        state, aux_state
-    )
-    horizontal_tendency_fn = functools.partial(
-        self.horizontal_scalar_advection, aux_state=aux_state
-    )
-    dT_dt_horizontal_nodal, dT_dt_horizontal_modal = horizontal_tendency_fn(
-        aux_state.temperature_variation
-    )
-    tracers_horizontal_nodal_and_modal = jax.tree_util.tree_map(
-        horizontal_tendency_fn, aux_state.tracers
-    )
-    # tendencies in nodal domain
-    dT_dt_vertical = self.nodal_temperature_vertical_tendency(aux_state)
-    dT_dt_adiabatic = self.nodal_temperature_adiabatic_tendency(aux_state)
-    log_sp_tendency = self.nodal_log_pressure_tendency(aux_state)
-    sigma_dot_full = aux_state.sigma_dot_full
-    if self.include_vertical_advection:
-      vertical_tendency_fn = functools.partial(
-          self._vertical_tendency, sigma_dot_full
-      )
-    else:
-      vertical_tendency_fn = lambda x: 0
-    tracers_vertical_nodal = jax.tree_util.tree_map(
-        vertical_tendency_fn, aux_state.tracers
-    )
-    # combining tendencies
-    to_modal_fn = self.coords.horizontal.to_modal
-    vorticity_tendency = vorticity_dot + humidity_vort_correction_tendency
-    divergence_tendency = (
-        divergence_dot
-        + kinetic_energy_tendency
-        + orography_tendency
-        + humidity_div_correction_tendency
-    )
-    temperature_tendency = (
-        to_modal_fn(dT_dt_horizontal_nodal + dT_dt_vertical + dT_dt_adiabatic)
-        + dT_dt_horizontal_modal
-    )
-    log_surface_pressure_tendency = to_modal_fn(log_sp_tendency)
-    tracers_tendency = jax.tree_util.tree_map(
-        lambda x, y_z: to_modal_fn(x + y_z[0]) + y_z[1],
-        tracers_vertical_nodal,
-        tracers_horizontal_nodal_and_modal,
-    )
-    explicit_terms = State(
-        vorticity=vorticity_tendency,
-        divergence=divergence_tendency,
-        temperature_variation=temperature_tendency,
-        log_surface_pressure=log_surface_pressure_tendency,
-        tracers=tracers_tendency,
-        sim_time=None if state.sim_time is None else 1.0,
-    )
-    # Note: clipping the final total wavenumber from the explicit tendencies
-    # matches SPEEDY.
-    return self.coords.horizontal.clip_wavenumbers(explicit_terms)
-
-
-@dataclasses.dataclass
-class MoistPrimitiveEquationsWithCloudMoisture(MoistPrimitiveEquations):
-  """Primitive equations that calculate virtual temperature with clouds."""
-
-  def _virtual_temperature(self, aux_state, moisture_contribution):
-    """Calculates virtual temperature with clouds."""
-    return (
-        self.physics_specs.R
-        * aux_state.temperature_variation
-        * (
-            1
-            + moisture_contribution
-            - self._get_cloud_water(aux_state)
-            - self._get_cloud_ice(aux_state)
-        )
+      reference_temperature: np.ndarray,
+      orography: Array,
+      coords: coordinate_systems.CoordinateSystem,
+      physics_specs: units.SimUnitsProtocol,
+      *,
+      vertical_matmul_method: str | None = None,
+      implicit_inverse_method: str = 'split',
+      vertical_advection: Callable[
+          ..., jax.Array
+      ] = sigma_coordinates.centered_vertical_advection,
+      include_vertical_advection: bool = True,
+  ):
+    super().__init__(
+        reference_temperature,
+        orography,
+        coords,
+        physics_specs,
+        vertical_matmul_method=vertical_matmul_method,
+        implicit_inverse_method=implicit_inverse_method,
+        vertical_advection=vertical_advection,
+        include_vertical_advection=include_vertical_advection,
+        humidity_key='specific_humidity',
+        cloud_keys=(
+            'specific_cloud_liquid_water_content',
+            'specific_cloud_ice_water_content',
+        ),
     )
 
-  def _get_cloud_water(self, aux_state: DiagnosticState) -> Array:
-    """Extracts `specific_cloud_liquid_water_content` from tracers in DiagnosticState."""
-    if 'specific_cloud_liquid_water_content' not in aux_state.tracers:
-      raise ValueError(
-          '`specific_cloud_liquid_water_content` is not found in tracers: '
-          f'{aux_state.tracers.keys()}.'
-      )
-    return aux_state.tracers['specific_cloud_liquid_water_content']
 
-  def _get_cloud_ice(self, aux_state: DiagnosticState) -> Array:
-    """Extracts `specific_cloud_ice_water_content` from tracers in DiagnosticState."""
-    if 'specific_cloud_ice_water_content' not in aux_state.tracers:
-      raise ValueError(
-          '`specific_cloud_ice_water_content` is not found in tracers: '
-          f'{aux_state.tracers.keys()}.'
-      )
-    return aux_state.tracers['specific_cloud_ice_water_content']
+def get_geopotential_with_moisture(
+    temperature: typing.Array,
+    specific_humidity: typing.Array,
+    nodal_orography: typing.Array,
+    coordinates: sigma_coordinates.SigmaCoordinates,
+    gravity_acceleration: float,
+    ideal_gas_constant: float,
+    water_vapor_gas_constant: float,
+    sharding: jax.sharding.NamedSharding | None = None,
+    clouds: typing.Array | None = None,
+) -> jnp.ndarray:
+  """Computes geopotential in nodal space using nodal temperature and `q`."""
+  return get_geopotential_on_sigma(
+      temperature,
+      specific_humidity,
+      clouds=clouds,
+      nodal_orography=nodal_orography,
+      sigma=coordinates,
+      gravity_acceleration=gravity_acceleration,
+      ideal_gas_constant=ideal_gas_constant,
+      water_vapor_gas_constant=water_vapor_gas_constant,
+      sharding=sharding,
+  )
 
 
 # pylint: enable=invalid-name

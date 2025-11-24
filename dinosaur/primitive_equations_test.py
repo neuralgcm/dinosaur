@@ -20,6 +20,7 @@ from dinosaur import scales
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
+from dinosaur import units
 from dinosaur import xarray_utils
 import jax
 import jax.numpy as jnp
@@ -28,7 +29,7 @@ import numpy as np
 
 jax.config.parse_flags_with_absl()
 
-units = scales.units
+s_units = scales.units
 
 
 def random_state(coords, key):
@@ -83,7 +84,7 @@ def assert_states_close(state0, state1, **kwargs):
       )
 
 
-class PrimitiveEquationsImplicitTest(parameterized.TestCase):
+class PrimitiveEquationsSigmaImplicitTest(parameterized.TestCase):
 
   @parameterized.parameters(
       dict(
@@ -135,8 +136,8 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
       dict(wavenumbers=128, layers=16, atol=5e-3),
   )
   def test_get_geopotential_steady_state(self, wavenumbers, layers, atol):
-    """Tests that `get_geopotential` works for steady states."""
-    physics_specs = primitive_equations.PrimitiveEquationsSpecs.from_si()
+    """Tests that `get_geopotential_on_sigma` works for steady states."""
+    physics_specs = units.SimUnits.from_si()
     coords = coordinate_systems.CoordinateSystem(
         horizontal=spherical_harmonic.Grid.with_wavenumbers(wavenumbers),
         vertical=sigma_coordinates.SigmaCoordinates.equidistant(layers),
@@ -150,15 +151,15 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
     )
     expected_geopotential = aux_features[xarray_utils.GEOPOTENTIAL_KEY]
     with self.subTest('dry_geopotential'):
-      actual = coords.horizontal.to_nodal(
-          primitive_equations.get_geopotential(
-              state.temperature_variation,
-              aux_features[xarray_utils.REF_TEMP_KEY],
-              modal_orography,
-              coords.vertical,
-              physics_specs.gravity_acceleration,
-              physics_specs.ideal_gas_constant,
-          )
+      temperature = aux_features[xarray_utils.REF_TEMP_KEY][
+          :, np.newaxis, np.newaxis
+      ] + coords.horizontal.to_nodal(state.temperature_variation)
+      actual = primitive_equations.get_geopotential_on_sigma(
+          temperature,
+          nodal_orography=coords.horizontal.to_nodal(modal_orography),
+          sigma=coords.vertical,
+          gravity_acceleration=physics_specs.gravity_acceleration,
+          ideal_gas_constant=physics_specs.ideal_gas_constant,
       )
       np.testing.assert_allclose(actual, expected_geopotential, atol=atol)
     with self.subTest('moist_geopotential'):
@@ -167,14 +168,14 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
       ] + coords.horizontal.to_nodal(state.temperature_variation)
       specific_humidity = jnp.zeros_like(temperature)
       nodal_orography = coords.horizontal.to_nodal(modal_orography)
-      actual = primitive_equations.get_geopotential_with_moisture(
+      actual = primitive_equations.get_geopotential_on_sigma(
           temperature,
           specific_humidity,
-          nodal_orography,
-          coords.vertical,
-          physics_specs.gravity_acceleration,
-          physics_specs.ideal_gas_constant,
-          physics_specs.water_vapor_gas_constant,
+          nodal_orography=nodal_orography,
+          sigma=coords.vertical,
+          gravity_acceleration=physics_specs.gravity_acceleration,
+          ideal_gas_constant=physics_specs.ideal_gas_constant,
+          water_vapor_gas_constant=physics_specs.water_vapor_gas_constant,
       )
       np.testing.assert_allclose(actual, expected_geopotential, atol=atol)
 
@@ -182,11 +183,11 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
     """Tests that steady state is stationary for primitive equations."""
     wavenumbers = 42
     layers = 26
-    dt_si = 600 * units.s
-    save_every_si = 4 * units.hour
+    dt_si = 600 * s_units.s
+    save_every_si = 4 * s_units.hour
     inner_steps = int(save_every_si / dt_si)
     outer_steps = 6
-    physics_specs = primitive_equations.PrimitiveEquationsSpecs.from_si()
+    physics_specs = units.SimUnits.from_si()
     dt = physics_specs.nondimensionalize(dt_si)
     coords = coordinate_systems.CoordinateSystem(
         horizontal=spherical_harmonic.Grid.with_wavenumbers(wavenumbers),
@@ -208,7 +209,7 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
         )
         for name, amplitude in zip(tracer_names, tracer_amplitudes)
     }
-    primitive = primitive_equations.PrimitiveEquations(
+    primitive = primitive_equations.PrimitiveEquationsSigma(
         ref_temps, modal_orography, coords, physics_specs
     )
     step_fn = time_integration.imex_rk_sil3(primitive, dt)
@@ -282,9 +283,11 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
           ideal_gas_constant=12.3,
       ),
   )
-  def test_get_geopotential_weights(self, coordinates, ideal_gas_constant):
+  def test_get_geopotential_weights_sigma(
+      self, coordinates, ideal_gas_constant
+  ):
     """Tests that the entries of geopotential weights `G` are correct."""
-    g = primitive_equations.get_geopotential_weights(
+    g = primitive_equations.get_geopotential_weights_sigma(
         coordinates, ideal_gas_constant
     )
     np.testing.assert_array_equal(
@@ -309,14 +312,14 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
             expected_entry, g[i, j], err_msg=f'Mismatch on entry {[i, j]}.'
         )
 
-  def test_get_geopotential_diff_both_ways(self):
+  def test_get_geopotential_diff_sigma_both_ways(self):
     temperature = np.random.RandomState(0).randn(12, 1, 1)
     coordinates = sigma_coordinates.SigmaCoordinates.equidistant(12)
     ideal_gas_constant = 1.5
-    result_matvec = primitive_equations.get_geopotential_diff(
+    result_matvec = primitive_equations.get_geopotential_diff_sigma(
         temperature, coordinates, ideal_gas_constant, method='dense'
     )
-    result_cumsum = primitive_equations.get_geopotential_diff(
+    result_cumsum = primitive_equations.get_geopotential_diff_sigma(
         temperature, coordinates, ideal_gas_constant, method='sparse'
     )
     np.testing.assert_allclose(result_matvec, result_cumsum, atol=1e-6)
@@ -337,11 +340,11 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
           heat_capacity_ratio=0.2857,
       ),
   )
-  def test_get_temperature_implicit_weights(
+  def test_get_temperature_implicit_weights_sigma(
       self, coordinates, reference_temperature, heat_capacity_ratio
   ):
     """Tests that the entries of temperature weights `H` are correct."""
-    h = primitive_equations.get_temperature_implicit_weights(
+    h = primitive_equations.get_temperature_implicit_weights_sigma(
         coordinates, reference_temperature, heat_capacity_ratio
     )
     np.testing.assert_array_equal(
@@ -404,14 +407,16 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
           reference_temperature=100 * np.ones(5),
       ),
   )
-  def test_get_temperature_implicit_both_ways(self, reference_temperature):
+  def test_get_temperature_implicit_sigma_both_ways(
+      self, reference_temperature
+  ):
     divergence = np.random.RandomState(0).randn(5, 1, 1)
     coordinates = sigma_coordinates.SigmaCoordinates.equidistant(5)
     kappa = 2 / 7
-    result_matvec = primitive_equations.get_temperature_implicit(
+    result_matvec = primitive_equations.get_temperature_implicit_sigma(
         divergence, coordinates, reference_temperature, kappa, method='dense'
     )
-    result_cumsum = primitive_equations.get_temperature_implicit(
+    result_cumsum = primitive_equations.get_temperature_implicit_sigma(
         divergence, coordinates, reference_temperature, kappa, method='sparse'
     )
     np.testing.assert_allclose(result_matvec, result_cumsum, atol=1e-5)
@@ -420,8 +425,8 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
       dict(wavenumbers=32, layers=4),
       dict(wavenumbers=64, layers=10),
   )
-  def test_primitive_equations_explicit_shape(self, wavenumbers, layers):
-    """Tests that output of primitive_equations_explicit has expected shape."""
+  def test_primitive_equations_sigma_explicit_shape(self, wavenumbers, layers):
+    """Tests that output of explicit_terms has expected shape."""
     coords = coordinate_systems.CoordinateSystem(
         horizontal=spherical_harmonic.Grid.with_wavenumbers(wavenumbers),
         vertical=sigma_coordinates.SigmaCoordinates.equidistant(layers),
@@ -434,11 +439,11 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
     temperature_variation = jnp.ones((layers,) + l.shape)
     log_surface_pressure = jnp.ones((1,) + l.shape)
 
-    physics_specs = primitive_equations.PrimitiveEquationsSpecs.from_si()
+    physics_specs = units.SimUnits.from_si()
     state = primitive_equations.State(
         vorticity, divergence, temperature_variation, log_surface_pressure
     )
-    primitive = primitive_equations.PrimitiveEquations(
+    primitive = primitive_equations.PrimitiveEquationsSigma(
         reference_temperature, modal_orography, coords, physics_specs
     )
 
@@ -459,7 +464,7 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
   @parameterized.parameters(
       dict(wavenumbers=64, layers=10),
   )
-  def test_primitive_equations_explicit_scales_invariance(
+  def test_primitive_equations_sigma_explicit_scales_invariance(
       self, wavenumbers, layers
   ):
     """Tests that tendencies in SI units are not affected by scales."""
@@ -467,16 +472,16 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
     custom_scale = scales.Scale(
         scales.RADIUS / 100,
         55.3 / 2 / scales.OMEGA,
-        1 * units.kilogram * 16.4,
-        1 * units.degK * 3.15,
+        1 * s_units.kilogram * 16.4,
+        1 * s_units.degK * 3.15,
     )
-    physics_specs_a = primitive_equations.PrimitiveEquationsSpecs.from_si(
+    physics_specs_a = units.SimUnits.from_si(
         scale=default_scale
     )
     grid_a = spherical_harmonic.Grid.with_wavenumbers(
         wavenumbers, radius=physics_specs_a.radius
     )
-    physics_specs_b = primitive_equations.PrimitiveEquationsSpecs.from_si(
+    physics_specs_b = units.SimUnits.from_si(
         scale=custom_scale
     )
     grid_b = spherical_harmonic.Grid.with_wavenumbers(
@@ -511,14 +516,14 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
     )
 
     # Computing tendencies using both variations.
-    primitive_a = primitive_equations.PrimitiveEquations(
+    primitive_a = primitive_equations.PrimitiveEquationsSigma(
         aux_features_a[xarray_utils.REF_TEMP_KEY],
         modal_orography_a,
         coordinate_systems.CoordinateSystem(grid_a, vertical_grid),
         physics_specs_a,
     )
 
-    primitive_b = primitive_equations.PrimitiveEquations(
+    primitive_b = primitive_equations.PrimitiveEquationsSigma(
         aux_features_b[xarray_utils.REF_TEMP_KEY],
         modal_orography_b,
         coordinate_systems.CoordinateSystem(grid_b, vertical_grid),
@@ -529,40 +534,40 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
 
     with self.subTest('divergence tendency'):
       divergence_a = physics_specs_a.dimensionalize(
-          tendencies_a.divergence, 1 / units.s**2
+          tendencies_a.divergence, 1 / s_units.s**2
       )
       divergence_b = physics_specs_b.dimensionalize(
-          tendencies_b.divergence, 1 / units.s**2
+          tendencies_b.divergence, 1 / s_units.s**2
       )
       np.testing.assert_allclose(
           divergence_a.magnitude, divergence_b.magnitude, atol=5e-7
       )
     with self.subTest('vorticity tendency'):
       vorticity_a = physics_specs_a.dimensionalize(
-          tendencies_a.vorticity, 1 / units.s**2
+          tendencies_a.vorticity, 1 / s_units.s**2
       )
       vorticity_b = physics_specs_b.dimensionalize(
-          tendencies_b.vorticity, 1 / units.s**2
+          tendencies_b.vorticity, 1 / s_units.s**2
       )
       np.testing.assert_allclose(
           vorticity_a.magnitude, vorticity_b.magnitude, atol=5e-7
       )
     with self.subTest('temperature tendency'):
       temperature_a = physics_specs_a.dimensionalize(
-          tendencies_a.temperature_variation, units.degK / units.s
+          tendencies_a.temperature_variation, s_units.degK / s_units.s
       )
       temperature_b = physics_specs_b.dimensionalize(
-          tendencies_b.temperature_variation, units.degK / units.s
+          tendencies_b.temperature_variation, s_units.degK / s_units.s
       )
       np.testing.assert_allclose(
           temperature_a.magnitude, temperature_b.magnitude, atol=5e-7
       )
     with self.subTest('surface pressure tendency'):
       pressure_a = physics_specs_a.dimensionalize(
-          np.exp(tendencies_a.log_surface_pressure), units.pascal / units.s
+          np.exp(tendencies_a.log_surface_pressure), s_units.pascal / s_units.s
       )
       pressure_b = physics_specs_b.dimensionalize(
-          np.exp(tendencies_b.log_surface_pressure), units.pascal / units.s
+          np.exp(tendencies_b.log_surface_pressure), s_units.pascal / s_units.s
       )
       np.testing.assert_allclose(
           pressure_a.magnitude, pressure_b.magnitude, atol=1e-7
@@ -573,8 +578,8 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
           grid=spherical_harmonic.Grid.with_wavenumbers(16),
           vertical_grid=sigma_coordinates.SigmaCoordinates.equidistant(5),
           reference_temperature=np.linspace(100, 200, 5),
-          kappa=1.4 * units.dimensionless,
-          ideal_gas_constant=33 * units.J / units.kilogram / units.degK,
+          kappa=1.4 * s_units.dimensionless,
+          ideal_gas_constant=33 * s_units.J / s_units.kilogram / s_units.degK,
           step_size=0.3,
           implicit_inverse_method='split',
           seed=0,
@@ -583,8 +588,8 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
           grid=spherical_harmonic.Grid.with_wavenumbers(16),
           vertical_grid=sigma_coordinates.SigmaCoordinates.equidistant(5),
           reference_temperature=np.linspace(100, 200, 5),
-          kappa=1.4 * units.dimensionless,
-          ideal_gas_constant=33 * units.J / units.kilogram / units.degK,
+          kappa=1.4 * s_units.dimensionless,
+          ideal_gas_constant=33 * s_units.J / s_units.kilogram / s_units.degK,
           step_size=0.3,
           implicit_inverse_method='blockwise',
           seed=0,
@@ -593,8 +598,8 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
           grid=spherical_harmonic.Grid.with_wavenumbers(16),
           vertical_grid=sigma_coordinates.SigmaCoordinates.equidistant(5),
           reference_temperature=np.linspace(100, 200, 5),
-          kappa=1.4 * units.dimensionless,
-          ideal_gas_constant=33 * units.J / units.kilogram / units.degK,
+          kappa=1.4 * s_units.dimensionless,
+          ideal_gas_constant=33 * s_units.J / s_units.kilogram / s_units.degK,
           step_size=0.3,
           implicit_inverse_method='stacked',
           seed=0,
@@ -603,8 +608,8 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
           grid=spherical_harmonic.Grid.with_wavenumbers(128),
           vertical_grid=sigma_coordinates.SigmaCoordinates.equidistant(23),
           reference_temperature=np.linspace(250, 300, 23),
-          kappa=111 * units.dimensionless,
-          ideal_gas_constant=1 * units.J / units.kilogram / units.degK,
+          kappa=111 * s_units.dimensionless,
+          ideal_gas_constant=1 * s_units.J / s_units.kilogram / s_units.degK,
           step_size=0.1,
           implicit_inverse_method='split',
           seed=1,
@@ -623,13 +628,13 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
   ):
     """`primitive_inverse` computes (1 - step_size · primitive_implicit)⁻¹."""
     coords = coordinate_systems.CoordinateSystem(grid, vertical_grid)
-    physics_specs = primitive_equations.PrimitiveEquationsSpecs.from_si(
+    physics_specs = units.SimUnits.from_si(
         ideal_gas_constant_si=ideal_gas_constant, kappa_si=kappa
     )
     state = random_state(coords, jax.random.PRNGKey(seed))
     l, _ = coords.horizontal.modal_mesh
     modal_orography = np.zeros_like(l)
-    primitive = primitive_equations.PrimitiveEquations(
+    primitive = primitive_equations.PrimitiveEquationsSigma(
         reference_temperature,
         modal_orography,
         coords,
@@ -652,7 +657,7 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
 
   def test_equivalence_of_primitive_equations_with_and_without_humidity(self):
     """Tests that primitive equations + humidity reduces to default for q=0."""
-    physics_specs = primitive_equations.PrimitiveEquationsSpecs.from_si()
+    physics_specs = units.SimUnits.from_si()
     horizontal = spherical_harmonic.Grid.T21()
     vertical = sigma_coordinates.SigmaCoordinates.equidistant(4)
     coords = coordinate_systems.CoordinateSystem(horizontal, vertical)
@@ -675,11 +680,15 @@ class PrimitiveEquationsImplicitTest(parameterized.TestCase):
     }
     # Computing tendencies using both variations.
     ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
-    primitive_a = primitive_equations.PrimitiveEquationsWithTime(
+    primitive_a = primitive_equations.PrimitiveEquationsSigma(
         ref_temps, modal_orography, coords, physics_specs
     )
-    primitive_b = primitive_equations.MoistPrimitiveEquations(
-        ref_temps, modal_orography, coords, physics_specs
+    primitive_b = primitive_equations.PrimitiveEquationsSigma(
+        ref_temps,
+        modal_orography,
+        coords,
+        physics_specs,
+        humidity_key='specific_humidity',
     )
 
     tendencies_a = primitive_a.explicit_terms(state)
@@ -701,7 +710,7 @@ class PrimitiveEquationsSpecsTest(parameterized.TestCase):
       (np.arange(5).astype('timedelta64[s]'),),
   )
   def test_timedelta_roundtrip(self, timedelta):
-    physics_specs = primitive_equations.PrimitiveEquationsSpecs.from_si()
+    physics_specs = units.SimUnits.from_si()
     dt = physics_specs.nondimensionalize_timedelta64(timedelta)
     actual = physics_specs.dimensionalize_timedelta64(dt)
     np.testing.assert_equal(actual, timedelta)
@@ -711,7 +720,7 @@ class PrimitiveEquationsSpecsTest(parameterized.TestCase):
       dict(value=1e-4, expected=0),  # rounded down from 0.0.68568294
   )
   def test_equivalent_rounding_behavior(self, value, expected):
-    physics_specs = primitive_equations.PrimitiveEquationsSpecs.from_si()
+    physics_specs = units.SimUnits.from_si()
     array_value = np.array(value)
     actual_scalar = physics_specs.dimensionalize_timedelta64(value)
     acutal_array = physics_specs.dimensionalize_timedelta64(array_value)

@@ -25,6 +25,7 @@ from dinosaur import scales
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
+from dinosaur import units
 from dinosaur import xarray_utils
 import jax
 from jax import config  # pylint: disable=g-importing-member
@@ -71,8 +72,12 @@ def make_dycore_sim_fn(coords, physics_specs, num_hours):
   )
   ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
   orography = np.zeros(coords.horizontal.modal_shape, np.float32)
-  eq = primitive_equations.MoistPrimitiveEquations(
-      ref_temps, orography, coords, physics_specs
+  eq = primitive_equations.PrimitiveEquationsSigma(
+      ref_temps,
+      orography,
+      coords,
+      physics_specs,
+      humidity_key='specific_humidity',
   )
   dt = physics_specs.nondimensionalize(30 * scales.units.minute)
   step_fn = time_integration.imex_rk_sil3(eq, time_step=dt)
@@ -131,7 +136,7 @@ def trim_state(state, distributed_coords):
 class IntegrationTest(absltest.TestCase):
 
   def test_distributed_simulation_consistency(self):
-    physics_specs = primitive_equations.PrimitiveEquationsSpecs.from_si()
+    physics_specs = units.SimUnits.from_si()
     coords = make_coords(
         max_wavenumber=31,
         num_layers=8,
@@ -186,7 +191,7 @@ class IntegrationTest(absltest.TestCase):
       )
 
   def test_real_vs_fast_spherical_harmonics(self):
-    physics_specs = primitive_equations.PrimitiveEquationsSpecs.from_si()
+    physics_specs = units.SimUnits.from_si()
 
     real_coords = make_coords(
         max_wavenumber=31,

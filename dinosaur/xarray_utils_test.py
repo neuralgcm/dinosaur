@@ -85,7 +85,7 @@ class XarrayUtilsTest(parameterized.TestCase):
   def test_primitive_eq_data_to_xarray(
       self, samples, time_steps, dt, layers, wavenumbers, attrs
   ):
-    physics_specs = primitive_equations.PrimitiveEquationsSpecs.from_si()
+    physics_specs = units.SimUnits.from_si()
     grid = spherical_harmonic.Grid.with_wavenumbers(
         wavenumbers, radius=physics_specs.radius
     )
@@ -351,7 +351,7 @@ class XarrayUtilsTest(parameterized.TestCase):
     layers = 6
     inner_steps = 3
     outer_steps = 12
-    physics_specs = primitive_equations.PrimitiveEquationsSpecs.from_si()
+    physics_specs = units.SimUnits.from_si()
     grid = spherical_harmonic.Grid.with_wavenumbers(
         wavenumbers, radius=physics_specs.radius
     )
@@ -370,7 +370,7 @@ class XarrayUtilsTest(parameterized.TestCase):
     )
     state = initial_state_fn()
     state.sim_time = 0.0
-    equation = primitive_equations.PrimitiveEquations(
+    equation = primitive_equations.PrimitiveEquationsSigma(
         ref_temperatures, orography, coords, physics_specs
     )
     step_fn = integrator(equation, dt)
@@ -399,7 +399,7 @@ class XarrayUtilsTest(parameterized.TestCase):
   def test_xarray_to_data_with_renaming(self):
     wavenumbers = 21
     layers = 6
-    physics_specs = primitive_equations.PrimitiveEquationsSpecs.from_si()
+    physics_specs = units.SimUnits.from_si()
     grid = spherical_harmonic.Grid.with_wavenumbers(
         wavenumbers, radius=physics_specs.radius
     )

@@ -116,7 +116,7 @@ class HeldSuarezForcing(time_integration.ExplicitODE):
       self, state: primitive_equations.State
   ) -> primitive_equations.State:
     """Computes explicit tendencies due to Held-Suarez forcing."""
-    aux_state = primitive_equations.compute_diagnostic_state(
+    aux_state = primitive_equations.compute_diagnostic_state_sigma(
         state=state, coords=self.coords
     )
 
