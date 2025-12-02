@@ -371,15 +371,24 @@ class HybridCoordinates:
 
   def pressure_boundaries(self, surface_pressure: typing.Numeric) -> Array:
     """Returns boundaries of each layer in pressure units."""
-    return (
-        self.a_boundaries[:, np.newaxis, np.newaxis]
-        + self.b_boundaries[:, np.newaxis, np.newaxis] * surface_pressure
-    )
+    ndim = len([s for s in jnp.shape(surface_pressure) if s > 1])
+    new_dims = tuple(range(1, ndim + 1))
+    a_boundaries = np.expand_dims(self.a_boundaries, new_dims)
+    b_boundaries = np.expand_dims(self.b_boundaries, new_dims)
+    return a_boundaries + b_boundaries * surface_pressure
 
   def pressure_centers(self, surface_pressure: typing.Numeric) -> Array:
     """Returns centers of each layer in pressure units."""
     boundaries = self.pressure_boundaries(surface_pressure)
     return (boundaries[1:] + boundaries[:-1]) / 2
+
+  def layer_thickness(self, surface_pressure: typing.Numeric) -> Array:
+    """Returns thickness of each layer in pressure units."""
+    ndim = len([s for s in jnp.shape(surface_pressure) if s > 1])
+    new_dims = tuple(range(1, ndim + 1))
+    p_thickness = np.expand_dims(self.pressure_thickness, new_dims)
+    sigma_thickness = np.expand_dims(self.sigma_thickness, new_dims)
+    return p_thickness + sigma_thickness * surface_pressure
 
   @classmethod
   def from_sigma_levels(

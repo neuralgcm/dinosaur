@@ -11,9 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
+
 from absl.testing import absltest
 from absl.testing import parameterized
 from dinosaur import coordinate_systems
+from dinosaur import hybrid_coordinates
 from dinosaur import primitive_equations
 from dinosaur import primitive_equations_states
 from dinosaur import scales
@@ -21,6 +24,7 @@ from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
 from dinosaur import units
+from dinosaur import vertical_interpolation
 from dinosaur import xarray_utils
 import jax
 import jax.numpy as jnp
@@ -214,9 +218,7 @@ class PrimitiveEquationsSigmaImplicitTest(parameterized.TestCase):
     )
     step_fn = time_integration.imex_rk_sil3(primitive, dt)
     filters = [
-        time_integration.exponential_step_filter(
-            coords.horizontal, dt
-        ),
+        time_integration.exponential_step_filter(coords.horizontal, dt),
     ]
     step_fn = time_integration.step_with_filters(step_fn, filters)
     trajectory_fn = time_integration.trajectory_from_step(
@@ -694,10 +696,587 @@ class PrimitiveEquationsSigmaImplicitTest(parameterized.TestCase):
     tendencies_a = primitive_a.explicit_terms(state)
     tendencies_b = primitive_b.explicit_terms(state)
 
-    jax.tree_util.tree_map(
+    jax.tree.map(
         lambda x, y: np.testing.assert_allclose(x, y, atol=1e-7),
         tendencies_a,
         tendencies_b,
+    )
+
+
+def interpolate_state_hybrid_to_sigma(
+    state_hybrid: primitive_equations.State,
+    coords_hybrid: coordinate_systems.CoordinateSystem,
+    coords_sigma: coordinate_systems.CoordinateSystem,
+    surface_pressure_nodal: jax.Array,
+) -> primitive_equations.State:
+  """Interpolates hybrid state to sigma coordinates."""
+
+  grid = coords_hybrid.horizontal
+  hybrid_levels = coords_hybrid.vertical
+  sigma_levels = coords_sigma.vertical
+
+  fields_to_interpolate = {
+      'vorticity': grid.to_nodal(state_hybrid.vorticity),
+      'divergence': grid.to_nodal(state_hybrid.divergence),
+      'temperature_variation': grid.to_nodal(
+          state_hybrid.temperature_variation
+      ),
+  }
+  if state_hybrid.tracers:
+    fields_to_interpolate['tracers'] = jax.tree.map(
+        grid.to_nodal, state_hybrid.tracers
+    )
+  interpolated_fields = vertical_interpolation.interp_hybrid_to_sigma(
+      fields_to_interpolate,
+      hybrid_levels,
+      sigma_levels,
+      surface_pressure_nodal.squeeze(),
+  )
+  modal_interpolated_fields = jax.tree.map(grid.to_modal, interpolated_fields)
+  return state_hybrid.replace(**modal_interpolated_fields)
+
+
+class PrimitiveEquationsHybridTest(parameterized.TestCase):
+
+  @parameterized.parameters(
+      dict(wavenumbers=32, layers=4),
+      dict(wavenumbers=64, layers=10),
+  )
+  def test_primitive_equations_hybrid_shape(self, wavenumbers, layers):
+    """Tests that output of explicit_terms has expected shape."""
+    coords = coordinate_systems.CoordinateSystem(
+        horizontal=spherical_harmonic.Grid.with_wavenumbers(wavenumbers),
+        vertical=hybrid_coordinates.HybridCoordinates.analytic_levels(layers),
+    )
+    reference_temperature = 300 * np.ones(layers)
+    l, _ = coords.horizontal.modal_mesh
+    modal_orography = np.zeros_like(l)
+    vorticity = jnp.ones((layers,) + l.shape)
+    divergence = jnp.ones((layers,) + l.shape)
+    temperature_variation = jnp.ones((layers,) + l.shape)
+    log_surface_pressure = jnp.ones((1,) + l.shape)
+
+    physics_specs = units.SimUnits.from_si()
+    state = primitive_equations.State(
+        vorticity, divergence, temperature_variation, log_surface_pressure
+    )
+    primitive = primitive_equations.PrimitiveEquationsHybrid(
+        reference_temperature, modal_orography, coords, physics_specs
+    )
+
+    explicit_output = primitive.explicit_terms(state)
+    implicit_output = primitive.implicit_terms(state)
+    for output in [explicit_output, implicit_output]:
+      with self.subTest('divergence shape'):
+        self.assertEqual(state.divergence.shape, output.divergence.shape)
+      with self.subTest('vorticity shape'):
+        self.assertEqual(state.vorticity.shape, output.vorticity.shape)
+      with self.subTest('temperature shape'):
+        self.assertEqual(
+            state.temperature_variation.shape,
+            output.temperature_variation.shape,
+        )
+      with self.subTest('log_surface_pressure shape'):
+        self.assertEqual(
+            state.log_surface_pressure.shape,
+            output.log_surface_pressure.shape,
+        )
+
+  def test_equivalence_sigma_like(self):
+    """Tests equivalence to PE when using sigma-like coordinates."""
+    wavenumbers = 21
+    layers = 40
+    physics_specs = units.SimUnits.from_si()
+    grid = spherical_harmonic.Grid.with_wavenumbers(wavenumbers)
+    sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(layers)
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.from_sigma_levels(
+        sigma_levels
+    )
+    coords_sigma = coordinate_systems.CoordinateSystem(grid, sigma_levels)
+    coords_hybrid = coordinate_systems.CoordinateSystem(grid, hybrid_levels)
+    state_fn_sigma, features_sigma = primitive_equations_states.steady_state_jw(
+        coords_sigma, physics_specs
+    )
+    state = state_fn_sigma()
+    state_hybrid = primitive_equations.State(**state.asdict())
+    ref_temps = features_sigma[xarray_utils.REF_TEMP_KEY]
+    modal_orography = primitive_equations.truncated_modal_orography(
+        features_sigma[xarray_utils.OROGRAPHY], coords_sigma
+    )
+    pe_sigma = primitive_equations.PrimitiveEquationsSigma(
+        ref_temps,
+        modal_orography,
+        coords_sigma,
+        physics_specs,
+    )
+    pe_hybrid = primitive_equations.PrimitiveEquationsHybrid(
+        ref_temps,
+        modal_orography,
+        coords_hybrid,
+        physics_specs,
+    )
+    explicit_sigma = pe_sigma.explicit_terms(state)
+    explicit_hybrid = pe_hybrid.explicit_terms(state_hybrid)
+    implicit_sigma = pe_sigma.implicit_terms(state)
+    implicit_hybrid = pe_hybrid.implicit_terms(state_hybrid)
+
+    nodal_surface_pressure = jnp.exp(
+        coords_hybrid.horizontal.to_nodal(state_hybrid.log_surface_pressure)
+    )
+    interp_fn = functools.partial(
+        interpolate_state_hybrid_to_sigma,
+        coords_hybrid=coords_hybrid,
+        coords_sigma=coords_sigma,
+        surface_pressure_nodal=nodal_surface_pressure,
+    )
+    explicit_hybrid_interp = interp_fn(explicit_hybrid)
+    implicit_hybrid_interp = interp_fn(implicit_hybrid)
+
+    with self.subTest('explicit_terms'):
+      assert_states_close(
+          explicit_sigma,
+          primitive_equations.State(**explicit_hybrid_interp.asdict()),
+          atol=1e-3,
+      )
+    with self.subTest('implicit_terms'):
+      assert_states_close(
+          implicit_sigma,
+          primitive_equations.State(**implicit_hybrid_interp.asdict()),
+          atol=1e-3,
+      )
+
+  @parameterized.parameters(
+      dict(
+          grid=spherical_harmonic.Grid.with_wavenumbers(16),
+          layers=5,
+          implicit_inverse_method='split',
+          seed=0,
+      ),
+      dict(
+          grid=spherical_harmonic.Grid.with_wavenumbers(16),
+          layers=5,
+          implicit_inverse_method='blockwise',
+          seed=0,
+      ),
+      dict(
+          grid=spherical_harmonic.Grid.with_wavenumbers(16),
+          layers=5,
+          implicit_inverse_method='stacked',
+          seed=0,
+      ),
+  )
+  def test_implicit_inverse_sigma_like(
+      self, grid, layers, implicit_inverse_method, seed
+  ):
+    """`implicit_inverse` computes (1 - step_size · implicit_terms)⁻¹."""
+    sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(layers)
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.from_sigma_levels(
+        sigma_levels
+    )
+    coords = coordinate_systems.CoordinateSystem(grid, hybrid_levels)
+    physics_specs = units.SimUnits.from_si()
+    state = random_state(coords, jax.random.PRNGKey(seed))
+    reference_temperature = 280 * np.ones(layers)
+    l, _ = coords.horizontal.modal_mesh
+    modal_orography = np.zeros_like(l)
+    step_size = 0.1
+    primitive = primitive_equations.PrimitiveEquationsHybrid(
+        reference_temperature,
+        modal_orography,
+        coords,
+        physics_specs,
+        implicit_inverse_method=implicit_inverse_method,
+    )
+    implicit_terms = primitive.implicit_terms(state)
+    primitive_equations.validate_state_shape(implicit_terms, coords)
+    jitted_inverse = jax.jit(lambda s: primitive.implicit_inverse(s, step_size))
+    inverted_state = jitted_inverse(state - step_size * implicit_terms)
+    primitive_equations.validate_state_shape(inverted_state, coords)
+    assert_states_close(state, inverted_state, atol=1e-5)
+
+  def test_stationarity_sigma_like(self):
+    """Tests that isothermal rest state is stationary."""
+    wavenumbers = 42
+    layers = 26
+    dt_si = 600 * s_units.s
+    save_every_si = 4 * s_units.hour
+    inner_steps = int(save_every_si / dt_si)
+    outer_steps = 6
+    physics_specs = units.SimUnits.from_si()
+    dt = physics_specs.nondimensionalize(dt_si)
+    grid = spherical_harmonic.Grid.with_wavenumbers(wavenumbers)
+    sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(layers)
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.from_sigma_levels(
+        sigma_levels
+    )
+    coords = coordinate_systems.CoordinateSystem(grid, hybrid_levels)
+    initial_state_fn, aux_features = primitive_equations_states.steady_state_jw(
+        coords, physics_specs
+    )
+    ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
+    modal_orography = primitive_equations.truncated_modal_orography(
+        aux_features[xarray_utils.OROGRAPHY], coords
+    )
+    state_sigma = initial_state_fn()
+    state = primitive_equations.State(**state_sigma.asdict())
+    primitive = primitive_equations.PrimitiveEquationsHybrid(
+        ref_temps, modal_orography, coords, physics_specs
+    )
+    step_fn = time_integration.imex_rk_sil3(primitive, dt)
+    filters = [
+        time_integration.exponential_step_filter(coords.horizontal, dt),
+    ]
+    step_fn = time_integration.step_with_filters(step_fn, filters)
+    trajectory_fn = time_integration.trajectory_from_step(
+        step_fn,
+        outer_steps,
+        inner_steps,
+    )
+    trajectory_fn = jax.jit(trajectory_fn)
+    input_state = state
+    _, trajectory = trajectory_fn(input_state)
+    trajectory = jax.device_get(trajectory)
+    for step in range(outer_steps):
+      step_state = jax.tree.map(lambda x: x[step], trajectory)  # pylint: disable=cell-var-from-loop
+      with self.subTest(f'Divergence remains close to zero, step {step}'):
+        np.testing.assert_array_less(abs(step_state.divergence), 2e-3)
+
+      with self.subTest(f'Vorticity is stationary, step {step}'):
+        np.testing.assert_allclose(
+            step_state.vorticity, state.vorticity, atol=3e-3
+        )
+
+      with self.subTest(f'Temperature is stationary, step {step}'):
+        np.testing.assert_allclose(
+            step_state.temperature_variation,
+            state.temperature_variation,
+            atol=0.2,
+        )
+
+      with self.subTest(f'Log surface pressure is stationary, step {step}'):
+        np.testing.assert_allclose(
+            step_state.log_surface_pressure,
+            state.log_surface_pressure,
+            atol=5e-4,
+        )
+
+  def test_simulation_equivalence_sigma_like(self):
+    """Tests that simulation with sigma-like hybrid coords matches PE."""
+    wavenumbers = 21
+    layers = 10
+    dt_si = 600 * s_units.s
+    # simulation for 3 days
+    sim_time_si = 3 * s_units.day
+    inner_steps = int(sim_time_si / dt_si)
+    outer_steps = 1
+    physics_specs = units.SimUnits.from_si()
+    dt = physics_specs.nondimensionalize(dt_si)
+    grid = spherical_harmonic.Grid.with_wavenumbers(wavenumbers)
+    sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(layers)
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.from_sigma_levels(
+        sigma_levels
+    )
+    coords_sigma = coordinate_systems.CoordinateSystem(grid, sigma_levels)
+    coords_hybrid = coordinate_systems.CoordinateSystem(grid, hybrid_levels)
+    state_fn_sigma, features_sigma = primitive_equations_states.steady_state_jw(
+        coords_sigma, physics_specs
+    )
+    state_sigma = state_fn_sigma()
+    # initial states are numerically identical, but need to convert type for
+    # hybrid.
+    state_hybrid = primitive_equations.State(**state_sigma.asdict())
+    modal_orography = primitive_equations.truncated_modal_orography(
+        features_sigma[xarray_utils.OROGRAPHY], coords_sigma
+    )
+
+    pe_sigma = primitive_equations.PrimitiveEquationsSigma(
+        features_sigma[xarray_utils.REF_TEMP_KEY],
+        modal_orography,
+        coords_sigma,
+        physics_specs,
+    )
+    pe_hybrid = primitive_equations.PrimitiveEquationsHybrid(
+        features_sigma[xarray_utils.REF_TEMP_KEY],
+        modal_orography,
+        coords_hybrid,
+        physics_specs,
+    )
+
+    def run_sim(primitive, state):
+      step_fn = time_integration.imex_rk_sil3(primitive, dt)
+      filters = [
+          time_integration.exponential_step_filter(
+              primitive.coords.horizontal, dt
+          ),
+      ]
+      step_fn = time_integration.step_with_filters(step_fn, filters)
+      trajectory_fn = time_integration.trajectory_from_step(
+          step_fn, outer_steps, inner_steps
+      )
+      trajectory_fn = jax.jit(trajectory_fn)
+      final_state, _ = trajectory_fn(state)
+      return final_state
+
+    final_state_sigma = run_sim(pe_sigma, state_sigma)
+    final_state_hybrid = run_sim(pe_hybrid, state_hybrid)
+    nodal_surface_pressure = jnp.exp(
+        coords_hybrid.horizontal.to_nodal(
+            final_state_hybrid.log_surface_pressure
+        )
+    )
+    interp_fn = functools.partial(
+        interpolate_state_hybrid_to_sigma,
+        coords_hybrid=coords_hybrid,
+        coords_sigma=coords_sigma,
+        surface_pressure_nodal=nodal_surface_pressure,
+    )
+    final_state_hybrid_interp = interp_fn(final_state_hybrid)
+    assert_states_close(
+        final_state_sigma,
+        primitive_equations.State(**final_state_hybrid_interp.asdict()),
+        atol=0.2,
+    )
+    nodal_surface_pressure_sigma = jnp.exp(
+        coords_sigma.horizontal.to_nodal(
+            final_state_sigma.log_surface_pressure
+        )
+    )
+    np.testing.assert_allclose(
+        nodal_surface_pressure_sigma,
+        nodal_surface_pressure,
+        rtol=1e-3,
+    )
+
+
+  def test_baroclinic_test_case_surface_pressure_similar(self):
+    """Tests that simulation with hybrid and simga coords are close."""
+    wavenumbers = 21
+    layers = 16
+    dt_si = 600 * s_units.s
+    # simulation for 3 days
+    sim_time_si = 1 * s_units.day
+    inner_steps = int(sim_time_si / dt_si)
+    outer_steps = 1
+    physics_specs = units.SimUnits.from_si()
+    dt = physics_specs.nondimensionalize(dt_si)
+    grid = spherical_harmonic.Grid.with_wavenumbers(wavenumbers)
+    sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(layers)
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        layers, sigma_exponent=1.5, stretch_exponent=0.5
+    )
+    coords_sigma = coordinate_systems.CoordinateSystem(grid, sigma_levels)
+    coords_hybrid = coordinate_systems.CoordinateSystem(grid, hybrid_levels)
+    state_fn_sigma, features_sigma = primitive_equations_states.steady_state_jw(
+        coords_sigma, physics_specs
+    )
+    perturbation = primitive_equations_states.baroclinic_perturbation_jw(
+        coords_sigma,
+        physics_specs,
+    )
+    state_sigma = state_fn_sigma()
+    state_sigma += perturbation
+    state_fn_hybrid, features_hybrid = primitive_equations_states.steady_state_jw(
+        coords_hybrid, physics_specs
+    )
+    state_hybrid = state_fn_hybrid()
+    state_hybrid += perturbation  # perturbation is level independent.
+    modal_orography = primitive_equations.truncated_modal_orography(
+        features_sigma[xarray_utils.OROGRAPHY], coords_sigma
+    )
+
+    pe_sigma = primitive_equations.PrimitiveEquationsSigma(
+        features_sigma[xarray_utils.REF_TEMP_KEY],
+        modal_orography,
+        coords_sigma,
+        physics_specs,
+    )
+    pe_hybrid = primitive_equations.PrimitiveEquationsHybrid(
+        features_hybrid[xarray_utils.REF_TEMP_KEY],
+        modal_orography,
+        coords_hybrid,
+        physics_specs,
+    )
+
+    def run_sim(primitive, state):
+      step_fn = time_integration.imex_rk_sil3(primitive, dt)
+      filters = [
+          time_integration.exponential_step_filter(
+              primitive.coords.horizontal, dt
+          ),
+      ]
+      step_fn = time_integration.step_with_filters(step_fn, filters)
+      trajectory_fn = time_integration.trajectory_from_step(
+          step_fn, outer_steps, inner_steps
+      )
+      trajectory_fn = jax.jit(trajectory_fn)
+      final_state, _ = trajectory_fn(state)
+      return final_state
+
+    final_state_sigma = run_sim(pe_sigma, state_sigma)
+    final_state_hybrid = run_sim(pe_hybrid, state_hybrid)
+    nodal_surface_pressure_hybrid = jnp.exp(
+        coords_hybrid.horizontal.to_nodal(
+            final_state_hybrid.log_surface_pressure
+        )
+    )
+    nodal_surface_pressure_sigma = jnp.exp(
+        coords_sigma.horizontal.to_nodal(
+            final_state_sigma.log_surface_pressure
+        )
+    )
+    np.testing.assert_allclose(
+        nodal_surface_pressure_hybrid,
+        nodal_surface_pressure_sigma,
+        rtol=1e-3,
+    )
+
+  @parameterized.parameters(
+      dict(scale=scales.DEFAULT_SCALE),
+      dict(scale=scales.ATMOSPHERIC_SCALE),
+  )
+  def test_tracer_conservation(self, scale):
+    """Tests that tracer mass is conserved over a simulation."""
+    wavenumbers = 21
+    layers = 10
+    dt_si = 600 * s_units.s
+    # simulation for 1 day
+    sim_time_si = 1 * s_units.day
+    inner_steps = int(sim_time_si / dt_si)
+    outer_steps = 1
+    physics_specs = units.SimUnits.from_si(scale=scale)
+    dt = physics_specs.nondimensionalize(dt_si)
+    grid = spherical_harmonic.Grid.with_wavenumbers(wavenumbers)
+    ref_pressure_in_hpa = 1000
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        layers,
+        p0=ref_pressure_in_hpa,
+        sigma_exponent=1.5,
+        stretch_exponent=0.5,
+    )
+    coords = coordinate_systems.CoordinateSystem(grid, hybrid_levels)
+
+    state_fn, features = primitive_equations_states.steady_state_jw(
+        coords, physics_specs
+    )
+    state_pe = state_fn()
+    state = primitive_equations.State(**state_pe.asdict())
+    state.tracers = {
+        'tracer': primitive_equations_states.gaussian_scalar(
+            coords, physics_specs
+        )
+    }
+
+    modal_orography = primitive_equations.truncated_modal_orography(
+        features[xarray_utils.OROGRAPHY], coords
+    )
+    ref_temps = features[xarray_utils.REF_TEMP_KEY]
+    # Primitive equations nondimensionalize reference values and coordinates,
+    # so we can pass in coords directly.
+    primitive = primitive_equations.PrimitiveEquationsHybrid(
+        ref_temps,
+        modal_orography,
+        coords,
+        physics_specs,
+        reference_surface_pressure=ref_pressure_in_hpa * scales.units.millibar,
+    )
+
+    def tracer_integral(tracer, surface_pressure_nodal):
+      tracer_nodal = coords.horizontal.to_nodal(tracer)
+      # surface pressure is in nondim units, hence we need to use nondim coords.
+      tracer_columns = hybrid_coordinates.integral_over_pressure(
+          tracer_nodal,
+          surface_pressure_nodal,
+          primitive.nondim_coords.vertical,
+          keepdims=False,
+      )
+      return coords.horizontal.integrate(tracer_columns)
+
+    nodal_surface_pressure_initial = jnp.exp(
+        coords.horizontal.to_nodal(state.log_surface_pressure)
+    )
+    initial_tracer_total = tracer_integral(
+        state.tracers['tracer'], nodal_surface_pressure_initial
+    )
+
+    step_fn = time_integration.imex_rk_sil3(primitive, dt)
+    filters = [
+        time_integration.exponential_step_filter(
+            primitive.coords.horizontal, dt
+        ),
+    ]
+    step_fn = time_integration.step_with_filters(step_fn, filters)
+    trajectory_fn = time_integration.trajectory_from_step(
+        step_fn, outer_steps, inner_steps
+    )
+    trajectory_fn = jax.jit(trajectory_fn)
+    final_state, _ = trajectory_fn(state)
+
+    nodal_surface_pressure_final = jnp.exp(
+        coords.horizontal.to_nodal(final_state.log_surface_pressure)
+    )
+    final_tracer_total = tracer_integral(
+        final_state.tracers['tracer'], nodal_surface_pressure_final
+    )
+    np.testing.assert_allclose(
+        initial_tracer_total, final_tracer_total, rtol=1e-3
+    )
+
+  def test_primitive_equations_hybrid_run_with_clouds(self):
+    """Tests that the hybrid primitive equations can be run with clouds."""
+    wavenumbers = 21
+    layers = 10
+    dt_si = 600 * s_units.s
+    inner_steps = 2
+    outer_steps = 1
+    physics_specs = units.SimUnits.from_si()
+    dt = physics_specs.nondimensionalize(dt_si)
+    grid = spherical_harmonic.Grid.with_wavenumbers(wavenumbers)
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(layers)
+    coords = coordinate_systems.CoordinateSystem(grid, hybrid_levels)
+
+    state_fn, features = primitive_equations_states.steady_state_jw(
+        coords, physics_specs
+    )
+    state_pe = state_fn()
+    state = primitive_equations.State(**state_pe.asdict())
+    state.tracers = {
+        'specific_humidity': primitive_equations_states.gaussian_scalar(
+            coords, physics_specs
+        ),
+        'specific_cloud_liquid_water_content': (
+            (primitive_equations_states.gaussian_scalar(coords, physics_specs))
+            * 0.1
+        ),
+        'specific_cloud_ice_water_content': (
+            (primitive_equations_states.gaussian_scalar(coords, physics_specs))
+            * 0.01
+        ),
+    }
+
+    modal_orography = primitive_equations.truncated_modal_orography(
+        features[xarray_utils.OROGRAPHY], coords
+    )
+    ref_temps = features[xarray_utils.REF_TEMP_KEY]
+
+    primitive = primitive_equations.PrimitiveEquationsHybrid(
+        ref_temps,
+        modal_orography,
+        coords,
+        physics_specs,
+        humidity_key='specific_humidity',
+        cloud_keys=(
+            'specific_cloud_liquid_water_content',
+            'specific_cloud_ice_water_content',
+        ),
+    )
+    step_fn = time_integration.imex_rk_sil3(primitive, dt)
+    trajectory_fn = time_integration.trajectory_from_step(
+        step_fn, outer_steps, inner_steps, start_with_input=True
+    )
+    trajectory_fn = jax.jit(trajectory_fn)
+    _, trajectory = trajectory_fn(state)
+    self.assertEqual(
+        trajectory.vorticity.shape, (outer_steps,) + coords.modal_shape
     )
 
 
