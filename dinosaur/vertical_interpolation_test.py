@@ -204,6 +204,29 @@ class HybridCoordinatesTest(absltest.TestCase):
     ).ravel()
     np.testing.assert_allclose(actual, expected, atol=1e-6)
 
+  def test_regrid_hybrid_to_hybrid(self):
+    hybrid_coords_src = hybrid_coordinates.HybridCoordinates(
+        a_boundaries=np.array([0, 400, 300, 0]),
+        b_boundaries=np.array([0, 0, 0.5, 1.0]),
+    )
+    hybrid_coords_target = hybrid_coordinates.HybridCoordinates(
+        a_boundaries=np.array([0, 250, 0]),
+        b_boundaries=np.array([0, 0.25, 1.0]),
+    )
+    surface_pressure = np.array([[1000]])
+    original = np.array([1.0, 2.0, 3.0])[:, np.newaxis, np.newaxis]
+    # Source pressure bounds: [0, 400, 800, 1000] for sp=1000
+    # Target pressure bounds: [0, 500, 1000] for sp=1000
+    # Target level 0 (0-500) gets 400 from src level 0 (val=1) and 100 from src
+    # level 1 (val=2) -> (1*400 + 2*100)/500 = 1.2
+    # Target level 1 (500-1000) gets 300 from src level 1 (val=2) and 200 from src
+    # level 2 (val=3) -> (2*300 + 3*200)/500 = 2.4
+    expected = np.array([1.2, 2.4])[:, np.newaxis, np.newaxis]
+    actual = vertical_interpolation.regrid_hybrid_to_hybrid(
+        original, hybrid_coords_src, hybrid_coords_target, surface_pressure
+    )
+    np.testing.assert_allclose(actual, expected, atol=1e-6)
+
   def test_interval_overlap(self):
     actual = vertical_interpolation._interval_overlap(
         np.array([1, 4, 6, 9, 10]), np.array([0, 3, 7, 10])

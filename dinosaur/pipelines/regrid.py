@@ -90,6 +90,12 @@ class RaiseIfNaNFiller(NaNFiller):
     for var, array in chunk.items():
       is_valid = array.notnull().any(dim=self.allowed_incomplete_dims)
       if not is_valid.all():
+        if 'time' in is_valid.dims:
+          nan_coords = is_valid.where(is_valid == False, drop=True)
+          times = np.unique(nan_coords.time.values)
+          logging.error(
+              f'NaN value found in {var} for {key=} at times: {times}'
+          )
         raise ValueError(f'NaN value found in {var} for {key=}')
     return key, chunk
 
@@ -293,6 +299,27 @@ def get_regrid_func(
           key = key.with_offsets(level=None, sigma=0)  # no vertical chunking
 
         case (
+            hybrid_coordinates.HybridCoordinates(),
+            hybrid_coordinates.HybridCoordinates(),
+        ):
+          surface_pressure = chunk.coords['surface_pressure']
+          if surface_pressure.attrs.get('units') != 'Pa':
+            raise ValueError(
+                f'surface_pressure units must be "Pa", but got '
+                f'{surface_pressure.attrs.get("units")=}'
+            )
+          surface_pressure_in_hPa = surface_pressure / 100  # pylint: disable=invalid-name
+          chunk = chunk.drop_vars('surface_pressure')
+          chunk = xarray_utils.regrid_vertical(
+              chunk,
+              surface_pressure_in_hPa,
+              vertical_regridder,
+              in_dim='level',
+              out_dim='hybrid',
+          )
+          assert 'level' not in chunk.dims and 'hybrid' in chunk.dims
+          key = key.with_offsets(level=None, hybrid=0)  # no vertical chunking
+        case (
             vertical_interpolation.PressureCoordinates(),
             vertical_interpolation.PressureCoordinates(),
         ):
@@ -360,11 +387,30 @@ def get_template(
           if 'level' not in x.dims:
             return x
           axis = x.get_axis_num('level')
+          assert isinstance(
+              vertical_regridder.target_grid,
+              sigma_coordinates.SigmaCoordinates,
+          )
           sigmas = vertical_regridder.target_grid.centers
           return x.isel(level=0, drop=True).expand_dims(sigma=sigmas, axis=axis)
 
         template = template.map(replace_level_with_sigma)
 
+      case (
+          hybrid_coordinates.HybridCoordinates(),
+          hybrid_coordinates.HybridCoordinates(),
+      ):
+
+        def replace_level_with_hybrid(x):
+          if 'level' not in x.dims:
+            return x
+          axis = x.get_axis_num('level')
+          hybrid_levels = np.arange(vertical_regridder.target_grid.layers)
+          return x.isel(level=0, drop=True).expand_dims(
+              hybrid=hybrid_levels, axis=axis
+          )
+
+        template = template.map(replace_level_with_hybrid)
       case (
           vertical_interpolation.PressureCoordinates(),
           vertical_interpolation.PressureCoordinates(),
@@ -374,6 +420,10 @@ def get_template(
           if 'level' not in x.dims:
             return x
           axis = x.get_axis_num('level')
+          assert isinstance(
+              vertical_regridder.target_grid,
+              vertical_interpolation.PressureCoordinates,
+          )
           new_levels = vertical_regridder.target_grid.centers
           return x.isel(level=0, drop=True).expand_dims(
               level=new_levels, axis=axis
@@ -423,6 +473,11 @@ def get_output_chunks(
         vertical_interpolation.PressureCoordinates,
     ):
       output_chunks['level'] = -1
+    elif isinstance(
+        vertical_regridder.target_grid,
+        hybrid_coordinates.HybridCoordinates,
+    ):
+      output_chunks['hybrid'] = -1
     else:
       raise ValueError(
           'Unsupported vertical regridding target grid: '

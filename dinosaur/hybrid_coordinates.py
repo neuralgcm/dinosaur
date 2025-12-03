@@ -339,6 +339,71 @@ class HybridCoordinates:
     b_boundaries[-1] = 1.0
     return cls.from_coefficients(a_boundaries, b_boundaries, p0)
 
+  @classmethod
+  def analytic_ecmwf_like(
+      cls,
+      n_levels: int = 137,
+      p0: float = 1013.25,
+      p_top: float = 0.0,
+      p_transition: float = 80.0,
+      alpha_strat: float = 4.2,
+      alpha_surf: float = 0.25,
+      b_exponent: float = 1.3,
+  ) -> HybridCoordinates:
+    """Generates hybrid coefficients with higher resolution at TOA and surface.
+    we note that this is an empirically-derived set of parameters that allows
+    to produce concentration of levels in the lower and upper parts of the
+    atmosphere. 
+
+    Args:
+      n_levels: The desired number of vertical layers.
+      p0: Reference surface pressure in hPa.
+      p_top: Pressure at the top of the model in hPa.
+      p_transition: Pressure level in hPa. Above this pressure (i.e., closer
+        to surface), coordinates transition from pure pressure to hybrid.
+      alpha_strat: Power law exponent used near TOA. Higher values (>1) result
+        in thinner layers (higher resolution) near TOA.
+      alpha_surf: Power law exponent used near the surface. Lower values (<1)
+        result in thinner layers (higher resolution) near the surface.
+      b_exponent: Exponent applied to normalized pressure in the hybrid region
+        to calculate the `b` coefficient. Controls how rapidly levels
+        transition from pressure-following to terrain-following.
+
+    Returns:
+      A HybridCoordinates object with coefficients defined in hPa.
+    """
+
+    k = np.linspace(0, 1, n_levels + 1)
+    exponents = np.linspace(alpha_strat, alpha_surf, n_levels + 1)
+    p_norm = k**exponents
+    p_target = p_top + p_norm * (p0 - p_top)
+    a_coeffs = np.zeros_like(p_target)
+    b_coeffs = np.zeros_like(p_target)
+
+    for i, p in enumerate(p_target):
+      if p <= p_transition:
+        # REGIME 1: Pure Pressure
+        b_coeffs[i] = 0.0
+        a_coeffs[i] = p
+      else:
+        # REGIME 2: Hybrid
+        # Calculate coordinate tau (0 at transition, 1 at surface)
+        tau = (p - p_transition) / (p0 - p_transition)
+        b_val = tau**b_exponent
+
+        # Enforce boundary
+        if i == n_levels:
+          b_val = 1.0
+
+        b_coeffs[i] = b_val
+
+        # A is the residual
+        a_val = p - (b_val * p0)
+        a_coeffs[i] = max(0.0, a_val)
+    a_coeffs[0] = 0.0
+    b_coeffs[0] = 0.0
+    return cls(a_boundaries=a_coeffs, b_boundaries=b_coeffs)
+
   def get_eta(self, p_surface: float) -> np.ndarray:
     """Returns the eta values for a given pressure."""
     etas = self.a_centers / p_surface + self.b_centers

@@ -356,7 +356,9 @@ def conservative_regrid_weights(
     NumPy array with shape (target, source). Rows sum to 1.
   """
   weights = _interval_overlap(source_bounds, target_bounds)
-  weights /= jnp.sum(weights, axis=1, keepdims=True)
+  # jnp.nan_to_num is needed above high topography as sometimes the layer
+  # thickness is 0
+  weights = jnp.nan_to_num(weights / jnp.sum(weights, axis=1, keepdims=True))
   assert weights.shape == (target_bounds.size - 1, source_bounds.size - 1)
   return weights
 
@@ -398,13 +400,56 @@ def regrid_hybrid_to_sigma(
   )
 
 
+@functools.partial(jax.jit, static_argnums=(1, 2))
+def regrid_hybrid_to_hybrid(
+    fields: typing.Pytree,
+    source_coords: hybrid_coordinates.HybridCoordinates,
+    target_coords: hybrid_coordinates.HybridCoordinates,
+    surface_pressure: typing.Array,
+) -> typing.Pytree:
+  """Conservatively regrid 3D fields from hybrid to hybrid levels."""
+  # This implementation mirrors regrid_hybrid_to_sigma using vectorize
+  @jax.jit
+  @functools.partial(jnp.vectorize, signature='(x,y),(b,x,y)->(c,x,y)')
+  @functools.partial(jax.vmap, in_axes=(-1, -1), out_axes=-1)
+  @functools.partial(jax.vmap, in_axes=(-1, -1), out_axes=-1)
+  def regrid(surface_pressure_scalar, field_1d):
+    """Regrids a single column."""
+    if field_1d.shape[0] != source_coords.layers:
+      raise ValueError(
+          f'Source has {source_coords.layers} layers, but field has'
+          f' {field_1d.shape[0]}'
+      )
+    source_pressure_bounds = (
+        source_coords.a_boundaries
+        + source_coords.b_boundaries * surface_pressure_scalar
+    )
+    target_pressure_bounds = (
+        target_coords.a_boundaries
+        + target_coords.b_boundaries * surface_pressure_scalar
+    )
+    weights = conservative_regrid_weights(
+        source_pressure_bounds, target_pressure_bounds
+    )
+    result = jnp.einsum('ab,b->a', weights, field_1d, precision='float32')
+    return result
+
+  return pytree_utils.tree_map_over_nonscalars(
+      lambda x: regrid(surface_pressure, x), fields
+  )
+
+
 @dataclasses.dataclass(frozen=True)
 class Regridder:
   """Regrid vertically, from hybrid to sigma coordinates."""
 
   # TODO(shoyer): support more generic vertical coordinate systems.
   source_grid: hybrid_coordinates.HybridCoordinates | PressureCoordinates
-  target_grid: sigma_coordinates.SigmaCoordinates | PressureCoordinates
+  target_grid: (
+      sigma_coordinates.SigmaCoordinates
+      | PressureCoordinates
+      | hybrid_coordinates.HybridCoordinates
+  )
 
   def __call__(
       self, field: typing.Array, surface_pressure: typing.Array | None
@@ -421,11 +466,26 @@ class ConservativeRegridder(Regridder):
   ) -> jnp.ndarray:
     if surface_pressure is None:
       raise ValueError(
-          'surface_pressure is required for hybrid to sigma regridding'
+          'surface_pressure is required for hybrid source regridding'
       )
-    return regrid_hybrid_to_sigma(
-        field, self.source_grid, self.target_grid, surface_pressure
-    )
+    if isinstance(
+        self.source_grid, hybrid_coordinates.HybridCoordinates
+    ) and isinstance(self.target_grid, sigma_coordinates.SigmaCoordinates):
+      return regrid_hybrid_to_sigma(
+          field, self.source_grid, self.target_grid, surface_pressure
+      )
+    elif isinstance(
+        self.source_grid, hybrid_coordinates.HybridCoordinates
+    ) and isinstance(self.target_grid, hybrid_coordinates.HybridCoordinates):
+      return regrid_hybrid_to_hybrid(
+          field, self.source_grid, self.target_grid, surface_pressure
+      )
+    else:
+      raise ValueError(
+          f'Unsupported grid combination for ConservativeRegridder: '
+          f'source_grid={type(self.source_grid)}, '
+          f'target_grid={type(self.target_grid)}'
+      )
 
 
 @dataclasses.dataclass(frozen=True)

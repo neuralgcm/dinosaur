@@ -1259,6 +1259,7 @@ def regrid_vertical(
 
   Supports:
     - Hybrid coordinates to Sigma coordinates (requires surface_pressure).
+    - Hybrid coordinates to Hybrid coordinates (requires surface_pressure).
     - Pressure coordinates to Pressure coordinates (surface_pressure is ignored).
 
   Args:
@@ -1303,13 +1304,17 @@ def regrid_vertical(
     case (
         hybrid_coordinates.HybridCoordinates(),
         sigma_coordinates.SigmaCoordinates(),
+    ) | (
+        hybrid_coordinates.HybridCoordinates(),
+        hybrid_coordinates.HybridCoordinates(),
     ):
       if surface_pressure is None:
         raise ValueError(
-            'surface_pressure is required for hybrid to sigma regridding'
+            'surface_pressure is required for regridding from hybrid'
+            ' coordinates'
         )
 
-      def regrid_chunk_hybrid_to_sigma(field, surface_pressure):
+      def regrid_chunk_hybrid_source(field, surface_pressure):
         chunks = list(field.chunks)
         chunks[-3] = (target_grid.layers,)
         return dask.array.map_blocks(
@@ -1323,7 +1328,7 @@ def regrid_vertical(
         )
 
       data = xarray.apply_ufunc(
-          regrid_chunk_hybrid_to_sigma,
+          regrid_chunk_hybrid_source,
           data.chunk(compute_chunks),
           surface_pressure.chunk(compute_chunks),
           input_core_dims=[
@@ -1371,6 +1376,11 @@ def regrid_vertical(
           dask='allowed',
       )
 
-  data.coords[out_dim] = regridder.target_grid.centers
+  if isinstance(
+      regridder.target_grid, hybrid_coordinates.HybridCoordinates
+  ):
+    data.coords[out_dim] = np.arange(regridder.target_grid.layers)
+  else:
+    data.coords[out_dim] = regridder.target_grid.centers
 
   return data.compute()
