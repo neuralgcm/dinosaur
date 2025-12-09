@@ -87,20 +87,22 @@ def integral_over_pressure(
     coordinates: HybridCoordinates,
     axis: int = -3,
     keepdims: bool = True,
-) -> jax.Array:
+    ) -> jax.Array:
   """Approximates definite integral of `x` over pressure."""
   if coordinates.layers != x.shape[axis]:
     raise ValueError(
         '`x.shape[axis]` must be equal to `coordinates.layers`;'
         f'got {x.shape[axis]} and {coordinates.layers}.'
     )
-  a_thickness = coordinates.pressure_thickness
-  b_thickness = coordinates.sigma_thickness
-  a_thickness = a_thickness.astype(x.dtype)[:, np.newaxis, np.newaxis]
-  b_thickness = b_thickness.astype(x.dtype)[:, np.newaxis, np.newaxis]
-  dp = a_thickness + b_thickness * surface_pressure
-  xdp = x * dp
-  return xdp.sum(axis=axis, keepdims=keepdims)
+  x_axes = range(x.ndim)
+  da = coordinates.pressure_thickness.astype(x.dtype)
+  db = coordinates.sigma_thickness.astype(x.dtype)
+  thickness_axes = [x_axes[axis]]
+  x_da = einsum(x, x_axes, da, thickness_axes, x_axes)
+  int_x_da = x_da.sum(axis=axis, keepdims=keepdims)
+  x_db = einsum(x, x_axes, db, thickness_axes, x_axes)
+  int_x_db = x_db.sum(axis=axis, keepdims=keepdims)
+  return int_x_da + surface_pressure * int_x_db
 
 
 @jax.named_call
@@ -353,7 +355,7 @@ class HybridCoordinates:
     """Generates hybrid coefficients with higher resolution at TOA and surface.
     we note that this is an empirically-derived set of parameters that allows
     to produce concentration of levels in the lower and upper parts of the
-    atmosphere. 
+    atmosphere.
 
     Args:
       n_levels: The desired number of vertical layers.
