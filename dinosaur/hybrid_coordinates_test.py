@@ -16,8 +16,10 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 from dinosaur import hybrid_coordinates
+from dinosaur import scales
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
+from dinosaur import units
 import jax.numpy as jnp
 import numpy as np
 
