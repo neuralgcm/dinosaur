@@ -478,6 +478,22 @@ class HybridCoordinates:
     return cls(a_boundaries=a, b_boundaries=b)
 
   @classmethod
+  def ecmwf137_interpolated(
+      cls,
+      n_levels: int,
+  ) -> HybridCoordinates:
+    """Returns hybrid coordinates interpolated from ECMWF 137 levels."""
+    base = cls.ECMWF137()
+
+    x_old = np.linspace(0, 1, base.layers + 1)
+    x_new = np.linspace(0, 1, n_levels + 1)
+
+    a_new = np.interp(x_new, x_old, base.a_boundaries)
+    b_new = np.interp(x_new, x_old, base.b_boundaries)
+
+    return cls(a_boundaries=a_new, b_boundaries=b_new)
+
+  @classmethod
   def ECMWF137(cls) -> HybridCoordinates:  # pylint: disable=invalid-name
     """Returns the 137 model levels used by ECMWF's IFS (e.g., in ERA5).
 
