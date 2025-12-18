@@ -1471,6 +1471,41 @@ def _get_vertical_discretization_coeffs(
 
 
 @jax.named_call
+def _get_vertical_discretization_coeffs_jax(
+    coordinates: hybrid_coordinates.HybridCoordinates,
+    p_s_ref: float | Array,
+):
+  """Computes coefficients for vertical discretization in Simmons & Burridge."""
+  # Pressure at interfaces at reference surface pressure
+  a_boundaries = jnp.asarray(coordinates.a_boundaries)
+  b_boundaries = jnp.asarray(coordinates.b_boundaries)
+  p_s_ref = jnp.asarray(p_s_ref)
+
+  if p_s_ref.ndim > 0:
+    # Broadcasting a, b to match p_s_ref shape.
+    # a, b are (levels+1,). p_s_ref is (lat, lon) or similar.
+    # We want p_half_ref to be (levels+1, lat, lon).
+    shape_suffix = (1,) * p_s_ref.ndim
+    a_boundaries = a_boundaries.reshape(a_boundaries.shape + shape_suffix)
+    b_boundaries = b_boundaries.reshape(b_boundaries.shape + shape_suffix)
+    p_s_ref = p_s_ref[jnp.newaxis, ...]
+
+  p_half_ref = a_boundaries + b_boundaries * p_s_ref
+  dp_ref = jax_numpy_utils.diff(p_half_ref, axis=0)
+  # dp_ref = jnp.where(dp_ref == 0, 1.0, dp_ref)  # Avoid division by zero
+
+  # Alpha coefficient from S&B 1981, for geopotential on full levels
+  p_k_minus_half = lax.slice_in_dim(p_half_ref, 0, -1)
+  p_k_plus_half = lax.slice_in_dim(p_half_ref, 1, None)
+  # Avoid log(0) at the model top
+  safe_p_k_minus_half = jnp.maximum(p_k_minus_half, 1e-6)
+  safe_p_k_plus_half = jnp.maximum(p_k_plus_half, 1e-6)
+  log_p_interface_ratio = jnp.log(safe_p_k_plus_half / safe_p_k_minus_half)
+  alpha_k = 1 - (p_k_minus_half / dp_ref) * log_p_interface_ratio
+  return alpha_k, log_p_interface_ratio
+
+
+@jax.named_call
 def compute_diagnostic_state_hybrid(
     state: State,
     coords: coordinate_systems.CoordinateSystem,
@@ -1567,31 +1602,99 @@ def get_geopotential_diff_hybrid(
     temperature: Array,
     coordinates: hybrid_coordinates.HybridCoordinates,
     ideal_gas_constant: float,
-    p_s_ref: float,
+    p_s_ref: float | Array,
     method: str = 'dense',
     sharding: jax.sharding.NamedSharding | None = None,
 ) -> jax.Array:
   """Calculate the implicit geopotential term."""
-  if method == 'dense':
+  # If p_s_ref is spatially varying, we cannot use the dense matrix method
+  # because the matrix would be spatially dependent.
+  is_variable_ps = np.ndim(p_s_ref) > 0
+
+  if method == 'dense' and not is_variable_ps:
     weights = get_geopotential_weights_hybrid(
         coordinates, ideal_gas_constant, p_s_ref=p_s_ref
     )
     return _vertical_matvec(weights, temperature)
-  elif method == 'sparse':
-    alpha_k, log_p_ratio = _get_vertical_discretization_coeffs(
-        coordinates, p_s_ref
-    )
+  elif method == 'sparse' or is_variable_ps:
+    if is_variable_ps:
+      alpha_k, log_p_ratio = _get_vertical_discretization_coeffs_jax(
+          coordinates, p_s_ref
+      )
+    else:
+      alpha_k, log_p_ratio = _get_vertical_discretization_coeffs(
+          coordinates, p_s_ref
+      )
+
+    if log_p_ratio.ndim == 1:
+      log_p_ratio = log_p_ratio[:, np.newaxis, np.newaxis]
+      alpha_k = alpha_k[:, np.newaxis, np.newaxis]
+
     # Φ'_k = R * [ Σ_{j=k+1 to N} T'_j Δ(ln p)_j + α_k T'_k ]
-    weighted_temp = temperature * log_p_ratio[:, np.newaxis, np.newaxis]
+    weighted_temp = temperature * log_p_ratio
     # Sum from j=k+1 to N-1 (0-indexed)
     full_integral = jax_numpy_utils.reverse_cumsum(
         weighted_temp, axis=0, sharding=sharding
     )
     integral_term = full_integral - weighted_temp  # Removes the j=k term
-    diagonal_term = alpha_k[:, np.newaxis, np.newaxis] * temperature
+    diagonal_term = alpha_k * temperature
     return ideal_gas_constant * (integral_term + diagonal_term)
   else:
     raise ValueError(f'unknown {method=} for get_geopotential_diff')
+
+
+def get_geopotential_on_hybrid(
+    temperature: typing.Array,
+    specific_humidity: typing.Array | None = None,
+    clouds: typing.Array | None = None,
+    *,
+    nodal_orography: typing.Array,
+    coordinates: hybrid_coordinates.HybridCoordinates,
+    gravity_acceleration: float,
+    ideal_gas_constant: float,
+    p_s_ref: float,
+    water_vapor_gas_constant: float | None = None,
+    sharding: jax.sharding.NamedSharding | None = None,
+) -> jnp.ndarray:
+  """Computes geopotential in nodal space using nodal temperature and moisture.
+
+  If `specific_humidity` is None, computes dry geopotential. If clouds are
+  provided, the cloud condensation is subtracted from the virtual temperature.
+
+  Args:
+    temperature: nodal values of temperature.
+    specific_humidity: nodal values of specific humidity. If provided, moisture
+      effects are included in geopotential calculation.
+    clouds: nodal values of cloud condensate.
+    nodal_orography: nodal values of orography.
+    coordinates: hybrid coordinates.
+    gravity_acceleration: gravity.
+    ideal_gas_constant: ideal gas constant for dry air.
+    p_s_ref: reference surface pressure.
+    water_vapor_gas_constant: ideal gas constant for water vapor. Must be
+      provided if `specific_humidity` is provided.
+    sharding: optional sharding.
+
+  Returns:
+    Nodal geopotential.
+  """
+  surface_geopotential = nodal_orography * gravity_acceleration
+  if specific_humidity is not None:
+    if water_vapor_gas_constant is None:
+      raise ValueError(
+          'Must provide `water_vapor_gas_constant` with `specific_humidity`.'
+      )
+    gas_const_ratio = water_vapor_gas_constant / ideal_gas_constant
+    cloud_effect = 0.0 if clouds is None else clouds
+    virtual_temp = temperature * (
+        1 + (gas_const_ratio - 1) * specific_humidity - cloud_effect
+    )
+  else:
+    virtual_temp = temperature
+  geopotential_diff = get_geopotential_diff_hybrid(
+      virtual_temp, coordinates, ideal_gas_constant, p_s_ref, sharding=sharding
+  )
+  return surface_geopotential + geopotential_diff
 
 
 def get_temperature_implicit_weights_hybrid(
@@ -1691,15 +1794,31 @@ def _get_pgf_lps_coefficient(
     R: float,
 ) -> Array:
   """Computes PGF coefficient from R*T*∇ln(p) term."""
-  # Pressure at full levels (layer centers)
-  p_full = coords.pressure_centers(surface_pressure)
-  p_full = jnp.maximum(p_full, 1e-6)
-  # B coefficient at full levels
-  b_full = coords.b_centers[:, None, None]
-  # The coefficient of ∇ln(p_s) from R*T*∇ln(p) is R*T*(B*p_s/p).
-  # This correctly collapses to R*T when A=0 (sigma coordinates).
-  coeff = R * temperature * (b_full * surface_pressure / p_full)
-  return coeff
+  if surface_pressure.ndim == temperature.ndim:
+    surface_pressure = surface_pressure.squeeze(0)
+
+  # Discretized term from Simmons & Burridge (1981) to ensure conservation.
+  # The term corresponds to `C.'II_k` in `C_k · ∇ln(p_s)`.
+  # C_k = (R T_v / Δp_k) * [ ln(p_{k+1/2}/p_{k-1/2}) * B_{k-1/2} + α_k * ΔB_k ] * p_s
+  alpha_k, log_p_interface_ratio = _get_vertical_discretization_coeffs_jax(
+      coords, surface_pressure
+  )
+  b_boundaries = jnp.asarray(coords.b_boundaries)
+  # b_minus is B_{k-1/2} (top of layer k)
+  b_minus = b_boundaries[:-1]
+  db = jax_numpy_utils.diff(b_boundaries, axis=0)
+
+  # Broadcast to match shape (layers, lat, lon)
+  if np.ndim(surface_pressure) > 0:
+    shape_suffix = (1,) * surface_pressure.ndim
+    b_minus = b_minus.reshape(b_minus.shape + shape_suffix)
+    db = db.reshape(db.shape + shape_suffix)
+
+  dp = coords.layer_thickness(surface_pressure)
+  # Avoid division by zero for empty layers
+  dp = jnp.where(dp == 0, 1.0, dp)
+  term_bracket = log_p_interface_ratio * b_minus + alpha_k * db
+  return (R * temperature / dp) * term_bracket * surface_pressure
 
 
 def _get_pgf_lps_coefficient_numpy(
@@ -1709,13 +1828,27 @@ def _get_pgf_lps_coefficient_numpy(
     R: float,
 ) -> np.ndarray:
   """NumPy version of PGF coefficient for the implicit matrix."""
-  # Pressure at full levels (layer centers)
-  p_full = coords.a_centers + coords.b_centers * surface_pressure
-  p_full = np.maximum(p_full, 1e-6)
-  # B coefficient at full levels
-  b_full = coords.b_centers
-  coeff = R * temperature * (b_full * surface_pressure / p_full)
-  return coeff
+  # Discretized term from Simmons & Burridge (1981) to ensure conservation.
+  # The term corresponds to `C.'II_k` in `C_k · ∇ln(p_s)`.
+  # C_k = (R T_v / Δp_k) * [ ln(p_{k+1/2}/p_{k-1/2}) * B_{k-1/2} + α_k * ΔB_k ] * p_s
+  alpha_k, log_p_interface_ratio = _get_vertical_discretization_coeffs(
+      coords, surface_pressure
+  )
+  b_boundaries = coords.b_boundaries
+  # b_minus is B_{k-1/2} (top of layer k)
+  b_minus = b_boundaries[:-1]
+  db = np.diff(b_boundaries, axis=0)
+
+  # Pressure thickness at full levels
+  # dp_k = p_{k+1/2} - p_{k-1/2} = (A_{k+1/2} - A_{k-1/2}) + (B_{k+1/2} - B_{k-1/2}) * p_s
+  # Since p_s is scalar here (reference pressure), this is just the layer thickness
+  # computed by the coordinates object for that pressure.
+  p_half = coords.a_boundaries + coords.b_boundaries * surface_pressure
+  dp = np.diff(p_half, axis=0)
+  dp = np.where(dp == 0, 1.0, dp)
+
+  vertical_weight_psg = log_p_interface_ratio * b_minus + alpha_k * db
+  return (R * temperature / dp) * vertical_weight_psg * surface_pressure
 
 
 def _get_implicit_term_matrix_hybrid(
@@ -1911,7 +2044,7 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
 
     # Explicit part of PGF is the term associated with temperature.
     pgf_coeff = _get_pgf_lps_coefficient(
-        aux_state.temperature_variation + self.T_ref,
+        aux_state.temperature_variation,
         nodal_surface_pressure,
         self.nondim_levels,
         self.physics_specs.R,
@@ -2057,12 +2190,32 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
     aux_state = compute_diagnostic_state_hybrid(state, self.nondim_coords)
     nodal_surface_pressure = jnp.exp(
         self.coords.horizontal.to_nodal(state.log_surface_pressure)
-    )
+    ).squeeze(0)
     vorticity_dot, divergence_dot = self.curl_and_div_tendencies(
         aux_state, nodal_surface_pressure
     )
     kinetic_energy_tendency = self.kinetic_energy_tendency(aux_state)
     orography_tendency = self.orography_tendency()
+
+    # To maintain hydrostatic balance, we must include the PGF term associated
+    # with the reference state T_ref.
+    # The total reference PGF is: ∇Φ(T_ref) + α(T_ref)∇p.
+    method = self.vertical_matmul_method
+    if method is None:
+      mesh = self.coords.spmd_mesh
+      method = 'sparse' if mesh is not None and mesh.shape['z'] > 1 else 'dense'
+
+    geopotential_diff_ref = get_geopotential_diff_hybrid(
+        self.T_ref,
+        self.nondim_levels,
+        self.physics_specs.R,
+        nodal_surface_pressure,
+        method=method,
+        sharding=self.coords.dycore_sharding,
+    )
+    ref_geopotential_tendency = -self.coords.horizontal.laplacian(
+        self.coords.horizontal.to_modal(geopotential_diff_ref)
+    )
 
     if self.humidity_key is not None:
       humidity_vort_correction_tendency = (
@@ -2105,7 +2258,10 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
     to_modal_fn = self.coords.horizontal.to_modal
     vorticity_tendency = vorticity_dot
     divergence_tendency = (
-        divergence_dot + kinetic_energy_tendency + orography_tendency
+        divergence_dot
+        + kinetic_energy_tendency
+        + orography_tendency
+        + ref_geopotential_tendency
     )
     temperature_tendency = (
         to_modal_fn(dT_dt_horizontal_nodal + dT_dt_vertical + dT_dt_adiabatic)
