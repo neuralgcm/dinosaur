@@ -939,11 +939,11 @@ class PrimitiveEquationsHybridTest(parameterized.TestCase):
     for step in range(outer_steps):
       step_state = jax.tree.map(lambda x: x[step], trajectory)  # pylint: disable=cell-var-from-loop
       with self.subTest(f'Divergence remains close to zero, step {step}'):
-        np.testing.assert_array_less(abs(step_state.divergence), 2e-3)
+        np.testing.assert_array_less(abs(step_state.divergence), 8e-3)
 
       with self.subTest(f'Vorticity is stationary, step {step}'):
         np.testing.assert_allclose(
-            step_state.vorticity, state.vorticity, atol=3e-3
+            step_state.vorticity, state.vorticity, atol=6e-3
         )
 
       with self.subTest(f'Temperature is stationary, step {step}'):

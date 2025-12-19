@@ -257,6 +257,8 @@ class HybridCoordinates:
   b_boundaries: np.ndarray
 
   def __post_init__(self):
+    object.__setattr__(self, 'a_boundaries', np.asarray(self.a_boundaries))
+    object.__setattr__(self, 'b_boundaries', np.asarray(self.b_boundaries))
     if len(self.a_boundaries) != len(self.b_boundaries):
       raise ValueError(
           'Expected `a_boundaries` and `b_boundaries` to have the same length, '
