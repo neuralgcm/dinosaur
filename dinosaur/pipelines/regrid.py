@@ -282,7 +282,7 @@ def get_regrid_func(
           surface_pressure = chunk.coords['surface_pressure']
           if surface_pressure.attrs.get('units') != 'Pa':
             raise ValueError(
-                f'surface_pressure units must be "Pa", but got '
+                'surface_pressure units must be "Pa", but got '
                 f'{surface_pressure.attrs.get("units")=}'
             )
           surface_pressure_in_hPa = surface_pressure / 100  # pylint: disable=invalid-name
@@ -316,6 +316,12 @@ def get_regrid_func(
               vertical_regridder,
               in_dim='level',
               out_dim='hybrid',
+          )
+          # xarray_utils.regrid_vertical creates 0-based hybrid levels by
+          # default. We need to overwrite them with 1-based levels to match
+          # the template.
+          chunk = chunk.assign_coords(
+              hybrid=np.arange(1, vertical_regridder.target_grid.layers + 1)
           )
           assert 'level' not in chunk.dims and 'hybrid' in chunk.dims
           key = key.with_offsets(level=None, hybrid=0)  # no vertical chunking
@@ -398,19 +404,31 @@ def get_template(
 
       case (
           hybrid_coordinates.HybridCoordinates(),
-          hybrid_coordinates.HybridCoordinates(),
+          hybrid_coordinates.HybridCoordinates() as target_grid,
       ):
+        # Help pytype understand the type of target_grid.
+        assert isinstance(target_grid, hybrid_coordinates.HybridCoordinates)
 
         def replace_level_with_hybrid(x):
           if 'level' not in x.dims:
             return x
           axis = x.get_axis_num('level')
-          hybrid_levels = np.arange(vertical_regridder.target_grid.layers)
+          # Hybrid levels are 1-based.
+          hybrid_levels = np.arange(1, target_grid.layers + 1)
           return x.isel(level=0, drop=True).expand_dims(
               hybrid=hybrid_levels, axis=axis
           )
 
         template = template.map(replace_level_with_hybrid)
+
+        if 'hybrid' in template.coords:
+          # Note: 'a' and 'b' coefficients are for the interfaces (boundaries)
+          # of the layers. 'a' is in hPa.
+          template.coords['hybrid'].attrs.update({
+              'standard_name': 'atmosphere_hybrid_sigma_pressure_coordinate',
+              'a_boundaries': target_grid.a_boundaries,
+              'b_boundaries': target_grid.b_boundaries,
+          })
       case (
           vertical_interpolation.PressureCoordinates(),
           vertical_interpolation.PressureCoordinates(),
