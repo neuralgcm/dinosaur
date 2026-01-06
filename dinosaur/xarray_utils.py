@@ -1379,7 +1379,7 @@ def regrid_vertical(
   if isinstance(
       regridder.target_grid, hybrid_coordinates.HybridCoordinates
   ):
-    data.coords[out_dim] = np.arange(regridder.target_grid.layers)
+    data.coords[out_dim] = np.arange(1, regridder.target_grid.layers + 1)
   else:
     data.coords[out_dim] = regridder.target_grid.centers
 
