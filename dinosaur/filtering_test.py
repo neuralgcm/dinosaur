@@ -79,7 +79,7 @@ class FilteringTest(parameterized.TestCase):
     inputs = np.ones((time_slices, 3) + grid.modal_shape)  # [time, level, ...].
     out = filter_fn(grid, **filter_kwargs)(inputs)
     for i in range(time_slices):
-      kwargs = jax.tree_util.tree_map(lambda x: float(x[i]), filter_kwargs)  # pylint: disable=cell-var-from-loop
+      kwargs = jax.tree.map (lambda x: x[i].item(), filter_kwargs)  # pylint: disable=cell-var-from-loop
       # we expect `out[i]` to be equal to independent application filter_fn.
       expected_out_i = filter_fn(grid, **kwargs)(inputs[i, ...])
       np.testing.assert_allclose(expected_out_i, out[i, ...])
