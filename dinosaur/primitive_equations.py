@@ -797,6 +797,7 @@ class PrimitiveEquationsBase(time_integration.ImplicitExplicitODE):
       temperature_diff: Array,
       method: str,
       sharding: jax.sharding.NamedSharding | None,
+      surface_pressure: Array | None = None,
   ) -> Array:
     """Returns geopotential difference."""
     # Must be implemented by subclasses. Depends on the vertical discretization.
@@ -827,7 +828,15 @@ class PrimitiveEquationsBase(time_integration.ImplicitExplicitODE):
     method = self.vertical_matmul_method
     if method is None:
       mesh = self.coords.spmd_mesh
-      method = 'sparse' if mesh is not None and mesh.shape['z'] > 1 else 'dense'
+      # Hybrid coordinates with variable surface pressure require sparse method.
+      force_sparse = isinstance(
+          self.coords.vertical, hybrid_coordinates.HybridCoordinates
+      )
+      method = (
+          'sparse'
+          if force_sparse or (mesh is not None and mesh.shape['z'] > 1)
+          else 'dense'
+      )
 
     q = self._get_specific_humidity(aux_state)
     physics_specs = self.physics_specs
@@ -862,10 +871,15 @@ class PrimitiveEquationsBase(time_integration.ImplicitExplicitODE):
     temperature_diff = (
         q * temperature * (physics_specs.R_vapor / physics_specs.R - 1)
     )
+    nodal_surface_pressure = jnp.exp(
+        self.coords.horizontal.to_nodal(state.log_surface_pressure)
+    )
+
     geopotential_diff = self._get_geopotential_diff(
         temperature_diff,
         method=method,
         sharding=self.coords.dycore_sharding,
+        surface_pressure=nodal_surface_pressure,
     )
 
     return -self.coords.horizontal.laplacian(
@@ -911,8 +925,11 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
       temperature_diff: Array,
       method: str,
       sharding: jax.sharding.NamedSharding | None,
+      surface_pressure: Array | None = None,
+
   ) -> Array:
     """Returns geopotential difference in sigma coordinates."""
+    del surface_pressure  # Unused in sigma coordinates.
     return get_geopotential_diff_sigma(
         temperature_diff,
         self.coords.vertical,
@@ -1601,7 +1618,7 @@ def get_geopotential_diff_hybrid(
     sharding: jax.sharding.NamedSharding | None = None,
 ) -> jax.Array:
   """Calculate the implicit geopotential term."""
-  # If p_s_ref is spatially varying, we cannot use the dense matrix method
+  # If p_surface is spatially varying, we cannot use the dense matrix method
   # because the matrix would be spatially dependent.
   is_variable_ps = np.ndim(p_surface) > 0
   if is_variable_ps and method == 'dense':
@@ -1643,6 +1660,7 @@ def get_geopotential_diff_hybrid(
 
 def get_geopotential_on_hybrid(
     temperature: typing.Array,
+    surface_pressure: typing.Array | float,
     specific_humidity: typing.Array | None = None,
     clouds: typing.Array | None = None,
     *,
@@ -1650,7 +1668,6 @@ def get_geopotential_on_hybrid(
     coordinates: hybrid_coordinates.HybridCoordinates,
     gravity_acceleration: float,
     ideal_gas_constant: float,
-    p_s_ref: float,
     water_vapor_gas_constant: float | None = None,
     sharding: jax.sharding.NamedSharding | None = None,
 ) -> jnp.ndarray:
@@ -1661,6 +1678,7 @@ def get_geopotential_on_hybrid(
 
   Args:
     temperature: nodal values of temperature.
+    surface_pressure: nodal values of surface pressure.
     specific_humidity: nodal values of specific humidity. If provided, moisture
       effects are included in geopotential calculation.
     clouds: nodal values of cloud condensate.
@@ -1668,7 +1686,6 @@ def get_geopotential_on_hybrid(
     coordinates: hybrid coordinates.
     gravity_acceleration: gravity.
     ideal_gas_constant: ideal gas constant for dry air.
-    p_s_ref: reference surface pressure.
     water_vapor_gas_constant: ideal gas constant for water vapor. Must be
       provided if `specific_humidity` is provided.
     sharding: optional sharding.
@@ -1690,7 +1707,12 @@ def get_geopotential_on_hybrid(
   else:
     virtual_temp = temperature
   geopotential_diff = get_geopotential_diff_hybrid(
-      virtual_temp, coordinates, ideal_gas_constant, p_s_ref, sharding=sharding
+      virtual_temp,
+      coordinates,
+      ideal_gas_constant,
+      surface_pressure,
+      method='sparse',
+      sharding=sharding,
   )
   return surface_geopotential + geopotential_diff
 
@@ -1978,13 +2000,14 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
       temperature_diff: Array,
       method: str,
       sharding: jax.sharding.NamedSharding | None,
+      surface_pressure: Array | None = None,
   ) -> Array:
     """Returns geopotential difference in hybrid coordinates."""
     return get_geopotential_diff_hybrid(
         temperature_diff,
         self.nondim_levels,
         self.physics_specs.R,
-        self.p_s_ref,
+        surface_pressure,
         method=method,
         sharding=sharding,
     )
@@ -2189,6 +2212,7 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
     nodal_surface_pressure = jnp.exp(
         self.coords.horizontal.to_nodal(state.log_surface_pressure)
     )
+
     vorticity_dot, divergence_dot = self.curl_and_div_tendencies(
         aux_state, nodal_surface_pressure
     )

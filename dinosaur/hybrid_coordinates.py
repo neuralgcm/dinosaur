@@ -286,6 +286,7 @@ class HybridCoordinates:
     a_boundaries = np.array(a_coeffs) * p0
     return cls(a_boundaries=a_boundaries, b_boundaries=np.array(b_coeffs))
 
+  # TODO(janniyuval) To remove after submitting cl/844884846
   @classmethod
   def analytic_levels(
       cls,
@@ -343,6 +344,7 @@ class HybridCoordinates:
     b_boundaries[-1] = 1.0
     return cls.from_coefficients(a_boundaries, b_boundaries, p0)
 
+  # TODO(janniyuval) To remove after submitting cl/844884846
   @classmethod
   def analytic_ecmwf_like(
       cls,
