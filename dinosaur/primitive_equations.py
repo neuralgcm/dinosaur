@@ -1480,8 +1480,8 @@ def _get_vertical_discretization_coeffs_numpy(
   p_k_minus_half = p_half_ref[:-1]
   p_k_plus_half = p_half_ref[1:]
   # Avoid log(0) at the model top
-  safe_p_k_minus_half = np.maximum(p_k_minus_half, 1e-6)
-  safe_p_k_plus_half = np.maximum(p_k_plus_half, 1e-6)
+  safe_p_k_minus_half = np.maximum(p_k_minus_half, 1e-6 * p_s_ref)
+  safe_p_k_plus_half = np.maximum(p_k_plus_half, 1e-6 * p_s_ref)
   log_p_interface_ratio = np.log(safe_p_k_plus_half / safe_p_k_minus_half)
   alpha_k = 1 - (p_k_minus_half / dp_ref) * log_p_interface_ratio
   return alpha_k, log_p_interface_ratio
@@ -1509,8 +1509,8 @@ def _get_vertical_discretization_coeffs(
   p_k_minus_half = lax.slice_in_dim(p_half_ref, 0, -1)
   p_k_plus_half = lax.slice_in_dim(p_half_ref, 1, None)
   # Avoid log(0) at the model top
-  safe_p_k_minus_half = jnp.maximum(p_k_minus_half, 1e-6)
-  safe_p_k_plus_half = jnp.maximum(p_k_plus_half, 1e-6)
+  safe_p_k_minus_half = jnp.maximum(p_k_minus_half, 1e-6 * p_surface)
+  safe_p_k_plus_half = jnp.maximum(p_k_plus_half, 1e-6 * p_surface)
   log_p_interface_ratio = jnp.log(safe_p_k_plus_half / safe_p_k_minus_half)
   alpha_k = 1 - (p_k_minus_half / dp_ref) * log_p_interface_ratio
   return alpha_k, log_p_interface_ratio
@@ -1835,7 +1835,7 @@ def _get_pgf_lps_coefficient(
 
   dp = coords.layer_thickness(surface_pressure)
   # Avoid division by zero for empty layers
-  dp = jnp.where(dp == 0, 1.0, dp)
+  dp = jnp.maximum(dp, 1e-6 * surface_pressure)
   vertical_weight_psg = log_p_interface_ratio * b_minus + alpha_k * db
   return (R * temperature / dp) * vertical_weight_psg * surface_pressure
 
@@ -1865,7 +1865,7 @@ def _get_pgf_lps_coefficient_numpy(
   # computed by the coordinates object for that pressure.
   p_half = coords.a_boundaries + coords.b_boundaries * surface_pressure
   dp = np.diff(p_half, axis=0)
-  dp = np.where(dp == 0, 1.0, dp)
+  dp = np.maximum(dp, 1e-6 * surface_pressure)
 
   vertical_weight_psg = log_p_interface_ratio * b_minus + alpha_k * db
   return (R * temperature / dp) * vertical_weight_psg * surface_pressure
@@ -2070,6 +2070,25 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
         self.nondim_levels,
         self.physics_specs.R,
     )
+    # The implicit solver uses a linearized PGF coefficient based on p_s_ref.
+    # We must add the residual (full - linear) for the reference temperature
+    # to the explicit tendencies to correctly capture PGF over topography.
+    pgf_coeff_ref_full = _get_pgf_lps_coefficient(
+        self.T_ref,
+        nodal_surface_pressure,
+        self.nondim_levels,
+        self.physics_specs.R,
+    )
+    pgf_coeff_ref_linear = _get_pgf_lps_coefficient_numpy(
+        self.reference_temperature,
+        self.p_s_ref,
+        self.nondim_levels,
+        self.physics_specs.R,
+    )
+    pgf_coeff_ref_linear = jnp.array(pgf_coeff_ref_linear)[
+        ..., np.newaxis, np.newaxis
+    ]
+    pgf_coeff += pgf_coeff_ref_full - pgf_coeff_ref_linear
     if self.humidity_key is not None:
       q = self._get_specific_humidity(aux_state)
       gas_const_ratio = self.physics_specs.R_vapor / self.physics_specs.R
@@ -2124,13 +2143,29 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
   ) -> Array:
     """Computes explicit temperature tendency due to adiabatic processes."""
     levels = self.nondim_levels
-    a_centers = levels.a_centers[:, np.newaxis, np.newaxis]
-    b_centers = levels.b_centers[:, np.newaxis, np.newaxis]
-    p_full = jnp.maximum(a_centers + b_centers * nodal_surface_pressure, 1e-6)
-    # First term in omega/p equation: v · ∇ln(p)
-    grad_ln_p_scaling = b_centers * nodal_surface_pressure / p_full
-    scaled_v_dot_grad_log_sp = aux_state.u_dot_grad_log_sp * grad_ln_p_scaling
+    # Consistent full-level pressure definition for energy conservation.
+    # We use the same weights as in the PGF calculation
+    # (Simmons & Burridge 1981).
+    alpha_k, log_p_ratio = _get_vertical_discretization_coeffs(
+        levels, nodal_surface_pressure
+    )
+    b_boundaries = levels.b_boundaries[:, np.newaxis, np.newaxis]
+    b_minus = b_boundaries[:-1]
+    db = jax_numpy_utils.diff(b_boundaries, axis=0)
 
+    # Vertical weight Wₖ = ln(p_upper/p_lower) * B_minus + αₖ * ΔB
+    vertical_weight_psg = log_p_ratio * b_minus + alpha_k * db
+
+    # Compute v·∇ln(p) = (v·∇ln pₛ) * (pₛ / Δp) * Wₖ
+    dp = levels.layer_thickness(nodal_surface_pressure)
+    # Avoid division by zero for empty layers
+    dp = jnp.maximum(dp, 1e-6 * nodal_surface_pressure)
+    scaled_v_dot_grad_log_sp = (
+        aux_state.u_dot_grad_log_sp
+        * nodal_surface_pressure
+        * vertical_weight_psg
+        / dp
+    )
     # `g_term` for `_t_omega_over_p_hybrid` is `∇·(vΔp) / Δp`.
     # `∇·(vΔp) = Δp(∇·v) + v·(∇Δp)`.
     # `v·(∇Δp) = v·(∇(ΔB p_s)) = (v·∇ln(p_s)) * p_s * ΔB`.
