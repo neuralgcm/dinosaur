@@ -2257,16 +2257,30 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
     # To maintain hydrostatic balance, we must include the PGF term associated
     # with the reference state T_ref.
     # The total reference PGF is: ∇Φ(T_ref) + α(T_ref)∇p.
-    geopotential_diff_ref = get_geopotential_diff_hybrid(
-        self.T_ref,
+    # We need to add the residual (full - linear) for the temperature
+    # variation T' to the explicit tendencies.
+    # The implicit solver uses a linearized geopotential based on p_s_ref.
+    # We combine T_ref and T' here for efficiency.
+    geopotential_diff_full = get_geopotential_diff_hybrid(
+        self.T_ref + aux_state.temperature_variation,
         self.nondim_levels,
         self.physics_specs.R,
         nodal_surface_pressure,
-        method='sparse',  # using the full surface pressure requires 'sparse'
+        method='sparse',
         sharding=self.coords.dycore_sharding,
     )
-    ref_geopotential_tendency = -self.coords.horizontal.laplacian(
-        self.coords.horizontal.to_modal(geopotential_diff_ref)
+    geopotential_diff_linear = get_geopotential_diff_hybrid(
+        aux_state.temperature_variation,
+        self.nondim_levels,
+        self.physics_specs.R,
+        self.p_s_ref,
+        method='dense',
+        sharding=self.coords.dycore_sharding,
+    )
+    geopotential_tendency_residual = -self.coords.horizontal.laplacian(
+        self.coords.horizontal.to_modal(
+            geopotential_diff_full - geopotential_diff_linear
+        )
     )
 
     if self.humidity_key is not None:
@@ -2313,7 +2327,7 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
         divergence_dot
         + kinetic_energy_tendency
         + orography_tendency
-        + ref_geopotential_tendency
+        + geopotential_tendency_residual
     )
     temperature_tendency = (
         to_modal_fn(dT_dt_horizontal_nodal + dT_dt_vertical + dT_dt_adiabatic)
