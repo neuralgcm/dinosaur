@@ -746,6 +746,18 @@ class PrimitiveEquationsBase(time_integration.ImplicitExplicitODE):
         adjustment -= self._get_tracer(aux_state, key)
     return adjustment
 
+  def _virtual_temperature_adjustment(self, aux_state: Any) -> Array:
+    """Computes the factor (1 + 0.61q - q_cloud) for virtual temperature."""
+    if self.humidity_key is None:
+      return jnp.asarray(1.0)
+    q = self._get_specific_humidity(aux_state)
+    gas_const_ratio = self.physics_specs.R_vapor / self.physics_specs.R
+    moisture_contribution = (gas_const_ratio - 1) * q
+    adjustment = 1 + moisture_contribution
+    # _cloud_virtual_t_adjustment returns a negative value (-cloud_water).
+    adjustment += self._cloud_virtual_t_adjustment(aux_state)
+    return adjustment
+
   @property
   def coriolis_parameter(self) -> Array:
     """Returns the value `2Ω sin(θ)` associated with Coriolis force."""
@@ -803,6 +815,49 @@ class PrimitiveEquationsBase(time_integration.ImplicitExplicitODE):
     # Must be implemented by subclasses. Depends on the vertical discretization.
     raise NotImplementedError()
 
+  def divergence_tendency_due_to_humidity(
+      self,
+      state: State,
+      aux_state: Any,
+  ) -> Array:
+    """Computes divergence tendencies from geopotential and pressure terms."""
+    raise NotImplementedError()
+
+  def vorticity_tendency_due_to_humidity(
+      self,
+      state: State,
+      aux_state: Any,
+  ) -> Array:
+    """Computes vorticity tendencies due to humidity."""
+    raise NotImplementedError()
+
+
+@dataclasses.dataclass
+class PrimitiveEquationsSigma(PrimitiveEquationsBase):
+  """Primitive Equations solved on terrain following sigma coordinates."""
+
+  vertical_advection: Callable[..., jax.Array] = dataclasses.field(
+      default=sigma_coordinates.centered_vertical_advection, kw_only=True
+  )
+
+  def _get_geopotential_diff(
+      self,
+      temperature_diff: Array,
+      method: str,
+      sharding: jax.sharding.NamedSharding | None,
+      surface_pressure: Array | None = None,
+
+  ) -> Array:
+    """Returns geopotential difference in sigma coordinates."""
+    del surface_pressure  # Unused in sigma coordinates.
+    return get_geopotential_diff_sigma(
+        temperature_diff,
+        self.coords.vertical,
+        self.physics_specs.R,
+        method=method,
+        sharding=sharding,
+    )
+
   @jax.named_call
   def divergence_tendency_due_to_humidity(
       self,
@@ -828,13 +883,9 @@ class PrimitiveEquationsBase(time_integration.ImplicitExplicitODE):
     method = self.vertical_matmul_method
     if method is None:
       mesh = self.coords.spmd_mesh
-      # Hybrid coordinates with variable surface pressure require sparse method.
-      force_sparse = isinstance(
-          self.coords.vertical, hybrid_coordinates.HybridCoordinates
-      )
       method = (
           'sparse'
-          if force_sparse or (mesh is not None and mesh.shape['z'] > 1)
+          if (mesh is not None and mesh.shape['z'] > 1)
           else 'dense'
       )
 
@@ -911,33 +962,6 @@ class PrimitiveEquationsBase(time_integration.ImplicitExplicitODE):
     )
     return self.coords.horizontal.to_modal(nodal_curl_term)
 
-
-@dataclasses.dataclass
-class PrimitiveEquationsSigma(PrimitiveEquationsBase):
-  """Primitive Equations solved on terrain following sigma coordinates."""
-
-  vertical_advection: Callable[..., jax.Array] = dataclasses.field(
-      default=sigma_coordinates.centered_vertical_advection, kw_only=True
-  )
-
-  def _get_geopotential_diff(
-      self,
-      temperature_diff: Array,
-      method: str,
-      sharding: jax.sharding.NamedSharding | None,
-      surface_pressure: Array | None = None,
-
-  ) -> Array:
-    """Returns geopotential difference in sigma coordinates."""
-    del surface_pressure  # Unused in sigma coordinates.
-    return get_geopotential_diff_sigma(
-        temperature_diff,
-        self.coords.vertical,
-        self.physics_specs.R,
-        method=method,
-        sharding=sharding,
-    )
-
   @jax.named_call
   def _t_omega_over_sigma_sp(
       self, temperature_field: Array, g_term: Array, v_dot_grad_log_sp: Array
@@ -1013,15 +1037,7 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
       sigma_dot_u = 0
       sigma_dot_v = 0
 
-    if self.humidity_key is None:
-      adjustment = 1.0
-    else:
-      q = self._get_specific_humidity(aux_state)
-      gas_const_ratio = self.physics_specs.R_vapor / self.physics_specs.R
-      moisture_contribution = (gas_const_ratio - 1) * q
-      adjustment = 1 + moisture_contribution
-      if self.cloud_keys is not None:
-        adjustment += self._cloud_virtual_t_adjustment(aux_state)
+    adjustment = self._virtual_temperature_adjustment(aux_state)
     rt = self.physics_specs.R * aux_state.temperature_variation * adjustment
 
     grad_log_ps_u, grad_log_ps_v = aux_state.cos_lat_grad_log_sp
@@ -2064,17 +2080,11 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
       sigma_dot_v = 0
 
     # Explicit part of PGF is the term associated with temperature.
-    pgf_coeff = _get_pgf_lps_coefficient(
-        aux_state.temperature_variation,
-        nodal_surface_pressure,
-        self.nondim_levels,
-        self.physics_specs.R,
-    )
     # The implicit solver uses a linearized PGF coefficient based on p_s_ref.
     # We must add the residual (full - linear) for the reference temperature
     # to the explicit tendencies to correctly capture PGF over topography.
-    pgf_coeff_ref_full = _get_pgf_lps_coefficient(
-        self.T_ref,
+    pgf_coeff = _get_pgf_lps_coefficient(
+        aux_state.temperature_variation + self.T_ref,
         nodal_surface_pressure,
         self.nondim_levels,
         self.physics_specs.R,
@@ -2088,16 +2098,11 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
     pgf_coeff_ref_linear = jnp.array(pgf_coeff_ref_linear)[
         ..., np.newaxis, np.newaxis
     ]
-    pgf_coeff += pgf_coeff_ref_full - pgf_coeff_ref_linear
-    if self.humidity_key is not None:
-      q = self._get_specific_humidity(aux_state)
-      gas_const_ratio = self.physics_specs.R_vapor / self.physics_specs.R
-      moisture_contribution = (gas_const_ratio - 1) * q
-      adjustment = 1 + moisture_contribution
-      if self.cloud_keys is not None:
-        adjustment -= self._cloud_virtual_t_adjustment(aux_state)
-      pgf_coeff = pgf_coeff * adjustment
+    pgf_coeff = pgf_coeff * self._virtual_temperature_adjustment(aux_state)
 
+    # We subtract the dry linear term because the implicit solver adds it
+    # (and does not account for moisture).
+    pgf_coeff -= pgf_coeff_ref_linear
     grad_log_ps_u, grad_log_ps_v = aux_state.cos_lat_grad_log_sp
     vertical_term_u = (sigma_dot_u + pgf_coeff * grad_log_ps_u) * sec2_lat
     vertical_term_v = (sigma_dot_v + pgf_coeff * grad_log_ps_v) * sec2_lat
@@ -2261,8 +2266,10 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
     # variation T' to the explicit tendencies.
     # The implicit solver uses a linearized geopotential based on p_s_ref.
     # We combine T_ref and T' here for efficiency.
+    temperature = self.T_ref + aux_state.temperature_variation
+    adjustment = self._virtual_temperature_adjustment(aux_state)
     geopotential_diff_full = get_geopotential_diff_hybrid(
-        self.T_ref + aux_state.temperature_variation,
+        temperature * adjustment,
         self.nondim_levels,
         self.physics_specs.R,
         nodal_surface_pressure,
@@ -2476,6 +2483,39 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
         inverted_tracers,
         sim_time=state.sim_time,
     )
+
+  @jax.named_call
+  def divergence_tendency_due_to_humidity(
+      self,
+      state: State,
+      aux_state: Any,
+  ) -> Array:
+    """Computes divergence tendencies due to humidity for Hybrid coordinates.
+
+    Returns zero because:
+    1. The PGF terms are handled in `explicit_terms` by adjusting `pgf_coeff`
+      `in curl_and_div_tendencies`.
+    2. The Geopotential terms are handled in `explicit_terms` by adjusting the
+       temperature passed to `get_geopotential_diff_hybrid`.
+    """
+    return jnp.zeros_like(state.divergence)
+
+  @jax.named_call
+  def vorticity_tendency_due_to_humidity(
+      self,
+      state: State,
+      aux_state: Any,
+  ) -> Array:
+    """Computes vorticity tendencies due to humidity.
+
+    In Hybrid, we sum T' and T_{ref} before multiplying by moisture, so the
+    interaction term is generated automatically within the main PGF calculation
+    in `curl_and_div_tendencies`.
+    In Sigma, the PGF calculation handles T' and T_{ref} separately (one
+    explicit, one implicit), so the interaction term q * T_{ref} is missed
+    and must be added back explicitly.
+    """
+    return jnp.zeros_like(state.vorticity)
 
 
 ###############################################################################
