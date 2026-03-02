@@ -354,7 +354,7 @@ def nodal_land_sea_mask_from_ds(ds: xarray.Dataset) -> typing.Array:
 
 
 def coordinate_system_from_attrs(
-    attrs: ...,
+    attrs,
 ) -> coordinate_systems.CoordinateSystem:
   """Creates a `CoordinateSystem` object based on `attrs`."""
   horizontal_coordinate_cls = GRID_REGISTRY[

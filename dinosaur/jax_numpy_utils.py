@@ -175,7 +175,7 @@ def diff(x, axis=-1):
 
 
 def _reversed_arg_order_einsum(
-    subscripts: str, x: jax.Array, y: jax.Array, **kwargs: ...
+    subscripts: str, x: jax.Array, y: jax.Array, **kwargs
 ) -> jax.Array:
   # Surprisingly, XLA can generate code with up to ~10% speed differences
   # depending on the order of einsum arguments. There is no consistent pattern
