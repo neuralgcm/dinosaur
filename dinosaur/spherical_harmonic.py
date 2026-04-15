@@ -28,7 +28,6 @@ from dinosaur import pytree_utils
 from dinosaur import typing
 import jax
 from jax import lax
-from jax.experimental import shard_map
 import jax.numpy as jnp
 import numpy as np
 
@@ -289,7 +288,7 @@ def _round_to_multiple(x: int, multiple: int) -> int:
 
 
 P = jax.sharding.PartitionSpec
-shmap = shard_map.shard_map
+shmap = jax.shard_map
 
 
 @jax.named_call
@@ -307,7 +306,7 @@ def _unstack_m(x: jax.Array, /, mesh: jax.sharding.Mesh | None) -> jax.Array:
   z = None if x.shape[0] == 1 else 'z'
   in_spec = P(z, 'x', 'y') if x.ndim == 3 else P('x', 'y')
   out_spec = P(z, None, 'x', 'y') if x.ndim == 3 else P(None, 'x', 'y')
-  return shmap(unstack, mesh, (in_spec,), out_spec)(x)
+  return shmap(unstack, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)(x)
 
 
 @jax.named_call
@@ -325,7 +324,7 @@ def _stack_m(x: jax.Array, /, mesh: jax.sharding.Mesh | None) -> jax.Array:
   z = None if x.shape[0] == 1 else 'z'
   in_spec = P(z, None, 'x', 'y') if x.ndim == 4 else P(None, 'x', 'y')
   out_spec = P(z, 'x', 'y') if x.ndim == 4 else P('x', 'y')
-  return shmap(stack, mesh, (in_spec,), out_spec)(x)
+  return shmap(stack, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)(x)
 
 
 @jax.named_call
@@ -353,7 +352,13 @@ def _fourier_derivative_for_real_basis_with_zero_imag(
   spec = P(z, 'x', 'y') if x.ndim == 3 else P('x', 'y')
   # TODO(shoyer): understand why this bogus check_rep=False is necessary to
   # avoid crashing
-  return shmap(differentiate, mesh, (spec,), spec, check_rep=False)(x)
+  return shmap(
+      differentiate,
+      mesh=mesh,
+      in_specs=(spec,),
+      out_specs=spec,
+      check_vma=False,
+  )(x)
 
 
 def _transform_einsum(

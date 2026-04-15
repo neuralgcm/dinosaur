@@ -110,7 +110,9 @@ def real_basis_with_zero_imag(wavenumbers: int, nodes: int) -> np.ndarray:
 
 
 def real_basis_derivative_with_zero_imag(
-    u: jnp.ndarray | jax.Array, axis: int = -1, frequency_offset: int = 0
+    u: jnp.ndarray | jax.Array,
+    axis: int = -1,
+    frequency_offset: int | jax.Array = 0,
 ) -> jax.Array:
   """Calculate the derivative along a real basis with zero imaginary part."""
   if u.shape[axis] % 2:
