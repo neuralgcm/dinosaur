@@ -168,7 +168,7 @@ class CoordinateSystem:
     """Transpose from physics to dycore sharding."""
     return self.with_dycore_sharding(self.with_physics_sharding(x))
 
-  def asdict(self) -> ...:
+  def asdict(self):
     horizontal_keys = set(self.horizontal.asdict().keys())
     vertical_keys = set(self.vertical.asdict().keys())
     if horizontal_keys.intersection(vertical_keys):
