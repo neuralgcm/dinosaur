@@ -138,4 +138,4 @@ def quadrature_nodes(nodes: int) -> tuple[np.ndarray, np.ndarray]:
   """
   xs = np.linspace(0, 2 * np.pi, nodes, endpoint=False)
   weights = 2 * np.pi / nodes
-  return xs, weights
+  return xs, weights  # pyrefly: ignore[bad-return]

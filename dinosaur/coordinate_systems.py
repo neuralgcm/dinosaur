@@ -75,7 +75,7 @@ def _with_sharding_constraint(
     return jax.lax.with_sharding_constraint(y, sharding_)
 
   try:
-    return pytree_utils.tree_map_over_nonscalars(f, x)
+    return pytree_utils.tree_map_over_nonscalars(f, x)  # pyrefly: ignore[bad-argument-type]
   except ValueError as e:
     shapes = jax.tree_util.tree_map(jnp.shape, x)
     raise ValueError(f'failed to shard pytree with shapes {shapes}') from e

@@ -207,13 +207,13 @@ def centered_vertical_advection(
 ) -> jnp.ndarray:
   """Compute vertical advection using 2nd order finite differences."""
   if w_boundary_values is None:
-    w_slc_shape = _slice_shape_along_axis(w, axis)
+    w_slc_shape = _slice_shape_along_axis(w, axis)  # pyrefly: ignore[bad-argument-type]
     w_boundary_values = (
         jnp.zeros(w_slc_shape, dtype=jax.dtypes.canonicalize_dtype(w.dtype)),
         jnp.zeros(w_slc_shape, dtype=jax.dtypes.canonicalize_dtype(w.dtype)),
     )
   if dx_dη_boundary_values is None:
-    x_slc_shape = _slice_shape_along_axis(x, axis)
+    x_slc_shape = _slice_shape_along_axis(x, axis)  # pyrefly: ignore[bad-argument-type]
     dx_dη_boundary_values = (
         jnp.zeros(x_slc_shape, dtype=jax.dtypes.canonicalize_dtype(x.dtype)),
         jnp.zeros(x_slc_shape, dtype=jax.dtypes.canonicalize_dtype(x.dtype)),
@@ -495,7 +495,7 @@ class HybridCoordinates:
     a_new = np.interp(x_new, x_old, base.a_boundaries)
     b_new = np.interp(x_new, x_old, base.b_boundaries)
 
-    return cls(a_boundaries=a_new, b_boundaries=b_new)
+    return cls(a_boundaries=a_new, b_boundaries=b_new)  # pyrefly: ignore[bad-argument-type]
 
   @classmethod
   def ECMWF137(cls) -> HybridCoordinates:  # pylint: disable=invalid-name

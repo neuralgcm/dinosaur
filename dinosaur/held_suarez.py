@@ -52,15 +52,15 @@ class HeldSuarezForcingSigma(time_integration.ExplicitODE):
       coords: coordinate_systems.CoordinateSystem,
       physics_specs: units.SimUnitsProtocol,
       reference_temperature: typing.Array,
-      p0: Quantity = 1e5 * scales.units.pascal,
+      p0: Quantity = 1e5 * scales.units.pascal,  # pyrefly: ignore[unsupported-operation]
       sigma_b: Quantity = 0.7,
-      kf: Quantity = 1 / (1 * scales.units.day),
-      ka: Quantity = 1 / (40 * scales.units.day),
-      ks: Quantity = 1 / (4 * scales.units.day),
-      minT: Quantity = 200 * scales.units.degK,
-      maxT: Quantity = 315 * scales.units.degK,
-      dTy: Quantity = 60 * scales.units.degK,
-      dThz: Quantity = 10 * scales.units.degK,
+      kf: Quantity = 1 / (1 * scales.units.day),  # pyrefly: ignore[unsupported-operation]
+      ka: Quantity = 1 / (40 * scales.units.day),  # pyrefly: ignore[unsupported-operation]
+      ks: Quantity = 1 / (4 * scales.units.day),  # pyrefly: ignore[unsupported-operation]
+      minT: Quantity = 200 * scales.units.degK,  # pyrefly: ignore[unsupported-operation]
+      maxT: Quantity = 315 * scales.units.degK,  # pyrefly: ignore[unsupported-operation]
+      dTy: Quantity = 60 * scales.units.degK,  # pyrefly: ignore[unsupported-operation]
+      dThz: Quantity = 10 * scales.units.degK,  # pyrefly: ignore[unsupported-operation]
   ):
     """Initialize HeldSuarezForcingSigma.
 
@@ -160,10 +160,10 @@ class HeldSuarezForcingSigma(time_integration.ExplicitODE):
     log_surface_pressure_tendency = jnp.zeros_like(state.log_surface_pressure)
 
     return primitive_equations.State(
-        vorticity=vorticity_tendency,
-        divergence=divergence_tendency,
-        temperature_variation=temperature_tendency,
-        log_surface_pressure=log_surface_pressure_tendency,
+        vorticity=vorticity_tendency,  # pyrefly: ignore[unexpected-keyword]
+        divergence=divergence_tendency,  # pyrefly: ignore[unexpected-keyword]
+        temperature_variation=temperature_tendency,  # pyrefly: ignore[unexpected-keyword]
+        log_surface_pressure=log_surface_pressure_tendency,  # pyrefly: ignore[unexpected-keyword]
     )
 
 
@@ -175,15 +175,15 @@ class HeldSuarezForcingHybrid(time_integration.ExplicitODE):
       coords: coordinate_systems.CoordinateSystem,
       physics_specs: units.SimUnitsProtocol,
       reference_temperature: typing.Array,
-      p0: Quantity = 1e5 * scales.units.pascal,
+      p0: Quantity = 1e5 * scales.units.pascal,  # pyrefly: ignore[unsupported-operation]
       sigma_b: float = 0.7,
-      kf: Quantity = 1 / (1 * scales.units.day),
-      ka: Quantity = 1 / (40 * scales.units.day),
-      ks: Quantity = 1 / (4 * scales.units.day),
-      minT: Quantity = 200 * scales.units.degK,
-      maxT: Quantity = 315 * scales.units.degK,
-      dTy: Quantity = 60 * scales.units.degK,
-      dThz: Quantity = 10 * scales.units.degK,
+      kf: Quantity = 1 / (1 * scales.units.day),  # pyrefly: ignore[unsupported-operation]
+      ka: Quantity = 1 / (40 * scales.units.day),  # pyrefly: ignore[unsupported-operation]
+      ks: Quantity = 1 / (4 * scales.units.day),  # pyrefly: ignore[unsupported-operation]
+      minT: Quantity = 200 * scales.units.degK,  # pyrefly: ignore[unsupported-operation]
+      maxT: Quantity = 315 * scales.units.degK,  # pyrefly: ignore[unsupported-operation]
+      dTy: Quantity = 60 * scales.units.degK,  # pyrefly: ignore[unsupported-operation]
+      dThz: Quantity = 10 * scales.units.degK,  # pyrefly: ignore[unsupported-operation]
       hpa_quantity: Quantity = scales.units.hPa,
   ):
     """Initializes HybridHeldSuarezForcingHybrid."""
@@ -208,7 +208,7 @@ class HeldSuarezForcingHybrid(time_integration.ExplicitODE):
         levels.a_boundaries * hpa_quantity
     )
     nondim_levels = hybrid_coordinates.HybridCoordinates(
-        nondim_a_boundaries, levels.b_boundaries
+        nondim_a_boundaries, levels.b_boundaries  # pyrefly: ignore[bad-argument-type]
     )
     self.nondim_coords = dataclasses.replace(coords, vertical=nondim_levels)
 
@@ -282,10 +282,10 @@ class HeldSuarezForcingHybrid(time_integration.ExplicitODE):
     log_surface_pressure_tendency = jnp.zeros_like(state.log_surface_pressure)
 
     return primitive_equations.State(
-        vorticity=vorticity_tendency,
-        divergence=divergence_tendency,
-        temperature_variation=temperature_tendency,
-        log_surface_pressure=log_surface_pressure_tendency,
+        vorticity=vorticity_tendency,  # pyrefly: ignore[unexpected-keyword]
+        divergence=divergence_tendency,  # pyrefly: ignore[unexpected-keyword]
+        temperature_variation=temperature_tendency,  # pyrefly: ignore[unexpected-keyword]
+        log_surface_pressure=log_surface_pressure_tendency,  # pyrefly: ignore[unexpected-keyword]
     )
 
 

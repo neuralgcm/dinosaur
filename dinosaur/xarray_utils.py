@@ -378,7 +378,7 @@ def coordinate_system_from_attrs(
     vertical = vertical_coordinate_cls(**vertical_attrs)
   else:
     vertical = None  # no vertical coordinate has been specified.
-  return coordinate_systems.CoordinateSystem(horizontal, vertical)
+  return coordinate_systems.CoordinateSystem(horizontal, vertical)  # pyrefly: ignore[bad-argument-type]
 
 
 def data_to_xarray(
@@ -431,7 +431,7 @@ def data_to_xarray(
   ):
     additional_coords[XR_SURFACE_NAME] = np.ones(1)
   all_coords, shape_to_dims = _infer_dims_shape_and_coords(
-      coords, times, sample_ids, additional_coords
+      coords, times, sample_ids, additional_coords  # pyrefly: ignore[bad-argument-type]
   )
 
   dims_in_state = set()  # keep track which coordinates should be included.
@@ -472,8 +472,8 @@ def data_to_xarray(
         raise ValueError(f'Key {key} is not allowed in `attrs`.')
     dataset_attrs.update(attrs)
   # only include coordinates for dimensions that are present in the dataset.
-  coords = {k: v for k, v in all_coords.items() if k in dims_in_state}
-  return xarray.Dataset(data_vars, coords, attrs=dataset_attrs)
+  coords = {k: v for k, v in all_coords.items() if k in dims_in_state}  # pyrefly: ignore[bad-assignment]
+  return xarray.Dataset(data_vars, coords, attrs=dataset_attrs)  # pyrefly: ignore[bad-argument-type]
 
 
 def dynamic_covariate_data_to_xarray(
@@ -502,7 +502,7 @@ def dynamic_covariate_data_to_xarray(
     additional_coords = {}
 
   all_coords, shape_to_dims = _infer_dims_shape_and_coords(
-      coords, times, sample_ids, additional_coords
+      coords, times, sample_ids, additional_coords  # pyrefly: ignore[bad-argument-type]
   )
 
   dims_in_state = set()  # keep track which coordinates should be included.
@@ -570,10 +570,10 @@ def xarray_to_shallow_water_eq_data(
     Dictionary that contains atmosphere state variables in a format compatible
     with `shallow_water.State`.
   """
-  return shallow_water.State(
-      vorticity=getattr(dataset['vorticity'], values),
-      divergence=getattr(dataset['divergence'], values),
-      potential=getattr(dataset['potential'], values),
+  return shallow_water.State(  # pyrefly: ignore[missing-attribute]
+      vorticity=getattr(dataset['vorticity'], values),  # pyrefly: ignore[unexpected-keyword]
+      divergence=getattr(dataset['divergence'], values),  # pyrefly: ignore[unexpected-keyword]
+      potential=getattr(dataset['potential'], values),  # pyrefly: ignore[unexpected-keyword]
   ).asdict()
 
 
@@ -596,12 +596,12 @@ def xarray_to_primitive_eq_data(
     Dictionary that contains atmosphere state variables in a format compatible
     with `primitive_equations.State`.
   """
-  return primitive_equations.State(
-      vorticity=getattr(dataset['vorticity'], values),
-      divergence=getattr(dataset['divergence'], values),
-      temperature_variation=getattr(dataset['temperature_variation'], values),
-      log_surface_pressure=getattr(dataset['log_surface_pressure'], values),
-      tracers={k: getattr(dataset[k], values) for k in tracers_to_include},
+  return primitive_equations.State(  # pyrefly: ignore[missing-attribute]
+      vorticity=getattr(dataset['vorticity'], values),  # pyrefly: ignore[unexpected-keyword]
+      divergence=getattr(dataset['divergence'], values),  # pyrefly: ignore[unexpected-keyword]
+      temperature_variation=getattr(dataset['temperature_variation'], values),  # pyrefly: ignore[unexpected-keyword]
+      log_surface_pressure=getattr(dataset['log_surface_pressure'], values),  # pyrefly: ignore[unexpected-keyword]
+      tracers={k: getattr(dataset[k], values) for k in tracers_to_include},  # pyrefly: ignore[unexpected-keyword]
   ).asdict()
 
 
@@ -624,13 +624,13 @@ def xarray_to_primitive_equations_with_time_data(
     Dictionary that contains atmosphere state variables in a format compatible
     with `primitive_equations.State`.
   """
-  return primitive_equations.State(
-      vorticity=getattr(dataset['vorticity'], values),
-      divergence=getattr(dataset['divergence'], values),
-      temperature_variation=getattr(dataset['temperature_variation'], values),
-      log_surface_pressure=getattr(dataset['log_surface_pressure'], values),
-      sim_time=getattr(dataset['sim_time'], values),
-      tracers={k: getattr(dataset[k], values) for k in tracers_to_include},
+  return primitive_equations.State(  # pyrefly: ignore[missing-attribute]
+      vorticity=getattr(dataset['vorticity'], values),  # pyrefly: ignore[unexpected-keyword]
+      divergence=getattr(dataset['divergence'], values),  # pyrefly: ignore[unexpected-keyword]
+      temperature_variation=getattr(dataset['temperature_variation'], values),  # pyrefly: ignore[unexpected-keyword]
+      log_surface_pressure=getattr(dataset['log_surface_pressure'], values),  # pyrefly: ignore[unexpected-keyword]
+      sim_time=getattr(dataset['sim_time'], values),  # pyrefly: ignore[unexpected-keyword]
+      tracers={k: getattr(dataset[k], values) for k in tracers_to_include},  # pyrefly: ignore[unexpected-keyword]
   ).asdict()
 
 
@@ -665,14 +665,14 @@ def xarray_to_weatherbench_data(
       )
       for k in diagnostics_to_include
   }
-  return weatherbench_utils.State(
-      u=getattr(dataset['u'], values),
-      v=getattr(dataset['v'], values),
-      t=getattr(dataset['t'], values),
-      z=getattr(dataset['z'], values),
-      sim_time=getattr(dataset['sim_time'], values),
-      tracers={k: getattr(dataset[k], values) for k in tracers_to_include},
-      diagnostics=diagnostics,
+  return weatherbench_utils.State(  # pyrefly: ignore[missing-attribute]
+      u=getattr(dataset['u'], values),  # pyrefly: ignore[unexpected-keyword]
+      v=getattr(dataset['v'], values),  # pyrefly: ignore[unexpected-keyword]
+      t=getattr(dataset['t'], values),  # pyrefly: ignore[unexpected-keyword]
+      z=getattr(dataset['z'], values),  # pyrefly: ignore[unexpected-keyword]
+      sim_time=getattr(dataset['sim_time'], values),  # pyrefly: ignore[unexpected-keyword]
+      tracers={k: getattr(dataset[k], values) for k in tracers_to_include},  # pyrefly: ignore[unexpected-keyword]
+      diagnostics=diagnostics,  # pyrefly: ignore[unexpected-keyword]
   ).asdict()
 
 
@@ -919,7 +919,7 @@ def datetime64_to_nondim_time(
 ) -> np.ndarray:
   """Converts `time` in datetime64 format to nondimensional sim_time."""
   return physics_specs.nondimensionalize(
-      ((time - reference_datetime) / np.timedelta64(1, 'h')) * scales.units.hour
+      ((time - reference_datetime) / np.timedelta64(1, 'h')) * scales.units.hour  # pyrefly: ignore[unsupported-operation]
   )
 
 
@@ -963,7 +963,7 @@ def nondim_time_delta_from_time_axis(
   time_delta = time[1] - time[0]
   if not np.issubdtype(time.dtype, np.floating):
     time_delta = np.timedelta64(time_delta, 's') / np.timedelta64(1, 's')
-    return physics_specs.nondimensionalize(time_delta * scales.units.second)
+    return physics_specs.nondimensionalize(time_delta * scales.units.second)  # pyrefly: ignore[unsupported-operation]
   return float(time_delta)
 
 
@@ -1040,7 +1040,7 @@ def coordinate_system_from_dataset_shape(
     lon, lat = ds.longitude, ds.latitude
   else:
     raise ValueError('Dataset must provide lon/lat or longitude/latitude axes.')
-  grid_cls = shape_to_grid_dict[lon.shape + lat.shape]
+  grid_cls = shape_to_grid_dict[lon.shape + lat.shape]  # pyrefly: ignore[bad-index]
   horizontal = grid_cls(
       latitude_spacing=infer_latitude_spacing(lat),
       radius=1.0,  # Note: only valid for NeuralGCM v1 models
@@ -1177,7 +1177,7 @@ def fill_nan_with_nearest(data: DatasetOrDataArray) -> DatasetOrDataArray:
     raise ValueError(f'did not find latitude and longitude dimensions: {data}')
 
   if isinstance(data, xarray.DataArray):
-    return fill_nan_for_array(data)
+    return fill_nan_for_array(data)  # pyrefly: ignore[bad-return]
   elif isinstance(data, xarray.Dataset):
     return data.map(fill_nan_for_array)
   else:

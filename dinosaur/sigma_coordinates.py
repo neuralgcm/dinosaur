@@ -138,7 +138,7 @@ class SigmaCoordinates:
       unpadded_bounds = np.linalg.solve(bounds_to_centers, centers)
       return np.pad(unpadded_bounds, [(1, 0)])
 
-    boundaries = _with_f64_math(centers_to_boundaries)(centers)
+    boundaries = _with_f64_math(centers_to_boundaries)(centers)  # pyrefly: ignore[bad-argument-type]
     return cls(boundaries)
 
   def asdict(self):
@@ -377,13 +377,13 @@ def centered_vertical_advection(
     Values of `-(w * ∂x/∂𝜎)[n]` at level centers.
   """
   if w_boundary_values is None:
-    w_slc_shape = _slice_shape_along_axis(w, axis)
+    w_slc_shape = _slice_shape_along_axis(w, axis)  # pyrefly: ignore[bad-argument-type]
     w_boundary_values = (
         jnp.zeros(w_slc_shape, dtype=jax.dtypes.canonicalize_dtype(w.dtype)),
         jnp.zeros(w_slc_shape, dtype=jax.dtypes.canonicalize_dtype(w.dtype)),
     )
   if dx_dsigma_boundary_values is None:
-    x_slc_shape = _slice_shape_along_axis(x, axis)
+    x_slc_shape = _slice_shape_along_axis(x, axis)  # pyrefly: ignore[bad-argument-type]
     dx_dsigma_boundary_values = (
         jnp.zeros(x_slc_shape, dtype=jax.dtypes.canonicalize_dtype(x.dtype)),
         jnp.zeros(x_slc_shape, dtype=jax.dtypes.canonicalize_dtype(x.dtype)),
@@ -413,13 +413,13 @@ def upwind_vertical_advection(
     axis: int = -3,
 ) -> jnp.ndarray:
   """Compute vertical advection using 1st order upwinding."""
-  w_slc_shape = _slice_shape_along_axis(w, axis)
+  w_slc_shape = _slice_shape_along_axis(w, axis)  # pyrefly: ignore[bad-argument-type]
   w_boundary_values = (
       jnp.zeros(w_slc_shape, dtype=jax.dtypes.canonicalize_dtype(w.dtype)),
       jnp.zeros(w_slc_shape, dtype=jax.dtypes.canonicalize_dtype(w.dtype)),
   )
 
-  x_slc_shape = _slice_shape_along_axis(x, axis)
+  x_slc_shape = _slice_shape_along_axis(x, axis)  # pyrefly: ignore[bad-argument-type]
   dx_dsigma_boundary_values = (
       jnp.zeros(x_slc_shape, dtype=jax.dtypes.canonicalize_dtype(x.dtype)),
       jnp.zeros(x_slc_shape, dtype=jax.dtypes.canonicalize_dtype(x.dtype)),

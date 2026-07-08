@@ -280,7 +280,7 @@ class RealSphericalHarmonics(SphericalHarmonics):
     return pfwx
 
   def longitudinal_derivative(self, x: Array) -> Array:
-    return fourier.real_basis_derivative(x, axis=-2)
+    return fourier.real_basis_derivative(x, axis=-2)  # pyrefly: ignore[bad-argument-type]
 
 
 def _round_to_multiple(x: int, multiple: int) -> int:
@@ -471,7 +471,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
     base = self.base_shape_multiple or 1
     x_shards, y_shards = self._mesh_shape()
     shape_multiples = (base * x_shards, base * y_shards)
-    return tuple(map(_round_to_multiple, self.nodal_limits, shape_multiples))
+    return tuple(map(_round_to_multiple, self.nodal_limits, shape_multiples))  # pyrefly: ignore[bad-return]
 
   @functools.cached_property
   def modal_shape(self) -> tuple[int, int]:
@@ -479,15 +479,15 @@ class FastSphericalHarmonics(SphericalHarmonics):
     x_shards, y_shards = self._mesh_shape()
     # twice the padding for x to handle positive and negative m when unstacked
     shape_multiples = (2 * base * x_shards, base * y_shards)
-    return tuple(map(_round_to_multiple, self.modal_limits, shape_multiples))
+    return tuple(map(_round_to_multiple, self.modal_limits, shape_multiples))  # pyrefly: ignore[bad-return]
 
   @functools.cached_property
   def nodal_padding(self) -> tuple[int, int]:
-    return tuple(x - y for x, y in zip(self.nodal_shape, self.nodal_limits))
+    return tuple(x - y for x, y in zip(self.nodal_shape, self.nodal_limits))  # pyrefly: ignore[bad-return]
 
   @functools.cached_property
   def modal_padding(self) -> tuple[int, int]:
-    return tuple(x - y for x, y in zip(self.modal_shape, self.modal_limits))
+    return tuple(x - y for x, y in zip(self.modal_shape, self.modal_limits))  # pyrefly: ignore[bad-return]
 
   @functools.cached_property
   def nodal_axes(self) -> tuple[np.ndarray, np.ndarray]:
@@ -1000,7 +1000,7 @@ class Grid:
   @functools.cached_property
   def cos_lat(self) -> jnp.ndarray:
     _, sin_lat = self.nodal_axes
-    return np.sqrt(1 - sin_lat**2)
+    return np.sqrt(1 - sin_lat**2)  # pyrefly: ignore[bad-return]
 
   @functools.cached_property
   def sec2_lat(self) -> jnp.ndarray:
@@ -1010,7 +1010,7 @@ class Grid:
   @functools.cached_property
   def laplacian_eigenvalues(self) -> np.ndarray:
     _, l = self.modal_axes
-    return -l * (l + 1) / (self.radius**2)
+    return -l * (l + 1) / (self.radius**2)  # pyrefly: ignore[unsupported-operation]
 
   # pylint:enable=g-missing-from-attributes
 
@@ -1020,7 +1020,7 @@ class Grid:
     f = _with_vertical_padding(
         self.spherical_harmonics.inverse_transform, self.spmd_mesh
     )
-    return pytree_utils.tree_map_over_nonscalars(f, x)
+    return pytree_utils.tree_map_over_nonscalars(f, x)  # pyrefly: ignore[bad-argument-type]
 
   @jax.named_call
   def to_modal(self, z: typing.Pytree) -> typing.Pytree:
@@ -1028,7 +1028,7 @@ class Grid:
     f = _with_vertical_padding(
         self.spherical_harmonics.transform, self.spmd_mesh
     )
-    return pytree_utils.tree_map_over_nonscalars(f, z)
+    return pytree_utils.tree_map_over_nonscalars(f, z)  # pyrefly: ignore[bad-argument-type]
 
   @jax.named_call
   def laplacian(self, x: Array) -> jnp.ndarray:
@@ -1043,7 +1043,7 @@ class Grid:
     inverse_eigenvalues[0] = 0
     inverse_eigenvalues[self.total_wavenumbers :] = 0
     assert not np.isnan(inverse_eigenvalues).any()
-    return x * inverse_eigenvalues
+    return x * inverse_eigenvalues  # pyrefly: ignore[bad-return]
 
   @jax.named_call
   def clip_wavenumbers(self, x: typing.Pytree, n: int = 1) -> typing.Pytree:
@@ -1073,8 +1073,8 @@ class Grid:
   def d_dlon(self, x: Array) -> Array:
     """Computes `∂x/∂λ` where λ denotes longitude."""
     return _with_vertical_padding(
-        self.spherical_harmonics.longitudinal_derivative, self.spmd_mesh
-    )(x)
+        self.spherical_harmonics.longitudinal_derivative, self.spmd_mesh  # pyrefly: ignore[bad-argument-type]
+    )(x)  # pyrefly: ignore[bad-argument-type]
 
   @jax.named_call
   def cos_lat_d_dlat(self, x: Array) -> Array:
@@ -1147,7 +1147,7 @@ class Grid:
   @jax.named_call
   def integrate(self, z: Array) -> Array:
     """Approximates the integral of nodal values `z` over the sphere."""
-    w = self.spherical_harmonics.basis.w * self.radius**2
+    w = self.spherical_harmonics.basis.w * self.radius**2  # pyrefly: ignore[unsupported-operation]
     return einsum('y,...xy->...', w, z)
 
 

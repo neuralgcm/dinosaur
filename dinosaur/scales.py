@@ -35,35 +35,35 @@ Numeric = Array | float | int
 #
 
 # The radius of the earth.
-RADIUS = 6.37122e6 * units.m
+RADIUS = 6.37122e6 * units.m  # pyrefly: ignore[unsupported-operation]
 
 # The rotation rate if the Earth in radians per second, often denoted Ω.
-ANGULAR_VELOCITY = OMEGA = 7.292e-5 / units.s
+ANGULAR_VELOCITY = OMEGA = 7.292e-5 / units.s  # pyrefly: ignore[unsupported-operation]
 
 # Acceleration due to gravity on Earth.
-GRAVITY_ACCELERATION = 9.80616 * units.m / units.s**2
+GRAVITY_ACCELERATION = 9.80616 * units.m / units.s**2  # pyrefly: ignore[unsupported-operation]
 
 # Specific heat capacity at constant pressure.
-ISOBARIC_HEAT_CAPACITY = 1004 * units.J / units.kilogram / units.degK
+ISOBARIC_HEAT_CAPACITY = 1004 * units.J / units.kilogram / units.degK  # pyrefly: ignore[unsupported-operation]
 
 # Specific heat capacity of water vapor at constant pressure.
 # value taken for T=275 from:
 # https://www.engineeringtoolbox.com/water-vapor-d_979.html
-WATER_VAPOR_CP = 1859 * units.J / units.kilogram / units.degK
+WATER_VAPOR_CP = 1859 * units.J / units.kilogram / units.degK  # pyrefly: ignore[unsupported-operation]
 
 # The mass of the dry atmosphere.
-MASS_OF_DRY_ATMOSPHERE = 5.18e18 * units.kg
+MASS_OF_DRY_ATMOSPHERE = 5.18e18 * units.kg  # pyrefly: ignore[unsupported-operation]
 
 # The ratio of the ideal gas constant to the isobaric specific heat capacity of
 # a diatomic ideal gas, often denoted κ. This value corresponds to a heat
 # capacity ratio ɣ = 7 / 5. Note that this quantity is dimensionless, and this
 # "unit" is included for consistency with other constants.
-KAPPA = 2 / 7 * units.dimensionless
+KAPPA = 2 / 7 * units.dimensionless  # pyrefly: ignore[unsupported-operation]
 
 # The Latent Heat of Vaporization for water assuming T = 273.15 K
 # Used to calculate enthalpy and MSE budgets as well as other moisture values
 # https://glossary.ametsoc.org/wiki/Latent_heat
-LATENT_HEAT_OF_VAPORIZATION = 2.501e6 * units.J / units.kilogram
+LATENT_HEAT_OF_VAPORIZATION = 2.501e6 * units.J / units.kilogram  # pyrefly: ignore[unsupported-operation]
 
 # Ideas gas constant for dry air (di-atomic). For `KAPPA == 1004` this value is
 # approximately 287.07.
@@ -71,10 +71,10 @@ IDEAL_GAS_CONSTANT = ISOBARIC_HEAT_CAPACITY * KAPPA
 
 # Ideal gas constant for air with water vapor included
 # Generally approximated to 461.
-IDEAL_GAS_CONSTANT_H20 = 461.0 * units.J / units.kilogram / units.degK
+IDEAL_GAS_CONSTANT_H20 = 461.0 * units.J / units.kilogram / units.degK  # pyrefly: ignore[unsupported-operation]
 
 # Density of liquid water.
-WATER_DENSITY = 997 * units.kg / units.m**3
+WATER_DENSITY = 997 * units.kg / units.m**3  # pyrefly: ignore[unsupported-operation]
 
 
 #
@@ -206,22 +206,22 @@ class Scale(abc.Mapping):
 NEURALGCM_V1_SCALE = Scale(
     RADIUS,  # length
     1 / 2 / OMEGA,  # time
-    1 * units.kilogram,  # mass
-    1 * units.degK,  # temperature
+    1 * units.kilogram,  # mass  # pyrefly: ignore[unsupported-operation]
+    1 * units.degK,  # temperature  # pyrefly: ignore[unsupported-operation]
 )
 
 ATMOSPHERIC_SCALE = Scale(
     RADIUS,  # length
     1 / 2 / OMEGA,  # time
     MASS_OF_DRY_ATMOSPHERE,  # mass
-    1 * units.degK,  # temperature
+    1 * units.degK,  # temperature  # pyrefly: ignore[unsupported-operation]
 )
 
 SI_SCALE = Scale(
-    1 * units.m,  # length
-    1 * units.s,  # time
-    1 * units.kilogram,  # mass
-    1 * units.degK,  # temperature
+    1 * units.m,  # length  # pyrefly: ignore[unsupported-operation]
+    1 * units.s,  # time  # pyrefly: ignore[unsupported-operation]
+    1 * units.kilogram,  # mass  # pyrefly: ignore[unsupported-operation]
+    1 * units.degK,  # temperature  # pyrefly: ignore[unsupported-operation]
 )
 
 # TODO(shoyer): consider switching to SI_SCALE

@@ -230,7 +230,7 @@ def interp_pressure_to_sigma(
     return len(shape) >= 3 and shape[-3] == pressure_coords.centers.shape[0]
 
   return pytree_utils.tree_map_where(
-      condition_fn=cond_fn,
+      condition_fn=cond_fn,  # pyrefly: ignore[bad-argument-type]
       f=regrid,
       g=lambda x: x,
       x=fields,
@@ -289,7 +289,7 @@ def _interp_centers_to_centers(
     return x.ndim > 2
 
   return pytree_utils.tree_map_where(
-      condition_fn=cond_fn,
+      condition_fn=cond_fn,  # pyrefly: ignore[bad-argument-type]
       f=regrid,
       g=lambda x: x,
       x=fields,

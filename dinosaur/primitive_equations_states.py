@@ -37,9 +37,9 @@ QuantityOrStr = Quantity | str
 def isothermal_rest_atmosphere(
     coords: coordinate_systems.CoordinateSystem,
     physics_specs: units.SimUnitsProtocol,
-    tref: Quantity = 288.0 * scales.units.degK,
-    p0: Quantity = 1e5 * scales.units.pascal,
-    p1: Quantity = 0.0 * scales.units.pascal,
+    tref: Quantity = 288.0 * scales.units.degK,  # pyrefly: ignore[unsupported-operation]
+    p0: Quantity = 1e5 * scales.units.pascal,  # pyrefly: ignore[unsupported-operation]
+    p1: Quantity = 0.0 * scales.units.pascal,  # pyrefly: ignore[unsupported-operation]
     surface_height: Quantity | None = None,
     meter_quantity: Quantity = scales.units.meter,
 ) -> tuple[Callable[..., primitive_equations.State], typing.AuxFeatures]:
@@ -145,10 +145,10 @@ def isothermal_rest_atmosphere(
     modal_vorticity = coords.horizontal.to_modal(nodal_vorticity)
     nodal_surface_pressure = _get_surface_pressure(lon, lat, rng_key)
     return primitive_equations.State(
-        vorticity=modal_vorticity,
-        divergence=jnp.zeros_like(modal_vorticity),
-        temperature_variation=jnp.zeros_like(modal_vorticity),
-        log_surface_pressure=(
+        vorticity=modal_vorticity,  # pyrefly: ignore[unexpected-keyword]
+        divergence=jnp.zeros_like(modal_vorticity),  # pyrefly: ignore[unexpected-keyword]
+        temperature_variation=jnp.zeros_like(modal_vorticity),  # pyrefly: ignore[unexpected-keyword]
+        log_surface_pressure=(  # pyrefly: ignore[unexpected-keyword]
             coords.horizontal.to_modal(jnp.log(nodal_surface_pressure))
         ),
     )
@@ -164,9 +164,9 @@ def isothermal_rest_atmosphere_with_orography_path(
     coords: coordinate_systems.CoordinateSystem,
     physics_specs: units.SimUnitsProtocol,
     path_to_orography_data: str,
-    tref: Quantity = 288.0 * scales.units.degK,
-    p0: Quantity = 1e5 * scales.units.pascal,
-    p1: Quantity = 0.0 * scales.units.pascal,
+    tref: Quantity = 288.0 * scales.units.degK,  # pyrefly: ignore[unsupported-operation]
+    p0: Quantity = 1e5 * scales.units.pascal,  # pyrefly: ignore[unsupported-operation]
+    p1: Quantity = 0.0 * scales.units.pascal,  # pyrefly: ignore[unsupported-operation]
     meter_quantity: Quantity = scales.units.meter,
 ) -> tuple[Callable[..., primitive_equations.State], typing.AuxFeatures]:
   """Wrapper around `isothermal_rest_atmosphere` that loads orography data."""
@@ -196,11 +196,11 @@ def isothermal_rest_atmosphere_with_orography_path(
 def steady_state_jw(
     coords: coordinate_systems.CoordinateSystem,
     physics_specs: units.SimUnitsProtocol,
-    u0: Quantity = 35.0 * scales.units.m / scales.units.s,
-    p0: Quantity = 1e5 * scales.units.pascal,
-    t0: Quantity = 288.0 * scales.units.degK,
-    delta_t: Quantity = 4.8e5 * scales.units.degK,
-    gamma: Quantity = 0.005 * scales.units.degK / scales.units.m,
+    u0: Quantity = 35.0 * scales.units.m / scales.units.s,  # pyrefly: ignore[unsupported-operation]
+    p0: Quantity = 1e5 * scales.units.pascal,  # pyrefly: ignore[unsupported-operation]
+    t0: Quantity = 288.0 * scales.units.degK,  # pyrefly: ignore[unsupported-operation]
+    delta_t: Quantity = 4.8e5 * scales.units.degK,  # pyrefly: ignore[unsupported-operation]
+    gamma: Quantity = 0.005 * scales.units.degK / scales.units.m,  # pyrefly: ignore[unsupported-operation]
     eta_tropo: float = 0.2,
     eta0: float = 0.252,
     hpa_quantity: Quantity = scales.units.hPa,
@@ -342,10 +342,10 @@ def steady_state_jw(
   levels = coords.vertical
   if isinstance(levels, hybrid_coordinates.HybridCoordinates):
     nondim_levels = hybrid_coordinates.HybridCoordinates(
-        physics_specs.nondimensionalize(levels.a_boundaries * hpa_quantity),
+        physics_specs.nondimensionalize(levels.a_boundaries * hpa_quantity),  # pyrefly: ignore[bad-argument-type]
         levels.b_boundaries,
     )
-    etas = nondim_levels.get_eta(p0)
+    etas = nondim_levels.get_eta(p0)  # pyrefly: ignore[bad-argument-type]
   elif isinstance(levels, sigma_coordinates.SigmaCoordinates):
     etas = levels.centers
   else:
@@ -363,12 +363,12 @@ def steady_state_jw(
     )
     log_nodal_surface_pressure = np.log(_get_surface_pressure(lat, lon))
     state = primitive_equations.State(
-        vorticity=modal_vorticity,
-        divergence=np.zeros_like(modal_vorticity),
-        temperature_variation=coords.horizontal.to_modal(
+        vorticity=modal_vorticity,  # pyrefly: ignore[unexpected-keyword]
+        divergence=np.zeros_like(modal_vorticity),  # pyrefly: ignore[unexpected-keyword]
+        temperature_variation=coords.horizontal.to_modal(  # pyrefly: ignore[unexpected-keyword]
             nodal_temperature_variation
         ),
-        log_surface_pressure=coords.horizontal.to_modal(
+        log_surface_pressure=coords.horizontal.to_modal(  # pyrefly: ignore[unexpected-keyword]
             log_nodal_surface_pressure
         ),
     )
@@ -390,7 +390,7 @@ def steady_state_jw(
 def baroclinic_perturbation_jw(
     coords: coordinate_systems.CoordinateSystem,
     physics_specs: units.SimUnitsProtocol,
-    u_perturb: Quantity = 1.0 * scales.units.m / scales.units.s,
+    u_perturb: Quantity = 1.0 * scales.units.m / scales.units.s,  # pyrefly: ignore[unsupported-operation]
     lon_location: Quantity = np.pi / 9,
     lat_location: Quantity = 2 * np.pi / 9,
     perturbation_radius: Quantity = 0.1,
@@ -475,7 +475,7 @@ def baroclinic_perturbation_jw(
   if isinstance(levels, hybrid_coordinates.HybridCoordinates):
     # perturbation is independent of levels, so we use a fixed ref pressure.
     nondim_levels = hybrid_coordinates.HybridCoordinates(
-        physics_specs.nondimensionalize(levels.a_boundaries * hpa_quantity),
+        physics_specs.nondimensionalize(levels.a_boundaries * hpa_quantity),  # pyrefly: ignore[bad-argument-type]
         levels.b_boundaries,
     )
     etas = nondim_levels.get_eta(1000.0)
@@ -493,10 +493,10 @@ def baroclinic_perturbation_jw(
   modal_vorticity = coords.horizontal.to_modal(nodal_vorticity)
   modal_divergence = coords.horizontal.to_modal(nodal_divergence)
   state = primitive_equations.State(
-      vorticity=modal_vorticity,
-      divergence=modal_divergence,
-      temperature_variation=np.zeros_like(modal_vorticity),
-      log_surface_pressure=np.zeros_like(modal_vorticity[:1, ...]),
+      vorticity=modal_vorticity,  # pyrefly: ignore[unexpected-keyword]
+      divergence=modal_divergence,  # pyrefly: ignore[unexpected-keyword]
+      temperature_variation=np.zeros_like(modal_vorticity),  # pyrefly: ignore[unexpected-keyword]
+      log_surface_pressure=np.zeros_like(modal_vorticity[:1, ...]),  # pyrefly: ignore[unexpected-keyword]
   )
   return state
 

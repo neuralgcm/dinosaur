@@ -198,14 +198,14 @@ class ShallowWaterEquations(time_integration.ImplicitExplicitODE):
     explicit_potential = self.coords.horizontal.clip_wavenumbers(
         -self.coords.horizontal.div_cos_lat(g)
     )
-    return State(explicit_vorticity, explicit_divergence, explicit_potential)
+    return State(explicit_vorticity, explicit_divergence, explicit_potential)  # pyrefly: ignore[bad-argument-count]
 
   def implicit_terms(self, state: State) -> State:
     """Returns the implicit terms of the shallow water equations."""
     return State(
-        vorticity=jnp.zeros_like(state.vorticity),
-        divergence=-self.coords.horizontal.laplacian(state.potential),
-        potential=-self.ref_potential * state.divergence,
+        vorticity=jnp.zeros_like(state.vorticity),  # pyrefly: ignore[unexpected-keyword]
+        divergence=-self.coords.horizontal.laplacian(state.potential),  # pyrefly: ignore[unexpected-keyword]
+        potential=-self.ref_potential * state.divergence,  # pyrefly: ignore[unexpected-keyword]
     )
 
   def implicit_inverse(self, state: State, step_size: float) -> State:
@@ -217,13 +217,13 @@ class ShallowWaterEquations(time_integration.ImplicitExplicitODE):
         * self.coords.horizontal.laplacian_eigenvalues
     )
     return State(
-        vorticity=state.vorticity,
-        divergence=inverse_schur_complement
+        vorticity=state.vorticity,  # pyrefly: ignore[unexpected-keyword]
+        divergence=inverse_schur_complement  # pyrefly: ignore[unexpected-keyword]
         * (
             state.divergence
             - step_size * self.coords.horizontal.laplacian(state.potential)
         ),
-        potential=inverse_schur_complement
+        potential=inverse_schur_complement  # pyrefly: ignore[unexpected-keyword]
         * (
             -step_size * self.ref_potential * state.divergence + state.potential
         ),
@@ -260,7 +260,7 @@ def shallow_water_leapfrog_step(
     next state.
   """
   shallow_water_ode = ShallowWaterEquations(
-      coords, physics_specs, orography, mean_potential, densities=densities
+      coords, physics_specs, orography, mean_potential, densities=densities  # pyrefly: ignore[bad-argument-type]
   )
   return time_integration.semi_implicit_leapfrog(shallow_water_ode, dt, alpha)
 

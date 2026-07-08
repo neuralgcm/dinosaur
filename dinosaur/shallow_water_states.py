@@ -80,9 +80,9 @@ def one_layer(
       grid.sec_lat_d_dlat_cos2(grid.to_modal(sec_lat_u * total_vorticity)))
   potential = potential_plus_energy - grid.to_modal(u**2 / 2)
   potential = potential.at[0, 0].set(0)
-  return shallow_water.State(vorticity=vorticity,
-                             divergence=jnp.zeros_like(vorticity),
-                             potential=potential)
+  return shallow_water.State(vorticity=vorticity,  # pyrefly: ignore[unexpected-keyword]
+                             divergence=jnp.zeros_like(vorticity),  # pyrefly: ignore[unexpected-keyword]
+                             potential=potential)  # pyrefly: ignore[unexpected-keyword]
 
 
 def multi_layer(
@@ -116,7 +116,7 @@ def multi_layer(
     flat_potential = jnp.reshape(s.potential, (n_layers, -1))
     potential = jnp.reshape(jnp.linalg.solve(density_ratios, flat_potential),
                             s.potential.shape)
-  return shallow_water.State(s.vorticity, s.divergence, potential)
+  return shallow_water.State(s.vorticity, s.divergence, potential)  # pyrefly: ignore[bad-argument-count]
 
 
 class BarotropicInstabilityParameters(NamedTuple):
@@ -233,9 +233,9 @@ def barotropic_instability_tc(
     bump_potential = coords.horizontal.to_modal(
         get_height(*coords.horizontal.nodal_mesh, parameters) * physics_specs.g)
     initial_state = shallow_water.State(
-        vorticity=steady.vorticity,
-        potential=(steady.potential + bump_potential),
-        divergence=steady.divergence)
+        vorticity=steady.vorticity,  # pyrefly: ignore[unexpected-keyword]
+        potential=(steady.potential + bump_potential),  # pyrefly: ignore[unexpected-keyword]
+        divergence=steady.divergence)  # pyrefly: ignore[unexpected-keyword]
     return initial_state
 
   top_potential = physics_specs.nondimensionalize(

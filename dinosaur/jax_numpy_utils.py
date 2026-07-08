@@ -111,7 +111,7 @@ def cumsum(
 ) -> jax.Array:
   """Optimized version of cumsum for short axes on TPUs."""
   if method == 'dot':
-    return _dot_cumsum(x, axis, sharding=sharding)
+    return _dot_cumsum(x, axis, sharding=sharding)  # pyrefly: ignore[bad-argument-type]
   elif method == 'jax':
     return jnp.cumsum(x, axis)
   else:
@@ -126,7 +126,7 @@ def reverse_cumsum(
 ) -> jax.Array:
   """Performs cumsum in reverse order along `axis`."""
   if method == 'dot':
-    return _dot_cumsum(x, axis, reverse=True, sharding=sharding)
+    return _dot_cumsum(x, axis, reverse=True, sharding=sharding)  # pyrefly: ignore[bad-argument-type]
   elif method == 'jax':
     return jnp.flip(jnp.cumsum(jnp.flip(x, axis), axis), axis)
   else:

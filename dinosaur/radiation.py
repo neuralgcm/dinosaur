@@ -46,9 +46,9 @@ MINUTES_PER_DAY = 1440
 SECONDS_PER_DAY = 86400
 # TSI: Energy input to the top of the Earth's atmosphere
 # https://www.ncei.noaa.gov/products/climate-data-records/total-solar-irradiance
-TOTAL_SOLAR_IRRADIANCE = 1361 * units.W / units.meter**2
+TOTAL_SOLAR_IRRADIANCE = 1361 * units.W / units.meter**2  # pyrefly: ignore[unsupported-operation]
 # Seasonal variation in apparent solar irradiance due to Earth-Sun distance
-SOLAR_IRRADIANCE_VARIATION = 47 * units.W / units.meter**2  # .5 * 6.9% * TSI
+SOLAR_IRRADIANCE_VARIATION = 47 * units.W / units.meter**2  # .5 * 6.9% * TSI  # pyrefly: ignore[unsupported-operation]
 # Approximate perihelion, when Earth is closest to the sun (Jan 3rd)
 PERIHELION = 3 * 2 * jnp.pi / DAYS_PER_YEAR  # radians
 # Approximate equinox (March 20 on non-leap year), when dihedral is zero
@@ -93,8 +93,8 @@ def datetime_to_orbital_time(when: datetime.datetime) -> OrbitalTime:
   fraction_of_day = (60 * when.hour + when.minute) / MINUTES_PER_DAY
   fraction_of_year = (full_days + fraction_of_day) / days_this_year
   return OrbitalTime(
-      orbital_phase=2 * jnp.pi * fraction_of_year,
-      synodic_phase=2 * jnp.pi * fraction_of_day,
+      orbital_phase=2 * jnp.pi * fraction_of_year,  # pyrefly: ignore[unexpected-keyword]
+      synodic_phase=2 * jnp.pi * fraction_of_day,  # pyrefly: ignore[unexpected-keyword]
   )
 
 
@@ -147,7 +147,7 @@ def get_direct_solar_irradiance(
       orbit. Default is 0.5 * 6.9% of TSI. Units should match mean_irradiance.
     perihelion: orbital phase in radians where the Earth is closest to the Sun.
   """
-  return mean_irradiance + variation * jnp.cos(orbital_phase - perihelion)
+  return mean_irradiance + variation * jnp.cos(orbital_phase - perihelion)  # pyrefly: ignore[bad-return]
 
 
 def get_declination(orbital_phase: Numeric) -> jnp.ndarray:
@@ -171,7 +171,7 @@ def get_hour_angle(
   """Angular displacement of the sun east or west of the local meridian."""
   # https://en.wikipedia.org/wiki/Hour_angle
   solar_time = synodic_phase + equation_of_time(orbital_phase) + longitude
-  return solar_time - jnp.pi
+  return solar_time - jnp.pi  # pyrefly: ignore[bad-return]
 
 
 def get_solar_sin_altitude(
@@ -257,7 +257,7 @@ class SolarRadiation:
     self.lat = np.arcsin(sin_lat)
     self.orbital_rate = jax.tree_util.tree_map(
         physics_specs.nondimensionalize,
-        OrbitalTime(2 * jnp.pi / units.year, 2 * jnp.pi / units.day),
+        OrbitalTime(2 * jnp.pi / units.year, 2 * jnp.pi / units.day),  # pyrefly: ignore[bad-argument-count, unsupported-operation]
     )
 
     self.total_solar_irradiance = physics_specs.nondimensionalize(
