@@ -19,11 +19,14 @@ ringing and negative concentrations.
    sigma coordinates that is **compatible with Dinosaur's implicit-explicit
    (IMEX) solver structure** (`explicit_terms` / `implicit_terms` /
    `implicit_inverse`), reusing the existing implicit solve unchanged.
-2. A **one-step (Runge-Kutta-style) time discretization** in the spirit of
-   Dinosaur's preferred `imex_rk_sil3` / `crank_nicolson_rk2` solvers — *not* a
-   two-time-level extrapolating scheme (SETTLS) or three-time-level leapfrog
-   like those used operationally at ECMWF, which require multistep memory and
-   have documented extrapolation instabilities.
+2. A **one-step (Runge-Kutta-style) time discretization** as the primary
+   scheme, in the spirit of Dinosaur's preferred `imex_rk_sil3` /
+   `crank_nicolson_rk2` solvers: self-starting, no multistep memory, and none
+   of the documented extrapolation instabilities of two-time-level SETTLS or
+   three-time-level leapfrog schemes. A SETTLS stepper is planned as an
+   opt-in *option* (§3.6) — halving per-step cost, matching operational IFS
+   practice, and mirroring how Dinosaur already ships
+   `semi_implicit_leapfrog` alongside the RK solvers.
 3. Straightforward, correct interpolation on the **existing full Gaussian
    grids**: gather-based linear and cubic-Lagrange interpolation with proper
    longitude periodicity and cross-pole halos.
@@ -127,7 +130,14 @@ ECMWF's own "iterative centred implicit" (ICI) scheme (Diamantakis 2014,
 §3.1) replaces extrapolation with iteration: compute a predictor `X⁽⁰⁾ ≈
 X^{n+1}`, then redo the SLSI step using time-*interpolation*
 `N^{n+1/2} ≈ ½(N⁽⁰⁾ + N^n)`. One iteration suffices to eliminate the noise;
-ECMWF avoids it operationally only because it doubles cost. **ICI with one
+ECMWF avoids it operationally only because it doubles the per-step cost of
+the dynamics *relative to SETTLS*, whose one-evaluation-per-step ledger is
+bought with multistep memory (stored `N^{t−Δt}`, `V^{t−Δt}`) — a discount
+Dinosaur's one-step solvers already forgo by design: `imex_rk_sil3` makes 3
+explicit-tendency evaluations per step and `crank_nicolson_rk2` makes 2, in
+exchange for self-starting steps and clean `scan`/autodiff semantics.
+Measured against Dinosaur's own RK baseline, ICI-style stepping therefore
+adds no doubling (see the cost bullet in §3.3). **ICI with one
 iteration is precisely a two-stage, one-step IMEX Runge-Kutta method** — no
 multistep memory, self-starting, and it slots naturally into Dinosaur's RK
 infrastructure. This is the recommended scheme.
@@ -182,7 +192,8 @@ Properties:
   accuracy.
 - Cost per step: 2 evaluations of `N`, 2 departure-point solves, 2 transport
   applications, 2 implicit solves. Roughly 2× an Eulerian
-  `crank_nicolson_rk2` step; the payoff is the 3-6× larger `Δt`.
+  `crank_nicolson_rk2` step; the payoff is the 3-6× larger `Δt`. (The SETTLS
+  option of §3.6 halves this per-step cost at the price of multistep memory.)
 
 An optional **off-centering (decentering) parameter** ε shifts the implicit
 weights to `(½+ε)Δt` at arrival and `(½−ε)Δt` at departure — the standard
@@ -245,6 +256,54 @@ version) consume this interface, so shallow water and the primitive equations
 share the same time-integration code, mirroring how `ImplicitExplicitODE` is
 shared today. `sim_time` passes through transport untouched and keeps its
 existing convention (`N` contributes rate 1.0).
+
+### 3.6 Optional: a SETTLS two-time-level stepper
+
+One-step is a preference, not a hard constraint: Dinosaur already ships a
+three-time-level `semi_implicit_leapfrog` whose step state is a
+`(previous, current)` tuple with matching filters (`leapfrog_utils.py`). A
+SETTLS stepper is the analogous two-time-level *option* for the SL scheme,
+worth having for two reasons: it is the operationally proven configuration
+(IFS since 1998), and it halves per-step cost relative to §3.3 — one `N`
+evaluation, one departure-point solve, one transport pass, one implicit
+solve — by reusing the previous step's tendencies instead of recomputing
+them with a predictor.
+
+Formulation (Hortal 2002; Diamantakis 2014, Eqs. 10-12): carry `(N^{n−1},
+V^{n−1})` and replace the RK predictor with the stable two-term extrapolation
+averaged along the trajectory,
+
+$$
+X^{n+1} = G_{\rm inv}\Big(\,T_D\big[X^n + \tfrac{\Delta t}{2}\big(L X^n
+  + 2N^n - N^{n-1}\big)\big] + \tfrac{\Delta t}{2}\,N^n,\ \tfrac{\Delta t}{2}\Big),
+$$
+
+with departure points iterated using the same extrapolation for the winds:
+`r_d ← r − (Δt/2)(V^n(r) + [2V^n − V^{n−1}](r_d))`.
+
+Design notes, mirroring the leapfrog pattern:
+
+- **Step state:** a tuple `(X^n, aux)` with `aux = (N^{n−1} modal, nodal
+  (u, v, σ̇)^{n−1})`. Tendencies are carried, not recomputed — that is where
+  the saving comes from. It is just a larger `scan` carry; checkpointing and
+  `trajectory_from_step` compose unchanged, as they do for leapfrog.
+- **Bootstrap:** take the first step with
+  `semi_lagrangian_crank_nicolson_rk2` (self-starting) and record
+  `(N^0, V^0)` — no accuracy-degraded startup step. Filter wrappers
+  analogous to `leapfrog_step_filter` adapt the modal filters to the tuple
+  state.
+- **Trade-offs to document:** the residual extrapolation instability that
+  SETTLS manages but does not eliminate (stratospheric noise; the SETTLS
+  trajectory limiter of Diamantakis 2014 §3.3 is the known remedy, deferred);
+  no digital-filter initialization (`TimeReversedImExODE` assumes a plain
+  state); and for training, one bootstrap step per rollout window plus `aux`
+  in every checkpoint.
+
+Because it consumes the same §3.5 interface — transport, departure points,
+`N`, `L`, `G_inv` shared verbatim — this is a small stepper wrapper plus
+filter adapters, scheduled after the RK scheme lands (M5c in §10) and folded
+into the Δt-extension study (§9.8) as a three-way comparison: Eulerian RK vs
+SL-RK2 vs SL-SETTLS on per-step cost, max stable Δt, and noise.
 
 ## 4. Semi-Lagrangian form of the primitive equations (sigma coordinates)
 
@@ -496,7 +555,9 @@ conventions) → add arrival-side terms → `implicit_inverse`.
 8. **The point of it all:** time-step extension experiments — max stable Δt
    for SL vs Eulerian cores at T42/T85/T170 with matched filters (target ≥3×;
    ECMWF experience suggests up to 6×), and wall-clock cost per simulated day
-   on CPU/GPU (TPU numbers recorded but explicitly not optimized).
+   on CPU/GPU (TPU numbers recorded but explicitly not optimized). With M5c:
+   a three-way Eulerian vs SL-RK2 vs SL-SETTLS comparison (per-step cost, max
+   stable Δt, stratospheric noise).
 9. Tracer-in-dynamics test: `gaussian_scalar` tracer in Held-Suarez flow;
    positivity with/without limiter; mass-conservation drift tracked
    (`grid.integrate`), with the optional global proportional fixer evaluated.
@@ -526,6 +587,8 @@ conventions) → add arrival-side terms → `implicit_inverse`.
 - **M5 — Moist terms + tracers + validation.** Moisture in `N`, per-tracer
   limiter, Held-Suarez climate, Δt-extension study, gradient tests, notebook
   + docs. **M5b:** opt-in nodal tracer storage for the sharp-tracer use case.
+- **M5c (optional) — SETTLS stepper** (§3.6): tuple-state stepper + filter
+  wrappers + RK2 bootstrap; extends the Δt study to the three-way comparison.
 - **M6 — Cleanups/follow-ups** spun out per §11.
 
 Each milestone lands as a separate PR with tests; nothing touches the default
@@ -556,7 +619,8 @@ Eulerian path.
 - **Cost accounting:** 2 transforms + 2 transports per step must beat the
   Eulerian step at ≥3× Δt. On CPU/GPU this is very likely; on TPU the gathers
   will be slow until the deferred efficiency work — measured and reported,
-  not optimized, in this phase.
+  not optimized, in this phase. If the two-pass RK structure ever binds,
+  SETTLS (§3.6) halves it.
 - **Interaction with modal filters:** filters currently target the tail
   spectrum produced by pseudo-spectral products; SL changes the noise
   spectrum. Filter settings may need retuning for large Δt (tracked in the
