@@ -378,16 +378,23 @@ Notes:
   `≈ (fΔt)⁴/8` per step: ~6·10⁻⁴/step at Δt = 30 min (`fΔt ≈ 0.26` at the
   poles; e-folding ≈ 35 simulated days — fine for short tests, marginal for
   climate runs) and disqualifying at the targeted 3-6× extension
-  (`fΔt ≈ 0.8-1.6` → 5-59% growth per step). Making Coriolis implicit is
-  rejected — it couples ζ and δ per wavenumber and would forfeit the
-  unchanged `implicit_inverse`. The large-Δt configuration is therefore
-  **advected planetary momentum** (IFS's LADVF option; Temperton et al.
-  2001): transport `v + 2Ω×r`, with the analytic `2Ω×r` field added at the
-  departure point and subtracted at the arrival point so only `v` is ever
-  interpolated. Since `D(v + 2Ω×r)/Dt` has no Coriolis term, `f` drops out
-  of `N` entirely, and the §6 rotation/projection machinery applies
-  unchanged. Explicit-`f` mode is retained for small-Δt consistency testing
-  (§9.6), where its growth is negligible over test horizons.
+  (`fΔt ≈ 0.8-1.6` → 5-59% growth per step). Three Coriolis modes, selected
+  by an equation-level option (`coriolis_mode`): **explicit** `f` in `N`
+  (small-Δt consistency testing, §9.6, where the growth is negligible over
+  test horizons); **advected planetary momentum** — the default large-Δt
+  configuration (IFS's LADVF option; Temperton et al. 2001): transport
+  `v + 2Ω×r`, with the analytic `2Ω×r` field added at the departure point
+  and subtracted at the arrival point so only `v` is ever interpolated —
+  since `D(v + 2Ω×r)/Dt` has no Coriolis term, `f` drops out of `N`
+  entirely, the §6 rotation/projection machinery applies unchanged, and the
+  implicit solve is untouched; and **implicit** Coriolis (IFS's LIMPF
+  option; Temperton 1997), a designed follow-up sketched in §11. Note the
+  implicit mode is a *scheme* change, not a solver-algorithm change: unlike
+  `implicit_inverse_method` (same operator, same results, different
+  algorithm), it moves Coriolis from `N` into `L`, so `implicit_terms` and
+  `implicit_inverse` must change together and results differ — which is why
+  it is an equation-level mode (precedent: `humidity_key` also changes the
+  equations) rather than a new `implicit_inverse_method` value.
 - **Continuity is exact with 2-D trajectories.** Since `ln pₛ` is independent
   of σ, `∫₀¹ v·∇ln pₛ dσ = v̄·∇ln pₛ` with `v̄ = ∫₀¹ v dσ`, so
   `D̄(ln pₛ)/D̄t = −∫₀¹ δ dσ` *exactly*, where `D̄/D̄t` follows the
@@ -644,9 +651,9 @@ conventions) → add arrival-side terms → `implicit_inverse`.
   (stage-consistent transport required, per §3.4).
 - **M3b (optional) — Shallow-water SL** for a cheap end-to-end shakeout (§9.5).
 - **M4 — `SemiLagrangianPrimitiveEquations` (dry, sigma).** Momentum/thermo/
-  continuity transport per §4 with both Coriolis modes (explicit `f`, and
-  advected planetary momentum for large Δt), JW steady-state +
-  baroclinic-wave consistency (§9.6).
+  continuity transport per §4 with the explicit-`f` and
+  advected-planetary-momentum Coriolis modes (the implicit mode stays a §12
+  follow-up), JW steady-state + baroclinic-wave consistency (§9.6).
 - **M5 — Moist terms + tracers + validation.** Moisture in `N`, per-tracer
   limiter, Held-Suarez climate, Δt-extension study, gradient tests, notebook
   + docs. **M5b:** opt-in nodal tracer storage for the sharp-tracer use case.
@@ -684,9 +691,34 @@ Eulerian path.
   Held-Suarez runs is checked, not assumed) and 5-59% per step at the 3-6×
   extension. Mitigation per §4: advected planetary momentum (`v + 2Ω×r`,
   IFS LADVF; Temperton et al. 2001) is the large-Δt configuration, with
-  explicit `f` only for small-Δt phases; implicit Coriolis is rejected
-  because it couples ζ and δ and forfeits the unchanged `implicit_inverse`.
-  The Δt study tracks an inertial-mode growth diagnostic (§9.8).
+  explicit `f` only for small-Δt phases. Off-centering the `N` trapezoid
+  cannot substitute: even the maximally decentered corrector is stable only
+  to `|fΔt| ≤ 1`, short of the polar 6× regime — so the two real remedies
+  are planetary momentum and implicit `f`. The Δt study tracks an
+  inertial-mode growth diagnostic (§9.8).
+- **Implicit Coriolis (`coriolis_mode='implicit'`, follow-up option):** the
+  LIMPF-style alternative (Temperton 1997) keeps the transported quantity a
+  plain wind and instead puts `−f k×v` into `L`. Structure: `f = 2Ωμ`, and
+  both μ-multiplication and the `(1−μ²)∂_μ` operators couple total
+  wavenumbers `l±1` within each zonal wavenumber `m`, with the same
+  ε-recurrence weights dinosaur already implements (`cos_lat_d_dlat`,
+  `sec_lat_d_dlat_cos2`) — so *adding* `L_f` to `implicit_terms` is easy,
+  and ζ simply joins the implicit state. The work is the inverse: it is no
+  longer one small matrix per `l` but, per `m`, a block-tridiagonal solve
+  in `l` coupling (ζ, δ) — with (T′, lnpₛ) eliminated per-`l` by Schur
+  complement against the existing small inverses — i.e. order
+  `3·(2K)²·L²/2` precomputed floats (~0.1 GB f32 at T85/L24, ~0.7 GB at
+  T170/L32), forfeiting the m-independence that makes the current solve
+  cheap. Two requirements if built: the reference implementation must be a
+  *direct* (exact) banded solve — an under-converged iterative inverse
+  would change the effective scheme, not just the algorithm — and
+  `implicit_inverse(x, η) ≡ (1 − η·implicit_terms)⁻¹x` must hold exactly
+  for the extended operator, since the steppers assume it. Two attractions:
+  with Coriolis in `L`, the SL bracket automatically centers the old-time
+  Coriolis along the trajectory (the `½Δt·L X^n` term rides from the
+  departure point) — precisely the LIMPF treatment — and it equally
+  stabilizes the SETTLS option, which has the same explicit-`f` exposure.
+  Deferred to §12 unless planetary momentum disappoints in the Δt study.
 - **Cost accounting:** 2 transforms + 2 transports per step must beat the
   Eulerian step at ≥3× Δt. On CPU/GPU this is very likely; on TPU the gathers
   will be slow until the deferred efficiency work — measured and reported,
@@ -704,7 +736,9 @@ For completeness, the follow-on path once this version is correct: quasi-cubic
 (TPU-friendly, per the einsum formulation sketched in issue #55); reduced
 Gaussian / octahedral / HEALPix-like grids so polar stencils become static;
 TL-truncation grids; conservative/monotone upgrades (SLICE-3D, CSLAM);
-hybrid-coordinate support; stage-consistent high-order SL-RK.
+hybrid-coordinate support; stage-consistent high-order SL-RK; the
+implicit-Coriolis `coriolis_mode` (LIMPF-style per-`m` block-tridiagonal
+implicit solve; §11).
 
 ## 13. References
 
@@ -759,6 +793,9 @@ hybrid-coordinate support; stage-consistent high-order SL-RK.
   semi-Lagrangian approximations for fluids. *J. Atmos. Sci.*, 49, 2082-2096.
 - Staniforth, A. & Côté, J. (1991). Semi-Lagrangian integration schemes for
   atmospheric models — a review. *Mon. Wea. Rev.*, 119, 2206-2223.
+- Temperton, C. (1997). Treatment of the Coriolis terms in semi-Lagrangian
+  spectral models. *Atmos.-Ocean*, 35(sup1), 293-302.
+  doi:10.1080/07055900.1997.9687353
 - Temperton, C., Hortal, M. & Simmons, A. (2001). A two-time-level
   semi-Lagrangian global spectral model. *Q. J. R. Meteorol. Soc.*, 127,
   111-127.
