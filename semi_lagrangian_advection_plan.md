@@ -93,7 +93,9 @@ this plan generalizes that idea to full 3-D transport inside the IMEX loop.
 
 Split the primitive equations, written along fluid trajectories, as
 
-$$\frac{DX}{Dt} = N(X) + L(X), \qquad \frac{d\mathbf r}{dt} = \mathbf V(X),$$
+$$
+\frac{DX}{Dt} = N(X) + L(X), \qquad \frac{d\mathbf r}{dt} = \mathbf V(X),
+$$
 
 where `L` is exactly Dinosaur's existing linear implicit operator, `N` is the
 remaining **non-advective** explicit forcing (§4 gives the term-by-term
@@ -107,9 +109,11 @@ evaluated at the arrival point need no interpolation. The classic trapezoidal
 semi-implicit SL (SLSI) discretization (Diamantakis 2014, Eq. 9; Temperton,
 Hortal & Simmons 2001) is
 
-$$X^{n+1} = T_D\big[X^n + \tfrac{\Delta t}{2}(N^n + L X^n)\big]
-          + \tfrac{\Delta t}{2}\,N^{n+1/2\,{\rm(extrap)}}
-          + \tfrac{\Delta t}{2} L X^{n+1},$$
+$$
+X^{n+1} = T_D\big[X^n + \tfrac{\Delta t}{2}(N^n + L X^n)\big]
+  + \tfrac{\Delta t}{2}\,N^{n+1/2\,{\rm(extrap)}}
+  + \tfrac{\Delta t}{2} L X^{n+1},
+$$
 
 which is second order and unconditionally stable for advection — but ECMWF
 obtains `N^{n+1/2}` and the trajectory winds by **time extrapolation** from
@@ -147,16 +151,20 @@ One step from `X^n`:
 Departure points `D₁` from the midpoint iteration (§5) using winds
 `V^n` (no time extrapolation; first-order-in-time trajectories):
 
-$$X^* = G_{\rm inv}\Big(\,T_{D_1}\big[X^n + \tfrac{\Delta t}{2} L X^n
-        + \Delta t\, N(X^n)\big],\ \tfrac{\Delta t}{2}\Big).$$
+$$
+X^* = G_{\rm inv}\Big(\,T_{D_1}\big[X^n + \tfrac{\Delta t}{2} L X^n
+  + \Delta t\, N(X^n)\big],\ \tfrac{\Delta t}{2}\Big).
+$$
 
 **Stage 2 (corrector).**
 Recompute departure points `D₂` with time-centered winds
 `V^{n+1/2} = ½(V^n + V^*)` (both fields known; interpolated at the trajectory
 midpoint, or averaged along the trajectory à la Temperton et al. 2001), then
 
-$$X^{n+1} = G_{\rm inv}\Big(\,T_{D_2}\big[X^n + \tfrac{\Delta t}{2}(L X^n
-          + N(X^n))\big] + \tfrac{\Delta t}{2} N(X^*),\ \tfrac{\Delta t}{2}\Big).$$
+$$
+X^{n+1} = G_{\rm inv}\Big(\,T_{D_2}\big[X^n + \tfrac{\Delta t}{2}(L X^n
+  + N(X^n))\big] + \tfrac{\Delta t}{2} N(X^*),\ \tfrac{\Delta t}{2}\Big).
+$$
 
 Properties:
 
