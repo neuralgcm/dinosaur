@@ -740,7 +740,30 @@ hybrid-coordinate support; stage-consistent high-order SL-RK; the
 implicit-Coriolis `coriolis_mode` (LIMPF-style per-`m` block-tridiagonal
 implicit solve; §11).
 
-## 13. References
+## 13. Implementation updates
+
+Issues encountered while implementing this plan, by milestone.
+
+**M0 — RHS split refactor.**
+
+- The reconstruction identity `explicit_terms ≈ explicit_advective_terms +
+  explicit_nonadvective_terms` holds only up to float32 re-association error,
+  not bit-exactly: splitting `(ζ + f)` products and applying `to_modal` /
+  `clip_wavenumbers` to each part separately re-associates linear operations.
+  Observed max absolute error ~5e-8 on T21 (nondimensional units, tendencies
+  O(0.1)); the regression test uses `rtol=1e-4, atol=1e-6`. `explicit_terms`
+  itself is bit-for-bit unchanged: the new `include_*` flags on
+  `curl_and_div_tendencies` and `nodal_temperature_vertical_tendency`
+  preserve the original expression trees when left at their defaults.
+- `nodal_velocities` returns σ̇ at all `layers + 1` boundaries (zeros appended
+  at σ = 0, 1) rather than only interior boundaries, since the trajectory
+  solver needs the full interpolation range.
+- Pre-existing test failures (not caused by this work): the two sharding
+  subtests of `primitive_equations_integration_test.py::IntegrationTest::
+  test_distributed_simulation_consistency` fail on a single-device CPU host,
+  verified identical at the base commit.
+
+## 14. References
 
 - Bermejo, R. & Staniforth, A. (1992). The conversion of semi-Lagrangian
   advection schemes to quasi-monotone schemes. *Mon. Wea. Rev.*, 120,

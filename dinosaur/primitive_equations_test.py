@@ -703,6 +703,137 @@ class PrimitiveEquationsSigmaImplicitTest(parameterized.TestCase):
     )
 
 
+class ExplicitTermsSplitTest(parameterized.TestCase):
+  """Tests the advective/non-advective split of explicit tendencies."""
+
+  def _make_equation_and_state(self, humidity, variable_t_ref):
+    physics_specs = units.SimUnits.from_si()
+    horizontal = spherical_harmonic.Grid.T21()
+    vertical = sigma_coordinates.SigmaCoordinates.equidistant(4)
+    coords = coordinate_systems.CoordinateSystem(horizontal, vertical)
+    initial_state_fn, aux_features = primitive_equations_states.steady_state_jw(
+        coords, physics_specs
+    )
+    modal_orography = primitive_equations.truncated_modal_orography(
+        aux_features[xarray_utils.OROGRAPHY], coords
+    )
+    state = initial_state_fn()
+    state = state + primitive_equations_states.baroclinic_perturbation_jw(
+        coords, physics_specs
+    )
+    state.tracers = {
+        'tracer': primitive_equations_states.gaussian_scalar(
+            coords, physics_specs
+        )
+    }
+    if humidity:
+      state.tracers['specific_humidity'] = (
+          primitive_equations_states.gaussian_scalar(
+              coords, physics_specs, amplitude=0.01
+          )
+      )
+    if variable_t_ref:
+      ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
+    else:
+      ref_temps = 288.0 * np.ones(coords.vertical.layers)
+    primitive = primitive_equations.PrimitiveEquationsSigma(
+        ref_temps,
+        modal_orography,
+        coords,
+        physics_specs,
+        humidity_key='specific_humidity' if humidity else None,
+    )
+    return primitive, state
+
+  @parameterized.parameters(
+      dict(humidity=False, variable_t_ref=False),
+      dict(humidity=False, variable_t_ref=True),
+      dict(humidity=True, variable_t_ref=True),
+  )
+  def test_explicit_terms_split_reconstruction(self, humidity, variable_t_ref):
+    """Advective + non-advective terms must reconstruct explicit_terms."""
+    primitive, state = self._make_equation_and_state(humidity, variable_t_ref)
+    full = primitive.explicit_terms(state)
+    advective = primitive.explicit_advective_terms(state)
+    nonadvective = primitive.explicit_nonadvective_terms(state)
+    reconstructed = jax.tree.map(lambda x, y: x + y, advective, nonadvective)
+    # The only differences are floating point rounding from re-associated
+    # linear operations.
+    tol = dict(rtol=1e-4, atol=1e-6)
+    assert_states_close(full, reconstructed, **tol)
+    self.assertEqual(full.sim_time, reconstructed.sim_time)
+
+  def test_nonadvective_terms_have_no_transport(self):
+    """Tracers and log surface pressure have zero non-advective tendencies."""
+    primitive, state = self._make_equation_and_state(
+        humidity=False, variable_t_ref=True
+    )
+    nonadvective = primitive.explicit_nonadvective_terms(state)
+    np.testing.assert_array_equal(
+        nonadvective.log_surface_pressure,
+        np.zeros_like(state.log_surface_pressure),
+    )
+    for name, tracer in nonadvective.tracers.items():
+      np.testing.assert_array_equal(
+          tracer, np.zeros_like(state.tracers[name]), err_msg=name
+      )
+
+  def test_nodal_velocities(self):
+    """Checks shapes and consistency of nodal velocities."""
+    primitive, state = self._make_equation_and_state(
+        humidity=False, variable_t_ref=True
+    )
+    coords = primitive.coords
+    velocities = primitive.nodal_velocities(state)
+    layers = coords.vertical.layers
+    self.assertEqual(velocities.u.shape, coords.nodal_shape)
+    self.assertEqual(velocities.v.shape, coords.nodal_shape)
+    self.assertEqual(
+        velocities.sigma_dot.shape,
+        (layers + 1,) + coords.horizontal.nodal_shape,
+    )
+    self.assertEqual(velocities.u_mean.shape, coords.surface_nodal_shape)
+    self.assertEqual(velocities.v_mean.shape, coords.surface_nodal_shape)
+    # winds match the standard modal-to-nodal conversion.
+    u_expected, v_expected = spherical_harmonic.vor_div_to_uv_nodal(
+        coords.horizontal, state.vorticity, state.divergence, clip=False
+    )
+    np.testing.assert_allclose(velocities.u, u_expected, atol=1e-6)
+    np.testing.assert_allclose(velocities.v, v_expected, atol=1e-6)
+    # sigma_dot vanishes at the top and bottom boundaries.
+    np.testing.assert_array_equal(
+        velocities.sigma_dot[0], np.zeros_like(velocities.sigma_dot[0])
+    )
+    np.testing.assert_array_equal(
+        velocities.sigma_dot[-1], np.zeros_like(velocities.sigma_dot[-1])
+    )
+    # vertical mean matches explicit integration.
+    np.testing.assert_allclose(
+        velocities.u_mean,
+        sigma_coordinates.sigma_integral(velocities.u, coords.vertical),
+        atol=1e-6,
+    )
+
+  def test_explicit_terms_unchanged_by_split_refactor(self):
+    """explicit_terms with default flags matches term-by-term assembly."""
+    primitive, state = self._make_equation_and_state(
+        humidity=True, variable_t_ref=True
+    )
+    aux_state = primitive_equations.compute_diagnostic_state_sigma(
+        state, primitive.coords
+    )
+    # curl_and_div_tendencies with all flags on equals the default call.
+    default = primitive.curl_and_div_tendencies(aux_state)
+    all_on = primitive.curl_and_div_tendencies(
+        aux_state,
+        include_vorticity_advection=True,
+        include_coriolis=True,
+        include_vertical_advection=True,
+        include_pressure_gradient=True,
+    )
+    jax.tree.map(np.testing.assert_array_equal, default, all_on)
+
+
 def interpolate_state_hybrid_to_sigma(
     state_hybrid: primitive_equations.State,
     coords_hybrid: coordinate_systems.CoordinateSystem,
