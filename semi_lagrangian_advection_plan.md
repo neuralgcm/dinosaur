@@ -48,7 +48,8 @@ ringing and negative concentrations.
 - No inherently conservative SL (SLICE/CSLAM), no mass fixers beyond an
   optional trivial global rescaling.
 - No hybrid-coordinate support in the first version (sigma only; the hybrid
-  class is a straightforward follow-up once sigma works).
+  class, built on the Simmons & Burridge (1981) vertical discretization, is a
+  straightforward follow-up once sigma works).
 - No changes to the default Eulerian code path; SL is a parallel opt-in
   equation class + steppers.
 
@@ -60,7 +61,8 @@ State (`primitive_equations.State`) holds modal (spherical-harmonic)
 `PrimitiveEquationsSigma.explicit_terms`:
 
 - transforms to nodal space (`compute_diagnostic_state_sigma`), computing
-  nodal winds `cos_lat_u` via `spherical_harmonic.get_cos_lat_vector`, the
+  nodal cosθ-scaled winds `cos_lat_u` (modal cosθ·v from
+  `spherical_harmonic.get_cos_lat_vector`, then `to_nodal`), the
   sigma-velocity `sigma_dot_{explicit,full}` at layer interfaces, and
   `u_dot_grad_log_sp`;
 - computes **advection terms pseudo-spectrally**: for scalars the flux-form
@@ -113,16 +115,21 @@ semi-implicit SL (SLSI) discretization (Diamantakis 2014, Eq. 9; Temperton,
 Hortal & Simmons 2001) is
 
 $$
-X^{n+1} = T_D\big[X^n + \tfrac{\Delta t}{2}(N^n + L X^n)\big]
-  + \tfrac{\Delta t}{2}\,N^{n+1/2\,{\rm(extrap)}}
+X^{n+1} = T_D\big[X^n + \tfrac{\Delta t}{2}\big(L X^n + N^{n+1/2}\big)\big]
+  + \tfrac{\Delta t}{2}\,N^{n+1/2}
   + \tfrac{\Delta t}{2} L X^{n+1},
 $$
 
-which is second order and unconditionally stable for advection — but ECMWF
-obtains `N^{n+1/2}` and the trajectory winds by **time extrapolation** from
-`{t^n, t^{n−1}}` (SETTLS), making the scheme multistep and introducing the
-extrapolation instabilities (stratospheric noise) that SETTLS and its limiters
-exist to manage.
+where the midpoint-time non-linear term `N^{n+1/2}` appears **twice**:
+interpolated at the departure point (inside `T_D`) and evaluated at the
+arrival point, centering the non-linear forcing at `t^{n+1/2}` along the
+trajectory. (Placing `N^n` at the departure point instead would center it at
+`t^{n+1/4}` and drop the scheme to first order.) This discretization is second
+order and unconditionally stable for advection — but ECMWF obtains `N^{n+1/2}`
+and the trajectory winds by **time extrapolation** from `{t^n, t^{n−1}}` — the
+standard `(3/2)N^n − (1/2)N^{n−1}` or the more stable SETTLS variant (§3.6) —
+making the scheme multistep and introducing the extrapolation instabilities
+(stratospheric noise) that SETTLS and its limiters exist to manage.
 
 ### 3.2 Key idea: replace extrapolation with an RK predictor
 
@@ -137,10 +144,19 @@ Dinosaur's one-step solvers already forgo by design: `imex_rk_sil3` makes 3
 explicit-tendency evaluations per step and `crank_nicolson_rk2` makes 2, in
 exchange for self-starting steps and clean `scan`/autodiff semantics.
 Measured against Dinosaur's own RK baseline, ICI-style stepping therefore
-adds no doubling (see the cost bullet in §3.3). **ICI with one
-iteration is precisely a two-stage, one-step IMEX Runge-Kutta method** — no
-multistep memory, self-starting, and it slots naturally into Dinosaur's RK
-infrastructure. This is the recommended scheme.
+adds no doubling (see the cost bullet in §3.3).
+
+Two honest caveats on the identification. As documented, ICI is not quite
+one-step — its first guess `X⁽⁰⁾` still uses time extrapolation — and its
+corrector centers the non-linear term as `½(N⁽⁰⁾ + N^n)` at *both* trajectory
+endpoints, where §3.3 uses the endpoint trapezoid `½(N^n_d + N(X^*)_a)`.
+**Replacing the extrapolated first guess with an RK predictor turns
+ICI-with-one-iteration into a genuine two-stage, one-step IMEX Runge-Kutta
+method** — no multistep memory, self-starting, slotting naturally into
+Dinosaur's RK infrastructure — and that is the recommended scheme. Both
+centerings are second order, but ECMWF's "one iteration eliminates the noise"
+is evidence from a close sibling, not from this exact scheme; the noise claim
+is verified, not assumed, in the Δt study (§9.8).
 
 One-step SL time stepping has further independent precedent: Tumolo &
 Bonaventura (2015) built an adaptive discontinuous-Galerkin NWP core around a
@@ -187,9 +203,10 @@ Properties:
   `u2 = G_inv(g + dt·h2, dt/2)` with `h2 = ½(h1 + F(u1))`). This gives a sharp
   unit test and makes the scheme's relationship to the existing code obvious.
 - **No CFL restriction from advection**; stability is limited by the explicit
-  treatment of `N` (Coriolis and non-linear residuals — slow modes), the
-  trajectory-convergence (Lipschitz) condition `Δt · max‖∇V‖ < 1`, and
-  accuracy.
+  treatment of `N` — where Coriolis is the binding term at large Δt, because
+  Heun has no imaginary-axis stability (see the Coriolis note in §4 and §11)
+  — by the trajectory-convergence (Lipschitz) condition `Δt · max‖∇V‖ < 1`
+  (§5), and by accuracy.
 - Cost per step: 2 evaluations of `N`, 2 departure-point solves, 2 transport
   applications, 2 implicit solves. Roughly 2× an Eulerian
   `crank_nicolson_rk2` step; the payoff is the 3-6× larger `Δt`. (The SETTLS
@@ -209,24 +226,33 @@ trajectories spanning `c_i Δt`, and solve
 `Y_i = G_inv(T_{D_i}[B_i], a_ii Δt)`; mirror the same pattern for the final
 combination (`b_ex`, `b_im`). Two caveats to document in code:
 
-1. **Formal order.** Interpolating *all* previous-stage tendencies at the
-   full-stage departure point treats them as attached to the parcel at `t^n`.
-   For stage tendencies with `0 < c_j < c_i` this is an `O(Δt²)` misplacement,
-   so the SL lift of a 3rd-order tableau (e.g. SIL3's explicit part) is
-   formally 2nd order unless stage-consistent interpolation (separate
-   trajectory-segment interpolation per `(i, j)` pair, as in the SL
-   exponential-RK integrators of Celledoni & Kometa 2009 and Celledoni,
-   Kometa & Verdier 2016) is used. Given that
-   SIL3's implicit part is 2nd order anyway and spatial interpolation error
-   dominates in practice, this is acceptable; a stage-consistent variant is
-   listed as future work.
+1. **Formal order — the naive lift is only first order.** Interpolating a
+   stage-`j` tendency (an Eulerian snapshot at `t^n + c_jΔt`) at the
+   full-segment departure point samples it where the parcel was at `t^n` — a
+   positional error `c_jΔt·|V|`, i.e. `O(Δt)` in the sampled value. The
+   leading step error is `−Δt²(Σ_j b_j c_j)(V·∇)N = −(Δt²/2)(V·∇)N`
+   (`Σ_j b_j c_j = ½` for any 2nd-order-consistent tableau), so the lift is
+   **globally first order** for any tableau with interior abscissae — worse
+   than §3.3. Constant-wind counterexample: for `DX/Dt = N(x)` the naive
+   lift yields `X^n_d + Δt·N_d`, missing the exact update's
+   `(Δt²/2)V·∇N` term. §3.3 escapes because its abscissae are `{0, 1}`:
+   `N^n` rides from the departure point and `N(X^*)` is added at the arrival
+   point — both at their correct parcel positions. Consequence: the general
+   stepper is only worth building with **stage-consistent transport**
+   (interpolate stage-`j` quantities at the parcel position at `t^n + c_jΔt`
+   along the stage-`i` trajectory — one trajectory-segment family per
+   `(i, j)` pair, as in the SL exponential-RK integrators of Celledoni &
+   Kometa 2009 and Celledoni, Kometa & Verdier 2016), at the cost of extra
+   interpolation passes.
 2. **Negative tableau weights** (SIL3 has them) combine tendencies sampled at
    slightly inconsistent positions; empirical noise checks against
    `semi_lagrangian_crank_nicolson_rk2` are part of validation.
 
 Deliverable-wise, the 2-stage scheme in §3.3 is the required outcome; the
 general tableau version is a stretch goal implemented behind the same
-interface so `imex_rk_sil3`-style tableaus can be evaluated experimentally.
+interface, **with stage-consistent transport as a requirement** (a naive
+first-order lift would be strictly worse than the workhorse), so
+`imex_rk_sil3`-style tableaus can be evaluated experimentally.
 
 ### 3.5 New equation interface
 
@@ -312,7 +338,8 @@ terms with no clean transport interpretation — the SL equations transport
 grid-point **velocity components**, following IFS practice (Ritchie et al.
 1995; Temperton et al. 2001), and only convert to (ζ, δ) modally at arrival
 via the existing `spherical_harmonic.uv_nodal_to_vor_div_modal`. Because
-`get_cos_lat_vector` (modal (ζ,δ) → nodal winds) and `uv_nodal_to_vor_div_modal`
+`get_cos_lat_vector` (modal (ζ, δ) → modal cosθ·v, made nodal via `to_nodal`)
+and `uv_nodal_to_vor_div_modal`
 are linear, transporting a *bracket* that includes (ζ, δ)-space terms is
 well-defined: convert the bracket's vorticity/divergence components to bracket
 winds, transport, convert back.
@@ -322,7 +349,7 @@ pattern using the existing helper functions):
 
 | Equation | Eulerian term (current code) | SL fate |
 |---|---|---|
-| momentum | `(ζ+f) k×v` rotational term | advection part → **trajectories**; Coriolis `−f k×v` → **N** (nodal, at stage points) |
+| momentum | `(ζ+f) k×v` rotational term | advection part → **trajectories**; Coriolis `−f k×v` → **N** in explicit-`f` mode (small Δt only), or removed entirely via planetary-momentum transport (large Δt; see Notes) |
 | momentum | `∇(|v|²/2)` (`kinetic_energy_tendency`) | **dropped** — artifact of the vector-invariant form, absorbed by directly advecting `v` |
 | momentum | `σ̇ ∂v/∂σ` | **trajectories** (3-D departure points) |
 | momentum | `−R T′_v ∇ln pₛ` (explicit PGF part) | **N** |
@@ -346,6 +373,21 @@ Notes:
   (transported bracket + `Δt`-weighted arrival `N` terms), we transform
   `(u*, v*) → (ζ*, δ*)` and apply the existing per-wavenumber solve on
   (δ, T′, lnpₛ).
+- **Coriolis and large Δt.** Heun's explicit part has no imaginary-axis
+  stability, so explicit `−f k×v` in `N` amplifies inertial modes by
+  `≈ (fΔt)⁴/8` per step: ~6·10⁻⁴/step at Δt = 30 min (`fΔt ≈ 0.26` at the
+  poles; e-folding ≈ 35 simulated days — fine for short tests, marginal for
+  climate runs) and disqualifying at the targeted 3-6× extension
+  (`fΔt ≈ 0.8-1.6` → 5-59% growth per step). Making Coriolis implicit is
+  rejected — it couples ζ and δ per wavenumber and would forfeit the
+  unchanged `implicit_inverse`. The large-Δt configuration is therefore
+  **advected planetary momentum** (IFS's LADVF option; Temperton et al.
+  2001): transport `v + 2Ω×r`, with the analytic `2Ω×r` field added at the
+  departure point and subtracted at the arrival point so only `v` is ever
+  interpolated. Since `D(v + 2Ω×r)/Dt` has no Coriolis term, `f` drops out
+  of `N` entirely, and the §6 rotation/projection machinery applies
+  unchanged. Explicit-`f` mode is retained for small-Δt consistency testing
+  (§9.6), where its growth is negligible over test horizons.
 - **Continuity is exact with 2-D trajectories.** Since `ln pₛ` is independent
   of σ, `∫₀¹ v·∇ln pₛ dσ = v̄·∇ln pₛ` with `v̄ = ∫₀¹ v dσ`, so
   `D̄(ln pₛ)/D̄t = −∫₀¹ δ dσ` *exactly*, where `D̄/D̄t` follows the
@@ -400,9 +442,15 @@ Work in 3-D Cartesian coordinates on the unit sphere (pole-singularity-free):
    horizontal and vertical positions together.
 
 Convergence of the iteration requires `Δt < 1/max‖∂V/∂x‖` (trajectories do
-not cross; Pudykiewicz et al. 1985; Smolarkiewicz & Pudykiewicz 1992) —
-in practice hours, far beyond target time steps; two iterations give
-second-order departure points.
+not cross; Pudykiewicz et al. 1985; Smolarkiewicz & Pudykiewicz 1992). That
+margin is real, not academic: resolved jet-region shear/vorticity of
+~1·10⁻⁴ s⁻¹ puts the bound at ≈ 2.8 h — comparable to the top of the §9.8
+Δt scan (6× a 30-min baseline = 3 h) — so the fixed 2-iteration solve loses
+convergence exactly where the study pushes hardest. The Δt study therefore
+tracks the iteration increment `‖r_d⁽²⁾ − r_d⁽¹⁾‖` as a diagnostic, and the
+faster-converging departure-point algorithm of Diamantakis & Váňa (2022) is
+the known upgrade if that limit binds. Within the convergent regime, two
+iterations give second-order departure points.
 
 ## 6. Interpolation on the full Gaussian grid
 
@@ -418,8 +466,9 @@ einsums:
 - **Cross-pole halo**: extend the field with 2 rows beyond each pole, taking
   values from longitude `λ + π` (a `jnp.roll` by `longitude_nodes // 2`; exact
   for the even node counts of the standard `Grid.T*`/`Grid.TL*` constructors —
-  the odd counts produced by `Grid.with_wavenumbers` would need a half-cell
-  shift, so the initial version asserts an even number of longitude nodes).
+  `Grid.with_wavenumbers` yields `order·m + 1` longitude nodes, odd whenever
+  `order·m` is even, and odd counts would need a half-cell shift — so the
+  initial version asserts an even number of longitude nodes).
   Scalars copy directly;
   for wind fields interpolated as Cartesian components no sign flip is needed
   (this is a key reason to interpolate Cartesian components; (u, v) halos
@@ -448,7 +497,11 @@ componentwise, then **rotated from the departure tangent plane to the arrival
 tangent plane** with the closed-form great-circle (Rodrigues) rotation
 `R(r_d → r_a)` and projected onto `(ê_λ, ê_φ)` at arrival. This is exact
 parallel transport along the great circle; skipping the rotation is an
-`O(|Δr|²)` directional error, so the rotation stays on by default.
+`O(|Δr|²)` directional error, so the rotation stays on by default. One
+convention trap: dinosaur's wind diagnostics are cosθ-scaled
+(`cos_lat_u = cosθ·v`; `vor_div_to_uv_nodal` divides it back out), so the
+Cartesian conversion must consume true `(u, v)` with the cosθ factor
+stripped — an easy silent bug, pinned by the solid-body unit test.
 
 API sketch:
 
@@ -548,8 +601,13 @@ conventions) → add arrival-side terms → `implicit_inverse`.
 6. **Consistency:** Jablonowski & Williamson steady state (`steady_state_jw`)
    must remain steady (a sensitive test of the vector transport + PGF
    residual split); JW baroclinic wave (`baroclinic_perturbation_jw`) —
-   SL vs Eulerian solutions converge to each other at 2nd order as Δt → 0 at
-   fixed resolution.
+   SL vs Eulerian differences shrink at 2nd order **over a bounded Δt window**
+   (e.g. Δt_E to 6·Δt_E at fixed resolution). Not "as Δt → 0": SL error
+   behaves like `O(Δt²) + O(E_interp/Δt)` — every step commits an
+   interpolation remap error and the step count grows as `1/Δt` — so below an
+   interpolation-error floor the difference *grows* again. The test pins the
+   window and documents the measured floor (or compares both cores against a
+   Δt- and resolution-converged reference).
 7. **Climate:** Held-Suarez long run at T42/T85 — zonal-mean statistics
    against the Eulerian core within sampling variability.
 8. **The point of it all:** time-step extension experiments — max stable Δt
@@ -557,7 +615,10 @@ conventions) → add arrival-side terms → `implicit_inverse`.
    ECMWF experience suggests up to 6×), and wall-clock cost per simulated day
    on CPU/GPU (TPU numbers recorded but explicitly not optimized). With M5c:
    a three-way Eulerian vs SL-RK2 vs SL-SETTLS comparison (per-step cost, max
-   stable Δt, stratospheric noise).
+   stable Δt, stratospheric noise). Diagnostics tracked across the Δt scan:
+   polar inertial-mode amplification (explicit-`f` vs planetary-momentum
+   Coriolis modes, §4) and the departure-iteration increment
+   `‖r_d⁽²⁾ − r_d⁽¹⁾‖` (§5).
 9. Tracer-in-dynamics test: `gaussian_scalar` tracer in Held-Suarez flow;
    positivity with/without limiter; mass-conservation drift tracked
    (`grid.integrate`), with the optional global proportional fixer evaluated.
@@ -579,11 +640,13 @@ conventions) → add arrival-side terms → `implicit_inverse`.
   (§9.4), including the positivity stress case.
 - **M3 — SL time steppers.** `SemiLagrangianImplicitExplicitODE`,
   `semi_lagrangian_crank_nicolson_rk2` (+ off-centering), toy-problem tests
-  (§9.3). Stretch: tableau-general `semi_lagrangian_imex_runge_kutta`.
+  (§9.3). Stretch: tableau-general `semi_lagrangian_imex_runge_kutta`
+  (stage-consistent transport required, per §3.4).
 - **M3b (optional) — Shallow-water SL** for a cheap end-to-end shakeout (§9.5).
 - **M4 — `SemiLagrangianPrimitiveEquations` (dry, sigma).** Momentum/thermo/
-  continuity transport per §4, JW steady-state + baroclinic-wave consistency
-  (§9.6).
+  continuity transport per §4 with both Coriolis modes (explicit `f`, and
+  advected planetary momentum for large Δt), JW steady-state +
+  baroclinic-wave consistency (§9.6).
 - **M5 — Moist terms + tracers + validation.** Moisture in `N`, per-tracer
   limiter, Held-Suarez climate, Δt-extension study, gradient tests, notebook
   + docs. **M5b:** opt-in nodal tracer storage for the sharp-tracer use case.
@@ -596,8 +659,9 @@ Eulerian path.
 
 ## 11. Risks and open questions
 
-- **Order reduction in the general-tableau lift** (§3.4): accepted at 2nd
-  order; stage-consistent interpolation is the known fix if ever needed.
+- **Order of the general-tableau lift** (§3.4): the naive lift is first
+  order, so the stretch-goal stepper ships with stage-consistent transport
+  or not at all; the 2-stage workhorse is unaffected.
 - **Polar noise from naive lat-lon interpolation:** departure points near the
   poles span many longitude cells; the interpolation is still well-defined
   (full Gaussian grid, wrap + halo) but accuracy is anisotropic. Monitored via
@@ -611,11 +675,18 @@ Eulerian path.
   Tracked in tests; trivial proportional fixer optional; proper fixers
   (Bermejo & Conde 2002; Priestley 1993) and conservative remap (SLICE/CSLAM)
   deferred.
-- **Coriolis treatment:** initial version keeps Coriolis explicit in `N`
-  (matches current explicit treatment; `fΔt ≈ 0.26` at Δt = 30 min is
-  comfortably within RK2 stability). If accuracy at very long steps
-  disappoints, the standard alternative is advecting planetary momentum
-  (`v + Ω×r` treatment, as in IFS options; Temperton et al. 2001).
+- **Coriolis treatment:** explicit `f` under Heun is *not* the benign choice
+  it is under SIL3. Heun's stability function has `|R(iy)|² = 1 + y⁴/4 > 1`
+  for all `y ≠ 0` (no imaginary-axis stability), while SIL3's third-order
+  explicit part is stable to `|fΔt| ≤ √3` — which is why the Eulerian core
+  never sees this. Growth `≈ (fΔt)⁴/8` per step: ~6·10⁻⁴ at Δt = 30 min
+  (e-folding ≈ 35 simulated days; whether the modal filters mask it in the
+  Held-Suarez runs is checked, not assumed) and 5-59% per step at the 3-6×
+  extension. Mitigation per §4: advected planetary momentum (`v + 2Ω×r`,
+  IFS LADVF; Temperton et al. 2001) is the large-Δt configuration, with
+  explicit `f` only for small-Δt phases; implicit Coriolis is rejected
+  because it couples ζ and δ and forfeits the unchanged `implicit_inverse`.
+  The Δt study tracks an inertial-mode growth diagnostic (§9.8).
 - **Cost accounting:** 2 transforms + 2 transports per step must beat the
   Eulerian step at ≥3× Δt. On CPU/GPU this is very likely; on TPU the gathers
   will be slow until the deferred efficiency work — measured and reported,
@@ -651,6 +722,9 @@ hybrid-coordinate support; stage-consistent high-order SL-RK.
 - Diamantakis, M. (2014). The semi-Lagrangian technique in atmospheric
   modelling: current status and future challenges. *ECMWF Seminar on Numerical
   Methods for Atmosphere and Ocean Modelling*, 183-200.
+- Diamantakis, M. & Váňa, F. (2022). A fast converging and concise algorithm
+  for computing the departure points in semi-Lagrangian weather and climate
+  models. *Q. J. R. Meteorol. Soc.*, 148, 670-684. doi:10.1002/qj.4224
 - Hortal, M. (2002). The development and testing of a new two-time-level
   semi-Lagrangian scheme (SETTLS) in the ECMWF forecast model. *Q. J. R.
   Meteorol. Soc.*, 128, 1671-1687.
@@ -668,6 +742,9 @@ hybrid-coordinate support; stage-consistent high-order SL-RK.
   *SIAM J. Sci. Comput.*, 41(5). doi:10.1137/18M1206497
 - Priestley, A. (1993). A quasi-conservative version of the semi-Lagrangian
   advection scheme. *Mon. Wea. Rev.*, 121, 621-629.
+- Pudykiewicz, J., Benoit, R. & Staniforth, A. (1985). Preliminary results
+  from a partial LRTAP model based on an existing meteorological forecast
+  model. *Atmos.-Ocean*, 23, 267-303.
 - Ritchie, H., Temperton, C., Simmons, A., Hortal, M., Davies, T., Dent, D. &
   Hamrud, M. (1995). Implementation of the semi-Lagrangian method in a
   high-resolution version of the ECMWF forecast model. *Mon. Wea. Rev.*, 123,
@@ -678,6 +755,8 @@ hybrid-coordinate support; stage-consistent high-order SL-RK.
 - Simmons, A. J. & Burridge, D. M. (1981). An energy and angular-momentum
   conserving vertical finite-difference scheme and hybrid vertical
   coordinates. *Mon. Wea. Rev.*, 109, 758-766.
+- Smolarkiewicz, P. K. & Pudykiewicz, J. A. (1992). A class of
+  semi-Lagrangian approximations for fluids. *J. Atmos. Sci.*, 49, 2082-2096.
 - Staniforth, A. & Côté, J. (1991). Semi-Lagrangian integration schemes for
   atmospheric models — a review. *Mon. Wea. Rev.*, 119, 2206-2223.
 - Temperton, C., Hortal, M. & Simmons, A. (2001). A two-time-level
