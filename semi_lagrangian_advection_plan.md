@@ -787,6 +787,25 @@ Issues encountered while implementing this plan, by milestone.
   parallel-transport implementation (tight tolerance), plus the O(ω²Δt)
   flow-return bound as documentation of the physics.
 
+**M2 — Passive transport validation.**
+
+- The dominant error in long passive-advection runs is accumulated per-remap
+  interpolation error, so at fixed final time the error *decreases* with
+  larger Δt (measured Williamson case 1 at T42: l2 = 0.014 at 64 steps,
+  0.07 at 100, 0.16 at 250, 0.20 at 512 — identical in float32 and float64).
+  Step counts commensurate with the grid are misleading (128 steps = exactly
+  one cell per step at T42's 128 longitudes → near-exact); tests use
+  non-commensurate counts and thresholds calibrated to measured values.
+- Nair & Lauritzen deformational-flow return error is resolution-limited at
+  T42 (l2 = 0.24; the mid-time filaments are thinner than the grid), falling
+  to 0.021 at T85 with the same step count — consistent with published
+  behavior, so the T42 threshold is set accordingly rather than chasing the
+  headline numbers from finer grids.
+- The positivity stress case behaves exactly as issue #55 hopes: spectral
+  flux-form transport of a ~2-cell Gaussian hill rings negative (min <
+  −1% of peak), unlimited cubic SL undershoots slightly, and quasi-monotone
+  SL stays exactly non-negative without amplifying the peak.
+
 ## 14. References
 
 - Bermejo, R. & Staniforth, A. (1992). The conversion of semi-Lagrangian
