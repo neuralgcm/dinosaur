@@ -787,6 +787,27 @@ Issues encountered while implementing this plan, by milestone.
   parallel-transport implementation (tight tolerance), plus the O(ω²Δt)
   flow-return bound as documentation of the physics.
 
+**M3 — SL time steppers.**
+
+- The `SemiLagrangianImplicitExplicitODE` interface grew a third method
+  beyond the §3.5 sketch: `departure_points(velocities, dt)` sits between
+  `nodal_velocities` and `semi_lagrangian_transport`, so steppers can form
+  time-centered winds by tree-averaging two velocity pytrees (stage 2 needs
+  `½(V^n + V^*)`) without knowing the equation-specific velocity layout.
+- The off-centering parameter ε decenters both the implicit terms and the
+  corrector's non-linear trapezoid (`α = (½+ε)Δt` at arrival, `β = (½−ε)Δt`
+  at departure); the predictor keeps the full `Δt·N^n` weight. With ε = 0
+  and zero velocities the stepper reproduces `crank_nicolson_rk2` to
+  float64 round-off, and a ring advection-relaxation toy with exact
+  (spectral-shift) transport confirms clean second-order convergence
+  dropping toward first order with ε > 0.
+- The tableau-general `semi_lagrangian_imex_runge_kutta` stretch goal is
+  deliberately not built, following §3.4's own analysis: without
+  stage-consistent transport the lift is first order (strictly worse than
+  the workhorse), and stage-consistent transport (one trajectory family per
+  (i, j) stage pair) is a research-grade extension deferred with the §12
+  roadmap.
+
 **M2 — Passive transport validation.**
 
 - The dominant error in long passive-advection runs is accumulated per-remap

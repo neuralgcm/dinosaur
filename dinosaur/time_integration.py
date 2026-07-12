@@ -114,6 +114,146 @@ class ImplicitExplicitODE:
     return explicit_implicit_ode
 
 
+class SemiLagrangianImplicitExplicitODE(ImplicitExplicitODE):
+  """Describes a set of ODEs solved along semi-Lagrangian trajectories.
+
+  The structure of the equation is assumed to be:
+
+    DX/Dt = explicit_terms(X) + implicit_terms(X),  dr/dt = V(X)
+
+  where D/Dt is the material derivative along trajectories moving with the
+  velocities V. Unlike `ImplicitExplicitODE`, *all* advection is handled by
+  remapping fields along trajectories (`semi_lagrangian_transport`), so
+  `explicit_terms(x)` returns only the non-advective explicit tendencies
+  ("N" in the semi-Lagrangian literature). `implicit_terms` and
+  `implicit_inverse` are unchanged from the Eulerian equations.
+
+  Any `sim_time` field passes through transport untouched and keeps its
+  existing convention (`explicit_terms` contributes rate 1.0).
+  """
+
+  def nodal_velocities(self, state: PyTreeState) -> typing.Pytree:
+    """Computes the velocities that define trajectories.
+
+    Args:
+      state: the (modal) state.
+
+    Returns:
+      An equation-specific pytree of nodal velocities (e.g. horizontal winds
+      per level, vertical velocity, and the vertically averaged wind for the
+      continuity equation). Time steppers form linear combinations of these
+      pytrees (e.g. averaging velocities from two states), then pass them to
+      `departure_points`.
+    """
+    raise NotImplementedError
+
+  def departure_points(self, velocities: typing.Pytree, dt: float) -> Any:
+    """Solves for departure points of trajectories arriving at grid points.
+
+    Args:
+      velocities: velocities as returned by `nodal_velocities`.
+      dt: time step over which to integrate trajectories backwards.
+
+    Returns:
+      An equation-specific representation of departure points, passed on to
+      `semi_lagrangian_transport`.
+    """
+    raise NotImplementedError
+
+  def semi_lagrangian_transport(
+      self, bracket: PyTreeState, departure: Any
+  ) -> PyTreeState:
+    """Remaps a state-like pytree from departure to arrival points.
+
+    Applies `T_D[bracket]`: interpolates the advected representation of
+    `bracket` (a state or state-like linear combination of states and
+    tendencies) at the departure points of the trajectories.
+
+    Args:
+      bracket: modal state-like pytree to transport.
+      departure: departure points from `departure_points`.
+
+    Returns:
+      The transported bracket, in the same (modal) representation.
+    """
+    raise NotImplementedError
+
+
+def semi_lagrangian_crank_nicolson_rk2(
+    equation: SemiLagrangianImplicitExplicitODE,
+    time_step: float,
+    off_centering: float = 0.0,
+) -> TimeStepFn:
+  """Semi-Lagrangian time stepping via Crank-Nicolson and Heun's method.
+
+  This is the semi-Lagrangian lift of `crank_nicolson_rk2`: a two-stage,
+  one-step (self-starting) scheme, second order accurate in time. Stage 1
+  computes a predictor using trajectories from the current winds; stage 2
+  recomputes trajectories with time-centered winds `(V(x) + V(x*)) / 2` and
+  applies the trapezoidal semi-implicit semi-Lagrangian update, with
+  old-time-level terms interpolated at departure points and new-time-level
+  terms evaluated at arrival points:
+
+    x* = G⁻¹(T_D1[x + β·L(x) + dt·N(x)], α)
+    x' = G⁻¹(T_D2[x + β·(L(x) + N(x))] + α·N(x*), α)
+
+  where `T_D` denotes transport along trajectories, `G⁻¹(·, η) =
+  (1 - η·L)⁻¹` is the implicit inverse, `α = (1/2 + ε)·dt` and
+  `β = (1/2 - ε)·dt`.
+
+  With zero velocities (`T_D` the identity) and ε = 0 this reduces exactly
+  to `crank_nicolson_rk2`. Unlike the extrapolation-based two-time-level
+  schemes (SETTLS) used operationally, it requires no multistep memory, at
+  the cost of a second evaluation of the explicit terms and trajectories.
+
+  Args:
+    equation: equation to solve.
+    time_step: time step.
+    off_centering: optional off-centering (decentering) parameter ε ≥ 0,
+      shifting weight from the departure to the arrival side of the
+      trapezoidal rule — the standard remedy for orographic resonance in
+      semi-implicit semi-Lagrangian models. First-order accurate in the
+      ε-weighted terms; ε = 0 (default) is fully centered and second order.
+
+  Returns:
+    Function that performs a time step.
+
+  References:
+    Diamantakis, M. The semi-Lagrangian technique in atmospheric modelling:
+    current status and future challenges. ECMWF Seminar on Numerical Methods
+    for Atmosphere and Ocean Modelling (2014).
+    Temperton, C., Hortal, M. & Simmons, A. A two-time-level semi-Lagrangian
+    global spectral model. Q. J. R. Meteorol. Soc. 127, 111-127 (2001).
+  """
+  dt = time_step
+  α = (0.5 + off_centering) * dt
+  β = (0.5 - off_centering) * dt
+
+  def step_fn(x0: PyTreeState) -> PyTreeState:
+    n0 = equation.explicit_terms(x0)
+    l0 = equation.implicit_terms(x0)
+    v0 = equation.nodal_velocities(x0)
+
+    # Stage 1 (predictor): first-order trajectories from current winds.
+    departure1 = equation.departure_points(v0, dt)
+    bracket1 = tree_map(lambda x, l, n: x + β * l + dt * n, x0, l0, n0)
+    x_star = equation.implicit_inverse(
+        equation.semi_lagrangian_transport(bracket1, departure1), α
+    )
+
+    # Stage 2 (corrector): time-centered trajectories and trapezoidal update.
+    v_star = equation.nodal_velocities(x_star)
+    v_mid = tree_map(lambda a, b: 0.5 * (a + b), v0, v_star)
+    departure2 = equation.departure_points(v_mid, dt)
+    n_star = equation.explicit_terms(x_star)
+    bracket2 = tree_map(lambda x, l, n: x + β * (l + n), x0, l0, n0)
+    transported = equation.semi_lagrangian_transport(bracket2, departure2)
+    combined = tree_map(lambda t, n: t + α * n, transported, n_star)
+    return equation.implicit_inverse(combined, α)
+
+  return step_fn
+
+
 @dataclasses.dataclass
 class TimeReversedImExODE(ImplicitExplicitODE):
   """An ImplicitExplicitODE reversed in time.

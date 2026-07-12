@@ -22,6 +22,7 @@ from dinosaur import coordinate_systems
 from dinosaur import semi_lagrangian
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
+from dinosaur import time_integration
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -625,6 +626,157 @@ class TransportTest(X64TestCase):
     )
     exact = analytic(lon_mesh - omega * dt, sin_lat_mesh, sigma_departure)
     np.testing.assert_allclose(transported, exact, atol=1e-3)
+
+
+class _IdentityTransportODE(
+    time_integration.SemiLagrangianImplicitExplicitODE
+):
+  """A semi-Lagrangian equation with zero velocities (identity transport)."""
+
+  def __init__(self, base: time_integration.ImplicitExplicitODE):
+    self.base = base
+
+  def explicit_terms(self, state):
+    return self.base.explicit_terms(state)
+
+  def implicit_terms(self, state):
+    return self.base.implicit_terms(state)
+
+  def implicit_inverse(self, state, step_size):
+    return self.base.implicit_inverse(state, step_size)
+
+  def nodal_velocities(self, state):
+    return jnp.zeros(())
+
+  def departure_points(self, velocities, dt):
+    del velocities, dt  # unused
+    return None
+
+  def semi_lagrangian_transport(self, bracket, departure):
+    del departure  # unused
+    return bracket
+
+
+class _RingAdvectionODE(time_integration.SemiLagrangianImplicitExplicitODE):
+  """DX/Dt = cos(θ) - γ X along dθ/dt = ω on a periodic ring.
+
+  Transport is an exact spectral shift, so all discretization error comes
+  from the time stepping. The exact solution is:
+
+    X(θ, T) = e^(-γT) X₀(θ - ωT)
+              + Re{ e^(iθ) (1 - e^(-(γ + iω)T)) / (γ + iω) }
+  """
+
+  def __init__(self, num_points: int, omega: float, gamma: float):
+    self.theta = 2 * np.pi * jnp.arange(num_points) / num_points
+    self.omega = omega
+    self.gamma = gamma
+
+  def explicit_terms(self, state):
+    return jnp.cos(self.theta)
+
+  def implicit_terms(self, state):
+    return -self.gamma * state
+
+  def implicit_inverse(self, state, step_size):
+    return state / (1 + step_size * self.gamma)
+
+  def nodal_velocities(self, state):
+    return jnp.asarray(self.omega)
+
+  def departure_points(self, velocities, dt):
+    return velocities * dt
+
+  def semi_lagrangian_transport(self, bracket, departure):
+    num_points = self.theta.size
+    k = jnp.fft.rfftfreq(num_points, d=1 / num_points)
+    shifted = jnp.fft.rfft(bracket) * jnp.exp(-1j * k * departure)
+    return jnp.fft.irfft(shifted, num_points)
+
+  def exact_solution(self, state0, time):
+    theta = np.asarray(self.theta)
+    gamma, omega = self.gamma, self.omega
+    decay = np.exp(-gamma * time)
+    # initial condition advected and decayed (state0 must be band-limited).
+    initial_term = decay * np.asarray(
+        self.semi_lagrangian_transport(state0, omega * time)
+    )
+    forced = np.real(
+        np.exp(1j * theta)
+        * (1 - np.exp(-(gamma + 1j * omega) * time))
+        / (gamma + 1j * omega)
+    )
+    return initial_term + forced
+
+
+class SemiLagrangianSteppersTest(X64TestCase):
+
+  def test_reduces_to_crank_nicolson_rk2_for_zero_velocities(self):
+    rng = np.random.RandomState(0)
+    state = {
+        'a': jnp.asarray(rng.normal(size=(5, 7))),
+        'b': jnp.asarray(rng.normal(size=(3,))),
+    }
+    base = time_integration.ImplicitExplicitODE.from_functions(
+        explicit_terms=lambda x: jax.tree.map(jnp.sin, x),
+        implicit_terms=lambda x: jax.tree.map(lambda a: -2.0 * a, x),
+        implicit_inverse=lambda x, eta: jax.tree.map(
+            lambda a: a / (1 + 2.0 * eta), x
+        ),
+    )
+    dt = 0.3
+    expected = time_integration.crank_nicolson_rk2(base, dt)(state)
+    actual = time_integration.semi_lagrangian_crank_nicolson_rk2(
+        _IdentityTransportODE(base), dt
+    )(state)
+    jax.tree.map(
+        functools.partial(np.testing.assert_allclose, atol=1e-14),
+        expected,
+        actual,
+    )
+
+  def test_second_order_convergence(self):
+    equation = _RingAdvectionODE(num_points=64, omega=1.3, gamma=0.7)
+    state0 = jnp.sin(2 * equation.theta) + 0.5
+    total_time = 1.0
+    exact = equation.exact_solution(state0, total_time)
+
+    def global_error(num_steps):
+      dt = total_time / num_steps
+      step = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+      )
+      state = time_integration.repeated(step, num_steps)(state0)
+      return np.abs(np.asarray(state) - exact).max()
+
+    errors = [global_error(n) for n in [8, 16, 32]]
+    orders = [np.log2(errors[i] / errors[i + 1]) for i in range(2)]
+    for order in orders:
+      self.assertGreater(order, 1.7)
+      self.assertLess(order, 2.3)
+
+  def test_off_centering(self):
+    equation = _RingAdvectionODE(num_points=64, omega=1.3, gamma=0.7)
+    state0 = jnp.sin(2 * equation.theta) + 0.5
+    total_time = 1.0
+    exact = equation.exact_solution(state0, total_time)
+
+    def global_error(num_steps, off_centering):
+      dt = total_time / num_steps
+      step = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(
+              equation, dt, off_centering=off_centering
+          )
+      )
+      state = time_integration.repeated(step, num_steps)(state0)
+      return np.abs(np.asarray(state) - exact).max()
+
+    with self.subTest('off-centering costs accuracy'):
+      self.assertGreater(global_error(16, 0.1), global_error(16, 0.0))
+    with self.subTest('still converges, at reduced order'):
+      errors = [global_error(n, 0.1) for n in [16, 32]]
+      order = np.log2(errors[0] / errors[1])
+      self.assertGreater(order, 0.7)
 
 
 class DifferentiabilityTest(parameterized.TestCase):
