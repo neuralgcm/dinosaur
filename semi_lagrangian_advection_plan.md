@@ -751,17 +751,41 @@ Issues encountered while implementing this plan, by milestone.
   not bit-exactly: splitting `(ζ + f)` products and applying `to_modal` /
   `clip_wavenumbers` to each part separately re-associates linear operations.
   Observed max absolute error ~5e-8 on T21 (nondimensional units, tendencies
-  O(0.1)); the regression test uses `rtol=1e-4, atol=1e-6`. `explicit_terms`
-  itself is bit-for-bit unchanged: the new `include_*` flags on
-  `curl_and_div_tendencies` and `nodal_temperature_vertical_tendency`
-  preserve the original expression trees when left at their defaults.
+  O(0.1)); the regression test uses `rtol=1e-4, atol=1e-6`. The *outputs* of
+  `explicit_terms` with default flags are bit-for-bit identical to the
+  pre-refactor code (verified empirically against the parent commit, eager
+  and jitted); the traced expression tree gains two `+0` ops that XLA folds.
 - `nodal_velocities` returns σ̇ at all `layers + 1` boundaries (zeros appended
   at σ = 0, 1) rather than only interior boundaries, since the trajectory
   solver needs the full interpolation range.
+- Adversarial review (fresh sub-agent) found the initial tests pinned the
+  *completeness* of the split but not the *classification* (swapping Coriolis
+  and ζ-advection between N and A would have passed). Added algebraic
+  classification tests: N must be affine in (ζ, δ) at fixed (T′, ln pₛ,
+  tracers); momentum advection must be homogeneous quadratic and scalar
+  advection homogeneous linear, all vanishing at zero winds. The remaining
+  algebraically-indistinguishable swap (adiabatic heating ↔ T′ advection,
+  both linear in winds) is pinned later by the M4 steady-state test.
 - Pre-existing test failures (not caused by this work): the two sharding
   subtests of `primitive_equations_integration_test.py::IntegrationTest::
   test_distributed_simulation_consistency` fail on a single-device CPU host,
   verified identical at the base commit.
+
+**M1 — `semi_lagrangian.py` core.**
+
+- Latitude interpolation uses latitude φ (radians) as the coordinate, not
+  sin φ as sketched in §6: with cross-pole halo rows the extended axis must
+  stay strictly monotone, and sin φ folds at the poles. Halo-ring
+  coordinates are mirrored about the pole (`±π − φ`), keeping the extended
+  axis increasing; `searchsorted` operates on it directly.
+- "Cartesian-wind transport of a solid-body flow returns the same flow"
+  (§9.1) is true only up to O(Δt): parallel transport differs from the flow
+  map of solid-body rotation by an in-plane twist of angle ≈ ωΔt·cosθ (θ =
+  angle from the rotation axis) — exactly the turning that Coriolis/metric
+  terms supply in the momentum equations (f = 2Ω·cosθ_axis). The unit test
+  instead verifies wind transport against an independent per-point Rodrigues
+  parallel-transport implementation (tight tolerance), plus the O(ω²Δt)
+  flow-return bound as documentation of the physics.
 
 ## 14. References
 

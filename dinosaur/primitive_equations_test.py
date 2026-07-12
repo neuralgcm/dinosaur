@@ -706,7 +706,13 @@ class PrimitiveEquationsSigmaImplicitTest(parameterized.TestCase):
 class ExplicitTermsSplitTest(parameterized.TestCase):
   """Tests the advective/non-advective split of explicit tendencies."""
 
-  def _make_equation_and_state(self, humidity, variable_t_ref):
+  def _make_equation_and_state(
+      self,
+      humidity,
+      variable_t_ref,
+      clouds=False,
+      include_vertical_advection=True,
+  ):
     physics_specs = units.SimUnits.from_si()
     horizontal = spherical_harmonic.Grid.T21()
     vertical = sigma_coordinates.SigmaCoordinates.equidistant(4)
@@ -721,6 +727,7 @@ class ExplicitTermsSplitTest(parameterized.TestCase):
     state = state + primitive_equations_states.baroclinic_perturbation_jw(
         coords, physics_specs
     )
+    state.sim_time = 0.0
     state.tracers = {
         'tracer': primitive_equations_states.gaussian_scalar(
             coords, physics_specs
@@ -732,6 +739,10 @@ class ExplicitTermsSplitTest(parameterized.TestCase):
               coords, physics_specs, amplitude=0.01
           )
       )
+    if clouds:
+      state.tracers['cloud_water'] = primitive_equations_states.gaussian_scalar(
+          coords, physics_specs, amplitude=0.001
+      )
     if variable_t_ref:
       ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
     else:
@@ -742,6 +753,8 @@ class ExplicitTermsSplitTest(parameterized.TestCase):
         coords,
         physics_specs,
         humidity_key='specific_humidity' if humidity else None,
+        cloud_keys=('cloud_water',) if clouds else None,
+        include_vertical_advection=include_vertical_advection,
     )
     return primitive, state
 
@@ -749,10 +762,14 @@ class ExplicitTermsSplitTest(parameterized.TestCase):
       dict(humidity=False, variable_t_ref=False),
       dict(humidity=False, variable_t_ref=True),
       dict(humidity=True, variable_t_ref=True),
+      dict(humidity=True, variable_t_ref=True, clouds=True),
+      dict(
+          humidity=False, variable_t_ref=True, include_vertical_advection=False
+      ),
   )
-  def test_explicit_terms_split_reconstruction(self, humidity, variable_t_ref):
+  def test_explicit_terms_split_reconstruction(self, **kwargs):
     """Advective + non-advective terms must reconstruct explicit_terms."""
-    primitive, state = self._make_equation_and_state(humidity, variable_t_ref)
+    primitive, state = self._make_equation_and_state(**kwargs)
     full = primitive.explicit_terms(state)
     advective = primitive.explicit_advective_terms(state)
     nonadvective = primitive.explicit_nonadvective_terms(state)
@@ -761,7 +778,9 @@ class ExplicitTermsSplitTest(parameterized.TestCase):
     # linear operations.
     tol = dict(rtol=1e-4, atol=1e-6)
     assert_states_close(full, reconstructed, **tol)
-    self.assertEqual(full.sim_time, reconstructed.sim_time)
+    self.assertEqual(full.sim_time, 1.0)
+    self.assertEqual(advective.sim_time, 0.0)
+    self.assertEqual(nonadvective.sim_time, 1.0)
 
   def test_nonadvective_terms_have_no_transport(self):
     """Tracers and log surface pressure have zero non-advective tendencies."""
@@ -814,24 +833,80 @@ class ExplicitTermsSplitTest(parameterized.TestCase):
         atol=1e-6,
     )
 
-  def test_explicit_terms_unchanged_by_split_refactor(self):
-    """explicit_terms with default flags matches term-by-term assembly."""
+  @parameterized.parameters(dict(humidity=False), dict(humidity=True))
+  def test_nonadvective_terms_affine_in_winds(self, humidity):
+    """Pins the classification: N must be affine in (ζ, δ).
+
+    At fixed (T', ln pₛ, tracers), every non-advective term is affine in the
+    winds: Coriolis is linear, the explicit PGF/orography/humidity corrections
+    are constant, and the adiabatic and T_ref source terms are linear (via
+    σ̇ and ω/p). Advective terms like ζ(k ✕ v) are quadratic, so accidentally
+    classifying one as non-advective fails this test.
+    """
     primitive, state = self._make_equation_and_state(
-        humidity=True, variable_t_ref=True
+        humidity=humidity, variable_t_ref=True
     )
-    aux_state = primitive_equations.compute_diagnostic_state_sigma(
-        state, primitive.coords
+
+    def with_winds(factor):
+      return state.replace(
+          vorticity=factor * state.vorticity,
+          divergence=factor * state.divergence,
+      )
+
+    n0 = primitive.explicit_nonadvective_terms(with_winds(0.0))
+    n1 = primitive.explicit_nonadvective_terms(with_winds(1.0))
+    n2 = primitive.explicit_nonadvective_terms(with_winds(2.0))
+    lhs = jax.tree.map(lambda a, b: a - b, n2, n0)
+    rhs = jax.tree.map(lambda a, b: 2 * (a - b), n1, n0)
+    assert_states_close(lhs, rhs, rtol=1e-4, atol=1e-6)
+
+  def test_advective_terms_scaling_in_winds(self):
+    """Pins the classification: advection scales polynomially in (ζ, δ).
+
+    At fixed (T', ln pₛ, tracers), scaling the winds by 2 scales momentum
+    advection (vorticity flux, kinetic energy, vertical advection) by 4 and
+    scalar advection (T', ln pₛ, tracers) by 2, and all advective terms
+    vanish for zero winds. Non-advective terms like Coriolis (2✕), the
+    pressure gradient or orography (1✕) would break these scalings.
+    """
+    primitive, state = self._make_equation_and_state(
+        humidity=False, variable_t_ref=True
     )
-    # curl_and_div_tendencies with all flags on equals the default call.
-    default = primitive.curl_and_div_tendencies(aux_state)
-    all_on = primitive.curl_and_div_tendencies(
-        aux_state,
-        include_vorticity_advection=True,
-        include_coriolis=True,
-        include_vertical_advection=True,
-        include_pressure_gradient=True,
-    )
-    jax.tree.map(np.testing.assert_array_equal, default, all_on)
+
+    def with_winds(factor):
+      return state.replace(
+          vorticity=factor * state.vorticity,
+          divergence=factor * state.divergence,
+      )
+
+    a0 = primitive.explicit_advective_terms(with_winds(0.0))
+    a1 = primitive.explicit_advective_terms(with_winds(1.0))
+    a2 = primitive.explicit_advective_terms(with_winds(2.0))
+    with self.subTest('vanishes for zero winds'):
+      for name in ['vorticity', 'divergence', 'temperature_variation',
+                   'log_surface_pressure']:
+        np.testing.assert_array_equal(
+            getattr(a0, name), np.zeros_like(getattr(a0, name)), err_msg=name
+        )
+      for name, tracer in a0.tracers.items():
+        np.testing.assert_array_equal(
+            tracer, np.zeros_like(tracer), err_msg=name
+        )
+    tol = dict(rtol=1e-4, atol=1e-6)
+    with self.subTest('momentum advection is quadratic'):
+      np.testing.assert_allclose(a2.vorticity, 4 * a1.vorticity, **tol)
+      np.testing.assert_allclose(a2.divergence, 4 * a1.divergence, **tol)
+    with self.subTest('scalar advection is linear'):
+      np.testing.assert_allclose(
+          a2.temperature_variation, 2 * a1.temperature_variation, **tol
+      )
+      np.testing.assert_allclose(
+          a2.log_surface_pressure, 2 * a1.log_surface_pressure, **tol
+      )
+      for name in a1.tracers:
+        np.testing.assert_allclose(
+            a2.tracers[name], 2 * a1.tracers[name], err_msg=name, **tol
+        )
 
 
 def interpolate_state_hybrid_to_sigma(

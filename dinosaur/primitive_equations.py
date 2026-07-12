@@ -144,8 +144,9 @@ class DiagnosticStateSigma:
     cos_lat_u: tuple of nodal values of cosθ * velocity_vector, each of shape
       [h, q, t].
     sigma_dot_explicit: nodal values of d𝜎/dt due to pressure gradient terms `u
-      · ∇(log(ps))` of shape [h, q, t].
-    sigma_dot_full: nodal values of d𝜎/dt due to all terms of shape [h, q, t].
+      · ∇(log(ps))` at interior layer boundaries, of shape [h - 1, q, t].
+    sigma_dot_full: nodal values of d𝜎/dt due to all terms at interior layer
+      boundaries, of shape [h - 1, q, t].
     cos_lat_grad_log_sp: (2,) nodal values of cosθ · ∇(log(surface_pressure)) of
       shape [1, q, t].
     u_dot_grad_log_sp: nodal values of `u · ∇(log(surface_pressure))` of shape
@@ -1371,15 +1372,9 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
     tendency = State(
         vorticity=vorticity_dot,
         divergence=divergence_dot + orography_tendency,
-        temperature_variation=to_modal_fn(
-            dT_dt_reference + dT_dt_adiabatic
-        ),
-        log_surface_pressure=jnp.zeros_like(
-            state.log_surface_pressure
-        ),
-        tracers=jax.tree_util.tree_map(
-            jnp.zeros_like, state.tracers
-        ),
+        temperature_variation=to_modal_fn(dT_dt_reference + dT_dt_adiabatic),
+        log_surface_pressure=jnp.zeros_like(state.log_surface_pressure),
+        tracers=jax.tree_util.tree_map(jnp.zeros_like, state.tracers),
         sim_time=None if state.sim_time is None else 1.0,
     )
     return self.coords.horizontal.clip_wavenumbers(tendency)
