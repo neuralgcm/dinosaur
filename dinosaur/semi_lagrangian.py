@@ -728,6 +728,59 @@ def transport_scalar(
   )
 
 
+def planetary_velocity(r: Array, rotation_rate: float, radius: float) -> Array:
+  """Computes the planetary momentum field 2Ω ✕ R at unit vectors `r`.
+
+  This is twice the velocity of solid-body planetary rotation: the quantity
+  `v + 2Ω ✕ R` obeys a momentum equation with no Coriolis force, since the
+  horizontal projection of `2Ω ✕ v` is exactly `f k ✕ v` (IFS's LADVF
+  option; Temperton, Hortal & Simmons 2001).
+
+  Args:
+    r: array of shape [3, ...] of unit vectors on the sphere.
+    rotation_rate: planetary angular velocity Ω.
+    radius: radius of the sphere.
+
+  Returns:
+    Array of shape [3, ...]: `2 Ω a (ẑ ✕ r)`, a tangent vector field pointing
+    east with magnitude `2Ωa cosθ`.
+  """
+  scale = 2 * rotation_rate * radius
+  return jnp.stack([-scale * r[1], scale * r[0], jnp.zeros_like(r[0])])
+
+
+def _finish_wind_transport(
+    wind_departure: Array,
+    departure: DeparturePoints,
+    grid: spherical_harmonic.Grid,
+    rotate: bool,
+    planetary_rotation_rate: float | None,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+  """Rotates interpolated Cartesian winds to arrival and projects to (u, v)."""
+  lon_mesh, sin_lat_mesh = grid.nodal_mesh
+  arrival = lon_lat_to_cartesian(
+      jnp.broadcast_to(lon_mesh, departure.lon.shape),
+      jnp.broadcast_to(sin_lat_mesh, departure.lon.shape),
+  )
+  if planetary_rotation_rate is not None:
+    # add the analytic planetary momentum at the departure point (only the
+    # relative wind is ever interpolated) and subtract it at arrival.
+    wind_departure = wind_departure + planetary_velocity(
+        departure.cartesian, planetary_rotation_rate, grid.radius
+    )
+  if rotate:
+    wind_arrival = parallel_transport(
+        wind_departure, departure.cartesian, arrival
+    )
+  else:
+    wind_arrival = wind_departure
+  if planetary_rotation_rate is not None:
+    wind_arrival = wind_arrival - planetary_velocity(
+        arrival, planetary_rotation_rate, grid.radius
+    )
+  return tangent_wind(wind_arrival, lon_mesh, sin_lat_mesh)
+
+
 def transport_wind(
     u: Array,
     v: Array,
@@ -736,6 +789,7 @@ def transport_wind(
     interpolator: GridInterpolator,
     *,
     rotate: bool = True,
+    planetary_rotation_rate: float | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
   """Remaps horizontal winds to arrival points along 3-D trajectories.
 
@@ -756,6 +810,13 @@ def transport_wind(
       winds.
     rotate: whether to parallel-transport interpolated vectors from the
       departure to the arrival tangent plane.
+    planetary_rotation_rate: if not None, transport the planetary momentum
+      `v + 2Ω ✕ R` instead of the plain wind `v`, with the analytic planetary
+      component added at departure and removed at arrival (see
+      `planetary_velocity`). Along-trajectory transport of this quantity has
+      no Coriolis force, so equations using it drop `f k ✕ v` from their
+      explicit terms entirely — the standard configuration for long time
+      steps.
 
   Returns:
     Tuple (u, v) of transported winds at arrival points.
@@ -776,14 +837,44 @@ def transport_wind(
       monotone=False,
   )
   wind_departure = jnp.stack([interpolate(wind[c]) for c in range(3)])
-  arrival = lon_lat_to_cartesian(
-      jnp.broadcast_to(lon_mesh, departure.lon.shape),
-      jnp.broadcast_to(sin_lat_mesh, departure.lon.shape),
+  return _finish_wind_transport(
+      wind_departure, departure, grid, rotate, planetary_rotation_rate
   )
-  if rotate:
-    wind_arrival = parallel_transport(
-        wind_departure, departure.cartesian, arrival
-    )
-  else:
-    wind_arrival = wind_departure
-  return tangent_wind(wind_arrival, lon_mesh, sin_lat_mesh)
+
+
+def transport_wind_2d(
+    u: Array,
+    v: Array,
+    departure: DeparturePoints,
+    interpolator: GridInterpolator,
+    *,
+    rotate: bool = True,
+    planetary_rotation_rate: float | None = None,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+  """Remaps horizontal winds along 2-D trajectories (see `transport_wind`).
+
+  Args:
+    u: nodal zonal wind (true winds, not cosθ-scaled) of shape [*batch,
+      longitude_nodes, latitude_nodes].
+    v: nodal meridional wind, same shape as `u`.
+    departure: horizontal departure points with fields shaped like `u`.
+    interpolator: interpolation rule. The monotone limiter is not applied to
+      winds.
+    rotate: whether to parallel-transport interpolated vectors from the
+      departure to the arrival tangent plane.
+    planetary_rotation_rate: if not None, transport the planetary momentum
+      `v + 2Ω ✕ R` (see `transport_wind`).
+
+  Returns:
+    Tuple (u, v) of transported winds at arrival points.
+  """
+  grid = interpolator.grid
+  unlimited = dataclasses.replace(interpolator, monotone=False)
+  lon_mesh, sin_lat_mesh = grid.nodal_mesh
+  wind = cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
+  wind_departure = jnp.stack(
+      [unlimited(wind[c], departure.lon, departure.sin_lat) for c in range(3)]
+  )
+  return _finish_wind_transport(
+      wind_departure, departure, grid, rotate, planetary_rotation_rate
+  )

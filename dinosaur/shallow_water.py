@@ -22,6 +22,7 @@ from typing import Sequence
 
 from dinosaur import coordinate_systems
 from dinosaur import scales
+from dinosaur import semi_lagrangian
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
 from dinosaur import typing
@@ -227,6 +228,125 @@ class ShallowWaterEquations(time_integration.ImplicitExplicitODE):
         * (
             -step_size * self.ref_potential * state.divergence + state.potential
         ),
+    )
+
+
+@dataclasses.dataclass
+class SemiLagrangianShallowWaterEquations(
+    ShallowWaterEquations,
+    time_integration.SemiLagrangianImplicitExplicitODE,
+):
+  """Shallow water equations in semi-Lagrangian form.
+
+  The state layout (modal vorticity, divergence and potential) and the
+  implicit terms/inverse are unchanged from `ShallowWaterEquations`, so this
+  class plugs into `time_integration.semi_lagrangian_crank_nicolson_rk2`.
+  All advection is handled by trajectories: momentum is transported as
+  grid-point winds (converted from/to modal vorticity and divergence at the
+  transport boundaries) and the potential perturbation as a scalar, so
+  `explicit_terms` returns only the non-advective forcing:
+
+  - the pressure-gradient coupling between layers and orography,
+  - the potential's stretching source `-Φ'δ` (the flux-form Eulerian
+    tendency `-∇·(vΦ')` minus advection),
+  - and, only for `coriolis_mode='explicit'`, the Coriolis term `-f k✕v`.
+
+  Attributes:
+    coriolis_mode: 'planetary_momentum' (default) transports the planetary
+      momentum `v + 2Ω✕R`, which obeys a momentum equation with no Coriolis
+      force — the standard configuration for long time steps. 'explicit'
+      keeps `-f k✕v` as an explicit tendency, which is only suitable for
+      small `f·dt` (Heun's method has no imaginary-axis stability).
+    interpolation_order: horizontal interpolation order for transport
+      ('cubic' or 'linear'); trajectories always use linear interpolation.
+  """
+
+  coriolis_mode: str = 'planetary_momentum'
+  interpolation_order: str = 'cubic'
+
+  def __post_init__(self):
+    if self.coriolis_mode not in ('planetary_momentum', 'explicit'):
+      raise ValueError(f'unknown {self.coriolis_mode=}')
+
+  @property
+  def _interpolator(self) -> semi_lagrangian.GridInterpolator:
+    return semi_lagrangian.GridInterpolator(
+        self.coords.horizontal, self.interpolation_order
+    )
+
+  @property
+  def _planetary_rotation_rate(self) -> float | None:
+    if self.coriolis_mode == 'planetary_momentum':
+      return self.physics_specs.angular_velocity
+    return None
+
+  def explicit_terms(self, state: State) -> State:
+    """Computes non-advective explicit tendencies ("N")."""
+    grid = self.coords.horizontal
+    # Pressure gradients from other layers and orography; the own-layer
+    # potential gradient is the implicit term.
+    p = einsum('ab,...bml->...aml', self.density_ratios, state.potential)
+    if self.orography is not None:
+      p = p + self.orography
+    explicit_vorticity = jnp.zeros_like(state.vorticity)
+    explicit_divergence = -grid.laplacian(p)
+    if self.coriolis_mode == 'explicit':
+      u = jnp.stack(
+          spherical_harmonic.get_cos_lat_vector(
+              state.vorticity, state.divergence, grid
+          )
+      )
+      nodal_u = grid.to_nodal(u)
+      nodal_b = nodal_u * self.coriolis_parameter * grid.sec2_lat
+      b = grid.to_modal(nodal_b)
+      explicit_vorticity = explicit_vorticity - grid.div_cos_lat(b)
+      explicit_divergence = explicit_divergence + grid.curl_cos_lat(b)
+    # DΦ'/Dt = -Φ'δ - Φ_ref δ; the first term is the explicit source and the
+    # second is the implicit term.
+    nodal_divergence = grid.to_nodal(state.divergence)
+    nodal_potential = grid.to_nodal(state.potential)
+    explicit_potential = -grid.to_modal(nodal_potential * nodal_divergence)
+    return grid.clip_wavenumbers(
+        State(explicit_vorticity, explicit_divergence, explicit_potential)
+    )
+
+  def nodal_velocities(self, state: State) -> tuple[Array, Array]:
+    return spherical_harmonic.vor_div_to_uv_nodal(
+        self.coords.horizontal, state.vorticity, state.divergence, clip=False
+    )
+
+  def departure_points(
+      self, velocities: tuple[Array, Array], dt: float
+  ) -> semi_lagrangian.DeparturePoints:
+    u, v = velocities
+    return semi_lagrangian.horizontal_departure_points(
+        u, v, self.coords.horizontal, dt=dt
+    )
+
+  def semi_lagrangian_transport(
+      self, bracket: State, departure: semi_lagrangian.DeparturePoints
+  ) -> State:
+    grid = self.coords.horizontal
+    interpolator = self._interpolator
+    u, v = spherical_harmonic.vor_div_to_uv_nodal(
+        grid, bracket.vorticity, bracket.divergence, clip=False
+    )
+    u, v = semi_lagrangian.transport_wind_2d(
+        u,
+        v,
+        departure,
+        interpolator,
+        planetary_rotation_rate=self._planetary_rotation_rate,
+    )
+    nodal_potential = grid.to_nodal(bracket.potential)
+    transported_potential = semi_lagrangian.transport_scalar_2d(
+        nodal_potential, departure, interpolator
+    )
+    vorticity, divergence = spherical_harmonic.uv_nodal_to_vor_div_modal(
+        grid, u, v, clip=False
+    )
+    return grid.clip_wavenumbers(
+        State(vorticity, divergence, grid.to_modal(transported_potential))
     )
 
 

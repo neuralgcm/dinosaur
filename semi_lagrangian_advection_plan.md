@@ -808,6 +808,27 @@ Issues encountered while implementing this plan, by milestone.
   (i, j) stage pair) is a research-grade extension deferred with the §12
   roadmap.
 
+**M3b — Shallow-water SL equations.**
+
+- Implemented as `SemiLagrangianShallowWaterEquations` subclassing the
+  Eulerian class (implicit terms/inverse inherited) — and used to de-risk
+  the advected-planetary-momentum Coriolis treatment ahead of M4:
+  `transport_wind`/`transport_wind_2d` gained a `planetary_rotation_rate`
+  option that adds the analytic `2Ω✕R` at the departure point and removes
+  it at arrival, so only the relative wind is interpolated. Derivation
+  pinned in the code: the horizontal projection of `2Ω✕v` is exactly
+  `f k✕v`, so the covariant (parallel-transport) advection of `v + 2Ω✕R`
+  has no Coriolis force.
+- The plan's promised de-risk delivered: on the steady geostrophic flow at
+  T42, the Eulerian `imex_rk_sil3` core goes non-finite at Δt = 0.4
+  (nondimensional; ~8✕ its stable step), while the SL core remains steady
+  to l2 ≈ 3e-3 over 50 such steps. Both Coriolis modes hold the steady
+  state to l2 < 1e-4 at moderate Δt.
+- SL-vs-Eulerian differences on the barotropic-instability flow plateau at
+  the interpolation-error floor (~5e-4 potential l2) rather than shrinking
+  with Δt — the §9.6 bounded-window behavior, so the consistency test pins
+  closeness at fixed Δt instead of asserting convergence.
+
 **M2 — Passive transport validation.**
 
 - The dominant error in long passive-advection runs is accumulated per-remap

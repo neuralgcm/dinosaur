@@ -40,6 +40,7 @@ from dinosaur import shallow_water_states
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
 from dinosaur import units
+from dinosaur import xarray_utils
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -308,6 +309,141 @@ class ShallowWaterTest(parameterized.TestCase):
         grid, trajectory.potential, mean_potential, nondim_densities
     )
     np.testing.assert_allclose(masses, initial_mass, rtol=1e-6)
+
+
+class SemiLagrangianShallowWaterTest(parameterized.TestCase):
+  """Tests for the semi-Lagrangian shallow water equations."""
+
+  def _coords(self):
+    # T42 rather than `with_wavenumbers` because cross-pole halos require an
+    # even number of longitude nodes.
+    return coordinate_systems.CoordinateSystem(
+        spherical_harmonic.Grid.T42(), layer_coordinates.LayerCoordinates(1)
+    )
+
+  def _steady_state_setup(self, coriolis_mode):
+    coords = self._coords()
+    grid = coords.horizontal
+    physics_specs = units.SimUnits.from_si()
+    densities = np.ones(1)
+    mean_potential = np.ones(1) / 10
+    equation = shallow_water.SemiLagrangianShallowWaterEquations(
+        coords,
+        physics_specs,
+        None,
+        mean_potential,
+        densities=densities,
+        coriolis_mode=coriolis_mode,
+    )
+    lat = np.arccos(grid.cos_lat)
+    velocity = jnp.stack([np.cos(3 * lat) / 5])
+    initial_state = shallow_water_states.multi_layer(
+        velocity, densities, coords
+    )
+    return equation, initial_state
+
+  def _potential_l2_error(self, grid, state, reference):
+    potential = grid.to_nodal(state.potential)
+    reference = grid.to_nodal(reference.potential)
+    return float(
+        np.sqrt(
+            np.square(potential - reference).sum() / np.square(reference).sum()
+        )
+    )
+
+  @parameterized.parameters(
+      dict(coriolis_mode='planetary_momentum'),
+      dict(coriolis_mode='explicit'),
+  )
+  def test_steady_state_geostrophic_flow(self, coriolis_mode):
+    """Williamson case 2 analog: geostrophic flow remains steady."""
+    equation, initial_state = self._steady_state_setup(coriolis_mode)
+    grid = equation.coords.horizontal
+    dt = 0.01
+    step_fn = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+    )
+    final = time_integration.repeated(step_fn, 300)(initial_state)
+    # measured l2 error ~6e-5 for both Coriolis modes.
+    self.assertLess(self._potential_l2_error(grid, final, initial_state), 5e-4)
+
+  def test_large_time_step_stability(self):
+    """SL stays stable and accurate at time steps where the Eulerian core
+    blows up."""
+    equation, initial_state = self._steady_state_setup('planetary_momentum')
+    coords = equation.coords
+    grid = coords.horizontal
+    physics_specs = equation.physics_specs
+    eulerian = shallow_water.ShallowWaterEquations(
+        coords,
+        physics_specs,
+        None,
+        equation.reference_potential,
+        densities=equation.densities,
+    )
+    dt = 0.4  # ~8x the largest stable Eulerian step for this configuration
+    steps = 50
+    sl_final = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+        ),
+        steps,
+    )(initial_state)
+    eulerian_final = time_integration.repeated(
+        jax.jit(time_integration.imex_rk_sil3(eulerian, dt)), steps
+    )(initial_state)
+    with self.subTest('Eulerian core is unstable at this time step'):
+      self.assertFalse(
+          np.isfinite(np.asarray(eulerian_final.potential)).all()
+      )
+    with self.subTest('semi-Lagrangian core remains steady'):
+      error = self._potential_l2_error(grid, sl_final, initial_state)
+      self.assertTrue(np.isfinite(np.asarray(sl_final.potential)).all())
+      self.assertLess(error, 0.01)  # measured ~3e-3
+
+  def test_consistency_with_eulerian_core(self):
+    """SL and Eulerian cores track each other on an unsteady flow."""
+    coords = self._coords()
+    grid = coords.horizontal
+    physics_specs = units.SimUnits.from_si()
+    state_fn, aux_features = shallow_water_states.barotropic_instability_tc(
+        coords, physics_specs
+    )
+    initial_state = state_fn(jax.random.PRNGKey(0))
+    reference_potential = aux_features[xarray_utils.REF_POTENTIAL_KEY]
+    densities = np.ones(1)
+    sl_equation = shallow_water.SemiLagrangianShallowWaterEquations(
+        coords, physics_specs, None, reference_potential, densities=densities
+    )
+    eulerian = shallow_water.ShallowWaterEquations(
+        coords, physics_specs, None, reference_potential, densities=densities
+    )
+    dt = 0.01
+    steps = 100
+    sl_final = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(
+                sl_equation, dt
+            )
+        ),
+        steps,
+    )(initial_state)
+    eulerian_final = time_integration.repeated(
+        jax.jit(time_integration.imex_rk_sil3(eulerian, dt)), steps
+    )(initial_state)
+    # The differences plateau at the SL interpolation-error floor rather than
+    # shrinking indefinitely with dt (see plan §9.6); measured values are
+    # ~5e-4 (potential) and ~6e-3 (vorticity) across dt in [0.005, 0.02].
+    self.assertLess(
+        self._potential_l2_error(grid, sl_final, eulerian_final), 2e-3
+    )
+    vorticity_sl = grid.to_nodal(sl_final.vorticity)
+    vorticity_eu = grid.to_nodal(eulerian_final.vorticity)
+    vorticity_error = np.sqrt(
+        np.square(vorticity_sl - vorticity_eu).sum()
+        / np.square(vorticity_eu).sum()
+    )
+    self.assertLess(float(vorticity_error), 2e-2)
 
 
 if __name__ == '__main__':
