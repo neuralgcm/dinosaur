@@ -808,6 +808,26 @@ Issues encountered while implementing this plan, by milestone.
   (i, j) stage pair) is a research-grade extension deferred with the §12
   roadmap.
 
+**M5c — SETTLS stepper.**
+
+- Implemented per §3.6 with one documented deviation: trajectories reuse
+  the midpoint departure-point iteration with winds extrapolated to
+  `t + Δt/2` (`(3V^n − V^{n−1})/2`, the Temperton et al. 2001 form) rather
+  than Hortal's endpoint-form iteration, so the equation interface is
+  consumed verbatim (one wind pytree per departure solve). The RHS follows
+  SETTLS exactly (`2N^n − N^{n−1}` riding from departure, `N^n` at
+  arrival).
+- Step state is a `(x, (N_prev, V_prev))` tuple with an RK2 bootstrap
+  (`semi_lagrangian_settls_init`) and a `settls_step_filter` adapter, as
+  planned. Second-order convergence verified on both ring toys (including
+  the state-dependent-velocity one, which exercises the wind
+  extrapolation); on the one-day T21 baroclinic wave SETTLS tracks the RK2
+  stepper to T′ l2 < 2e-3 at half the per-step cost.
+- Scope notes: the notebook deliverable mentioned in §10 was not produced
+  (docstrings + this section carry the documentation); the wall-clock and
+  full 3-6✕ Δt study remain deferred to GPU/TPU hardware as discussed
+  under M4.
+
 **M5 / M5b — Moist terms, tracers, gradients, nodal storage.**
 
 - Moisture needed no new physics code: the M0 split already classifies the

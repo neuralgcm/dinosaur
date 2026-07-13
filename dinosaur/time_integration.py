@@ -261,6 +261,116 @@ def semi_lagrangian_crank_nicolson_rk2(
   return step_fn
 
 
+def semi_lagrangian_settls(
+    equation: SemiLagrangianImplicitExplicitODE,
+    time_step: float,
+) -> TimeStepFn:
+  """Two-time-level SETTLS semi-Lagrangian stepper.
+
+  The Stable Extrapolation Two-Time-Level Scheme (Hortal 2002), the
+  configuration used operationally by ECMWF's IFS. Instead of recomputing
+  tendencies with a predictor (as `semi_lagrangian_crank_nicolson_rk2`
+  does), it carries the previous step's non-advective tendencies and
+  velocities and uses the stable two-term extrapolation:
+
+    x' = G⁻¹(T_D[x + (dt/2)·(L(x) + 2N(x) − N_prev)] + (dt/2)·N(x), dt/2)
+
+  halving the per-step cost — one tendency evaluation, one departure solve,
+  one transport, one implicit solve — at the price of multistep memory and
+  the residual extrapolation sensitivity that SETTLS manages but does not
+  eliminate.
+
+  Trajectories use the midpoint iteration of `departure_points` with winds
+  extrapolated to `t + dt/2` (`(3·V(x) − V_prev)/2`, as in Temperton et al.
+  2001), rather than Hortal's endpoint-form iteration, so the equation
+  interface is reused verbatim.
+
+  The step state is a tuple `(x, (N_prev, V_prev))`; build the initial tuple
+  with `semi_lagrangian_settls_init` (a self-starting RK2 bootstrap), and
+  adapt modal filters with `settls_step_filter`.
+
+  Args:
+    equation: equation to solve.
+    time_step: time step.
+
+  Returns:
+    Function mapping `(x, aux)` to the next `(x, aux)`.
+
+  References:
+    Hortal, M. The development and testing of a new two-time-level
+    semi-Lagrangian scheme (SETTLS) in the ECMWF forecast model.
+    Q. J. R. Meteorol. Soc. 128, 1671-1687 (2002).
+  """
+  dt = time_step
+
+  def step_fn(carry):
+    x, (n_prev, v_prev) = carry
+    n = equation.explicit_terms(x)
+    l = equation.implicit_terms(x)
+    v = equation.nodal_velocities(x)
+    v_mid = tree_map(lambda a, b: 1.5 * a - 0.5 * b, v, v_prev)
+    departure = equation.departure_points(v_mid, dt)
+    bracket = tree_map(
+        lambda xi, li, ni, pi: xi + 0.5 * dt * (li + 2 * ni - pi),
+        x,
+        l,
+        n,
+        n_prev,
+    )
+    transported = equation.semi_lagrangian_transport(bracket, departure)
+    combined = tree_map(lambda t, ni: t + 0.5 * dt * ni, transported, n)
+    x_next = equation.implicit_inverse(combined, 0.5 * dt)
+    return (x_next, (n, v))
+
+  return step_fn
+
+
+def semi_lagrangian_settls_init(
+    equation: SemiLagrangianImplicitExplicitODE,
+    time_step: float,
+) -> TimeStepFn:
+  """Returns a function building the initial SETTLS step state.
+
+  Takes the first step with the self-starting
+  `semi_lagrangian_crank_nicolson_rk2` while recording the initial
+  tendencies and velocities, so no accuracy-degraded startup step is needed.
+
+  Args:
+    equation: equation to solve.
+    time_step: time step.
+
+  Returns:
+    Function mapping an initial state `x0` to the `(x1, (N(x0), V(x0)))`
+    tuple consumed by `semi_lagrangian_settls`.
+  """
+  rk2_step = semi_lagrangian_crank_nicolson_rk2(equation, time_step)
+
+  def init_fn(x0):
+    n0 = equation.explicit_terms(x0)
+    v0 = equation.nodal_velocities(x0)
+    return (rk2_step(x0), (n0, v0))
+
+  return init_fn
+
+
+def settls_step_filter(
+    state_filter: PyTreeStepFilterFn,
+) -> PyTreeStepFilterFn:
+  """Adapts a step filter to the `(x, aux)` step state of SETTLS.
+
+  The filter is applied to the state only; the carried tendencies and
+  velocities pass through unmodified (they are consumed once, at the next
+  step, and filtering them would double-filter the corresponding terms).
+  """
+
+  def _filter(u, u_next):
+    x_previous, _ = u
+    x, aux = u_next
+    return (state_filter(x_previous, x), aux)
+
+  return _filter
+
+
 @dataclasses.dataclass
 class TimeReversedImExODE(ImplicitExplicitODE):
   """An ImplicitExplicitODE reversed in time.

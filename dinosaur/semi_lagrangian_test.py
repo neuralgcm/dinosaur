@@ -888,6 +888,62 @@ class SemiLagrangianSteppersTest(X64TestCase):
       self.assertGreater(order, 1.7)
       self.assertLess(order, 2.4)
 
+  def test_settls_second_order_convergence(self):
+    """SETTLS with the RK2 bootstrap converges at second order."""
+    equation = _RingAdvectionODE(num_points=64, omega=1.3, gamma=0.7)
+    state0 = jnp.sin(2 * equation.theta) + 0.5
+    total_time = 1.0
+    exact = equation.exact_solution(state0, total_time)
+
+    def global_error(num_steps):
+      dt = total_time / num_steps
+      init_fn = time_integration.semi_lagrangian_settls_init(equation, dt)
+      step_fn = jax.jit(time_integration.semi_lagrangian_settls(equation, dt))
+      carry = time_integration.repeated(step_fn, num_steps - 1)(init_fn(state0))
+      return np.abs(np.asarray(carry[0]) - exact).max()
+
+    errors = [global_error(n) for n in [8, 16, 32]]
+    orders = [np.log2(errors[i] / errors[i + 1]) for i in range(2)]
+    for order in orders:
+      self.assertGreater(order, 1.7)
+      self.assertLess(order, 2.4)
+
+  def test_settls_second_order_convergence_state_dependent_velocity(self):
+    """SETTLS wind extrapolation is second order for evolving flows."""
+    equation = _StateDependentRingODE(
+        num_points=64, omega=1.1, gamma=0.4, coupling=2.0
+    )
+    state0 = jnp.sin(2 * equation.theta) + 0.8
+    total_time = 1.0
+
+    def solve(num_steps):
+      dt = total_time / num_steps
+      init_fn = time_integration.semi_lagrangian_settls_init(equation, dt)
+      step_fn = jax.jit(time_integration.semi_lagrangian_settls(equation, dt))
+      carry = time_integration.repeated(step_fn, num_steps - 1)(init_fn(state0))
+      return carry[0]
+
+    reference = np.asarray(solve(512))
+    errors = [
+        np.abs(np.asarray(solve(n)) - reference).max() for n in [8, 16, 32]
+    ]
+    orders = [np.log2(errors[i] / errors[i + 1]) for i in range(2)]
+    for order in orders:
+      self.assertGreater(order, 1.7)
+      self.assertLess(order, 2.4)
+
+  def test_settls_step_filter(self):
+    equation = _RingAdvectionODE(num_points=16, omega=1.0, gamma=0.5)
+    state = jnp.sin(equation.theta)
+    aux = (jnp.zeros_like(state), jnp.zeros(()))
+    base_filter = time_integration.runge_kutta_step_filter(lambda x: 0.5 * x)
+    settls_filter = time_integration.settls_step_filter(base_filter)
+    filtered_state, filtered_aux = settls_filter(
+        (state, aux), (state, aux)
+    )
+    np.testing.assert_allclose(filtered_state, 0.5 * state)
+    jax.tree.map(np.testing.assert_array_equal, filtered_aux, aux)
+
   def test_off_centering(self):
     equation = _RingAdvectionODE(num_points=64, omega=1.3, gamma=0.7)
     state0 = jnp.sin(2 * equation.theta) + 0.5

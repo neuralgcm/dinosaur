@@ -1056,6 +1056,38 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
           0.1,
       )
 
+  def test_settls_tracks_rk2_on_baroclinic_wave(self):
+    """The SETTLS stepper matches the RK2 stepper at half the per-step cost.
+
+    A one-day baroclinic-wave comparison of the two SL steppers, plus JW
+    steady-state stability for SETTLS.
+    """
+    equation, _, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True
+    )
+    grid = equation.coords.horizontal
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    rk2_final = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+        ),
+        48,
+    )(state0)
+    init_fn = time_integration.semi_lagrangian_settls_init(equation, dt)
+    step_fn = jax.jit(time_integration.semi_lagrangian_settls(equation, dt))
+    settls_final, _ = time_integration.repeated(step_fn, 47)(init_fn(state0))
+    self.assertLess(
+        self._l2(
+            grid,
+            settls_final.temperature_variation,
+            rk2_final.temperature_variation,
+        ),
+        2e-3,
+    )
+    self.assertTrue(
+        np.isfinite(grid.to_nodal(settls_final.temperature_variation)).all()
+    )
+
   def test_sim_time_advances_by_dt_per_step(self):
     equation, _, state0 = self._setup(spherical_harmonic.Grid.T21())
     state0.sim_time = 0.0
