@@ -1415,62 +1415,6 @@ class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
           0.0,
       )
 
-  @parameterized.parameters(dict(stepper='rk2'), dict(stepper='settls'))
-  def test_gradients_match_finite_differences(self, stepper):
-    """jax.grad through SL steps agrees with finite differences.
-
-    Differentiates two directional derivatives — a scale on the initial
-    vorticity (through departure points and wind transport) and a scale on
-    an initial tracer (through scalar transport) — against a loss over both
-    temperature and the tracer. Runs in float64 (state built after enabling
-    x64) so central differences resolve the gradient well below the
-    comparison tolerance; setUp/tearDown restore the float32 default.
-    """
-    jax.config.update('jax_enable_x64', True)
-    equation, state0, _, _ = self._setup(layers=4)
-    physics_specs = equation.physics_specs
-    state0.tracers = {
-        'tracer': primitive_equations_states.gaussian_scalar(
-            coords=equation.coords, physics_specs=physics_specs
-        )
-    }
-    dt = self._nondim_minutes(physics_specs, 30)
-    if stepper == 'rk2':
-      step_fn = time_integration.semi_lagrangian_crank_nicolson_rk2(
-          equation, dt
-      )
-      advance = lambda state: step_fn(step_fn(state))
-    else:
-      init_fn = time_integration.semi_lagrangian_settls_init(equation, dt)
-      settls_fn = time_integration.semi_lagrangian_settls(equation, dt)
-      advance = lambda state: settls_fn(init_fn(state))[0]
-
-    @jax.jit
-    def loss(scales):
-      vorticity_scale, tracer_scale = scales
-      state = state0.replace(
-          vorticity=vorticity_scale * state0.vorticity,
-          tracers={'tracer': tracer_scale * state0.tracers['tracer']},
-      )
-      out = advance(state)
-      return jnp.sum(out.temperature_variation**2) + jnp.sum(
-          out.tracers['tracer'] ** 2
-      )
-
-    ones = jnp.asarray([1.0, 1.0])
-    gradient = np.asarray(jax.grad(loss)(ones))
-    epsilon = 1e-4
-    for direction in range(2):
-      unit = jnp.zeros(2).at[direction].set(1.0)
-      finite_difference = float(
-          (loss(ones + epsilon * unit) - loss(ones - epsilon * unit))
-          / (2 * epsilon)
-      )
-      np.testing.assert_allclose(
-          gradient[direction], finite_difference, rtol=1e-4,
-          err_msg=f'{direction=}',
-      )
-
   def test_held_suarez_composition(self):
     """compose_equations preserves the SL interface; a forced run is stable."""
     equation, state0, ref_temps, _ = self._setup()

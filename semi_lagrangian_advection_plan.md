@@ -833,6 +833,17 @@ Issues encountered while implementing this plan, by milestone.
   jax x64 globally at import time, so full-suite runs execute later tests
   in float64. The instability-onset and threshold-calibrated SL test
   classes now pin float32 in setUp.
+- Test organization: JAX only handles the x64 flag reliably when it is set
+  once at startup, so per-test toggling was removed. All float64 tests
+  (convergence-order measurements, departure/transport exactness against
+  analytic rotations, and the gradient/finite-difference comparisons) live
+  in a dedicated `semi_lagrangian_x64_test.py` that enables x64 at import
+  time, following the existing `time_integration_test.py` convention;
+  `semi_lagrangian_test.py` keeps the dtype-agnostic unit tests. Every
+  validation claim in this section is backed by a committed test; the only
+  command-line-only runs were mutation checks (verifying that committed
+  tests discriminate against seeded bugs) and threshold-calibration runs
+  whose measured values are recorded in test comments.
 - Per user instruction, the branch is left local — no PR was created. A
   draft PR description exists in the session scratchpad.
 
