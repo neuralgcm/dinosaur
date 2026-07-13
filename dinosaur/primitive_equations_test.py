@@ -911,6 +911,180 @@ class ExplicitTermsSplitTest(parameterized.TestCase):
         )
 
 
+class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
+  """Tests for the semi-Lagrangian primitive equations (dry, sigma)."""
+
+  def _setup(self, grid, layers=8, perturbation=False, **kwargs):
+    physics_specs = units.SimUnits.from_si()
+    vertical = sigma_coordinates.SigmaCoordinates.equidistant(layers)
+    coords = coordinate_systems.CoordinateSystem(grid, vertical)
+    init_fn, aux_features = primitive_equations_states.steady_state_jw(
+        coords, physics_specs
+    )
+    state = init_fn()
+    if perturbation:
+      state = state + primitive_equations_states.baroclinic_perturbation_jw(
+          coords, physics_specs
+      )
+    orography = primitive_equations.truncated_modal_orography(
+        aux_features[xarray_utils.OROGRAPHY], coords
+    )
+    ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
+    equation = primitive_equations.SemiLagrangianPrimitiveEquations(
+        ref_temps, orography, coords, physics_specs, **kwargs
+    )
+    eulerian = primitive_equations.PrimitiveEquationsSigma(
+        ref_temps, orography, coords, physics_specs
+    )
+    return equation, eulerian, state
+
+  def _nondim_minutes(self, physics_specs, minutes):
+    return float(physics_specs.nondimensionalize(minutes * 60 * s_units.s))
+
+  def _l2(self, grid, x, y):
+    x, y = grid.to_nodal(x), grid.to_nodal(y)
+    return float(np.sqrt(np.square(x - y).sum() / np.square(y).sum()))
+
+  @parameterized.parameters(
+      dict(coriolis_mode='planetary_momentum'),
+      dict(coriolis_mode='explicit'),
+  )
+  def test_jw_steady_state_remains_steady(self, coriolis_mode):
+    """The JW steady state stays steady over a day of 30-minute steps.
+
+    This is a sensitive test of the vector transport + pressure-gradient
+    residual split: any misclassified momentum term unbalances the jet.
+    """
+    equation, eulerian, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), coriolis_mode=coriolis_mode
+    )
+    del eulerian  # unused
+    grid = equation.coords.horizontal
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    step_fn = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+    )
+    final = time_integration.repeated(step_fn, 48)(state0)
+    # measured drift ~1.1e-3, comparable to the Eulerian core at dt=10min
+    # (1.3e-3); dominated by the T21 spatial truncation of the initial
+    # balance, not by time stepping.
+    self.assertLess(
+        self._l2(
+            grid, final.temperature_variation, state0.temperature_variation
+        ),
+        3e-3,
+    )
+    max_divergence = np.abs(grid.to_nodal(final.divergence)).max()
+    self.assertLess(float(max_divergence), 2e-2)
+
+  def test_baroclinic_wave_consistency_with_eulerian(self):
+    """SL at dt=30min tracks the Eulerian core at dt=10min."""
+    equation, eulerian, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True
+    )
+    grid = equation.coords.horizontal
+    physics_specs = equation.physics_specs
+    sl_final = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(
+                equation, self._nondim_minutes(physics_specs, 30)
+            )
+        ),
+        48,
+    )(state0)
+    eulerian_final = time_integration.repeated(
+        jax.jit(
+            time_integration.imex_rk_sil3(
+                eulerian, self._nondim_minutes(physics_specs, 10)
+            )
+        ),
+        144,
+    )(state0)
+    # measured: T' 1.2e-3, ln(ps) 3.3e-6.
+    self.assertLess(
+        self._l2(
+            grid,
+            sl_final.temperature_variation,
+            eulerian_final.temperature_variation,
+        ),
+        5e-3,
+    )
+    self.assertLess(
+        self._l2(
+            grid,
+            sl_final.log_surface_pressure,
+            eulerian_final.log_surface_pressure,
+        ),
+        1e-4,
+    )
+
+  def test_time_step_extension(self):
+    """SL remains stable at time steps where the Eulerian core blows up."""
+    equation, eulerian, state0 = self._setup(spherical_harmonic.Grid.T42())
+    grid = equation.coords.horizontal
+    dt = self._nondim_minutes(equation.physics_specs, 180)
+    steps = 16  # two simulated days
+    sl_final = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+        ),
+        steps,
+    )(state0)
+    eulerian_final = time_integration.repeated(
+        jax.jit(time_integration.imex_rk_sil3(eulerian, dt)), steps
+    )(state0)
+    with self.subTest('Eulerian core is unstable at this time step'):
+      self.assertFalse(
+          np.isfinite(
+              grid.to_nodal(eulerian_final.temperature_variation)
+          ).all()
+      )
+    with self.subTest('semi-Lagrangian core remains stable'):
+      # measured drift 0.067: accuracy degrades at this step (the departure
+      # iteration approaches its convergence margin dt·max‖∇V‖ < 1, plan §5)
+      # but the solution remains bounded and qualitatively steady where the
+      # Eulerian core is NaN.
+      temperature = grid.to_nodal(sl_final.temperature_variation)
+      self.assertTrue(np.isfinite(temperature).all())
+      self.assertLess(
+          self._l2(
+              grid,
+              sl_final.temperature_variation,
+              state0.temperature_variation,
+          ),
+          0.1,
+      )
+
+  def test_sim_time_advances_by_dt_per_step(self):
+    equation, _, state0 = self._setup(spherical_harmonic.Grid.T21())
+    state0.sim_time = 0.0
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    step_fn = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+    )
+    state = step_fn(step_fn(state0))
+    np.testing.assert_allclose(state.sim_time, 2 * dt, rtol=1e-6)
+
+  def test_transport_preserves_constant_tracer(self):
+    """A spatially constant tracer must remain constant under transport."""
+    equation, _, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True
+    )
+    grid = equation.coords.horizontal
+    ones = jnp.zeros_like(state0.temperature_variation)
+    ones = spherical_harmonic.add_constant(ones, 1.0)
+    state0.tracers = {'constant': ones}
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    step_fn = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+    )
+    final = time_integration.repeated(step_fn, 4)(state0)
+    nodal_tracer = grid.to_nodal(final.tracers['constant'])
+    np.testing.assert_allclose(
+        nodal_tracer, np.ones_like(nodal_tracer), rtol=1e-4
+    )
+
+
 def interpolate_state_hybrid_to_sigma(
     state_hybrid: primitive_equations.State,
     coords_hybrid: coordinate_systems.CoordinateSystem,

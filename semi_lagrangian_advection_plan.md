@@ -808,6 +808,29 @@ Issues encountered while implementing this plan, by milestone.
   (i, j) stage pair) is a research-grade extension deferred with the §12
   roadmap.
 
+**M4 — `SemiLagrangianPrimitiveEquations` (dry, sigma).**
+
+- Worked essentially on first assembly thanks to the earlier de-risking: on
+  the JW steady state at T21/L8 with Δt = 30 min, both Coriolis modes hold
+  the jet with T′ drift 1.1e-3 over one day — comparable to the Eulerian
+  core at Δt = 10 min (1.3e-3, dominated by spatial truncation of the
+  initial balance in both cases). The baroclinic wave tracks the Eulerian
+  core to T′ l2 ≈ 1.2e-3 after one day.
+- Δt extension measured at T42/L8 on the steady state (CPU-affordable
+  scope): the Eulerian `imex_rk_sil3` core hits its spectral advective
+  stability limit almost exactly where `u·k_max·Δt = √3` predicts
+  (stable at 2.5 h, NaN at 3 h over two days), while SL at 3 h stays
+  bounded with T′ drift 6.7% — degraded accuracy, consistent with the §5
+  trajectory-convergence margin (`Δt·max‖∇V‖` ≈ 0.5-0.8 there), and
+  unaffected by modal filtering (the error is large-scale, not spectral
+  noise). The gentle JW jet at coarse CPU resolutions cannot showcase the
+  3-6✕ headline (stronger jets/finer grids are where Eulerian Δt collapses
+  and SL does not); that study remains with the deferred GPU/TPU work
+  (§9.8).
+- `explicit_nonadvective_terms` gained an `include_coriolis` flag so the
+  planetary-momentum mode can drop Coriolis from N without duplicating the
+  method.
+
 **M3b — Shallow-water SL equations.**
 
 - Implemented as `SemiLagrangianShallowWaterEquations` subclassing the

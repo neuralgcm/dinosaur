@@ -24,6 +24,7 @@ from dinosaur import coordinate_systems
 from dinosaur import hybrid_coordinates
 from dinosaur import jax_numpy_utils
 from dinosaur import scales
+from dinosaur import semi_lagrangian
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
@@ -1333,7 +1334,9 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
     return self.coords.horizontal.clip_wavenumbers(tendency)
 
   @jax.named_call
-  def explicit_nonadvective_terms(self, state: State) -> State:
+  def explicit_nonadvective_terms(
+      self, state: State, *, include_coriolis: bool = True
+  ) -> State:
     """Computes the non-advective part of the explicit tendencies.
 
     See `explicit_advective_terms` for the decomposition. The non-advective
@@ -1346,6 +1349,9 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
 
     Args:
       state: the (modal) state from which to compute tendencies.
+      include_coriolis: whether to include the Coriolis term. Semi-Lagrangian
+        solvers that transport planetary momentum (`v + 2Ω✕R`) absorb the
+        Coriolis force into transport and exclude it here.
 
     Returns:
       A `State` of non-advective explicit tendencies.
@@ -1354,6 +1360,7 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
     vorticity_dot, divergence_dot = self.curl_and_div_tendencies(
         aux_state,
         include_vorticity_advection=False,
+        include_coriolis=include_coriolis,
         include_vertical_advection=False,
     )
     orography_tendency = self.orography_tendency()
@@ -1678,6 +1685,151 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
         inverted_tracers,
         sim_time=state.sim_time,  # pyrefly: ignore[unexpected-keyword]
     )
+
+
+@dataclasses.dataclass
+class SemiLagrangianPrimitiveEquations(
+    PrimitiveEquationsSigma,
+    time_integration.SemiLagrangianImplicitExplicitODE,
+):
+  """Primitive equations on sigma coordinates in semi-Lagrangian form.
+
+  The state layout (modal vorticity, divergence, T', log surface pressure and
+  tracers) and the implicit terms/inverse are unchanged from
+  `PrimitiveEquationsSigma`, so this class plugs into
+  `time_integration.semi_lagrangian_crank_nicolson_rk2`. All advection is
+  handled by trajectories:
+
+  - momentum is transported as grid-point winds along 3-D trajectories
+    (converted from/to modal vorticity and divergence at the transport
+    boundaries),
+  - T' and tracers are transported as scalars along 3-D trajectories,
+  - log surface pressure is transported along horizontal trajectories of the
+    vertically averaged wind, which is exact for the continuity equation
+    (`∫v·∇ln(pₛ)dσ = v̄·∇ln(pₛ)` since `ln(pₛ)` is independent of σ),
+
+  and `explicit_terms` returns only the non-advective forcing
+  (`explicit_nonadvective_terms`).
+
+  Attributes:
+    coriolis_mode: 'planetary_momentum' (default) transports the planetary
+      momentum `v + 2Ω✕R`, which obeys a momentum equation with no Coriolis
+      force — the standard configuration for long time steps (IFS's LADVF).
+      'explicit' keeps `f (k✕v)` as an explicit tendency, which is only
+      suitable for small `f·dt` (Heun's method has no imaginary-axis
+      stability, amplifying inertial modes by ~(f·dt)⁴/8 per step).
+    interpolation_order: horizontal interpolation order for transported
+      fields ('cubic' or 'linear'); trajectories always use linear
+      interpolation. Vertical interpolation is linear in σ.
+    monotone_tracers: names of tracers transported with the quasi-monotone
+      limiter, which prevents new extrema (and preserves positivity) at the
+      cost of formal accuracy at extrema. Dynamical fields are never limited.
+  """
+
+  coriolis_mode: str = dataclasses.field(
+      default='planetary_momentum', kw_only=True
+  )
+  interpolation_order: str = dataclasses.field(default='cubic', kw_only=True)
+  monotone_tracers: tuple[str, ...] = dataclasses.field(
+      default=(), kw_only=True
+  )
+
+  def __post_init__(self):
+    super().__post_init__()
+    if self.coriolis_mode not in ('planetary_momentum', 'explicit'):
+      raise ValueError(f'unknown {self.coriolis_mode=}')
+
+  @property
+  def _planetary_rotation_rate(self) -> float | None:
+    if self.coriolis_mode == 'planetary_momentum':
+      return self.physics_specs.angular_velocity
+    return None
+
+  @jax.named_call
+  def explicit_terms(self, state: State) -> State:
+    """Computes non-advective explicit tendencies ("N")."""
+    return self.explicit_nonadvective_terms(
+        state, include_coriolis=self.coriolis_mode == 'explicit'
+    )
+
+  @jax.named_call
+  def departure_points(
+      self, velocities: NodalVelocities, dt: float
+  ) -> dict[str, semi_lagrangian.DeparturePoints]:
+    """Solves for 3-D departure points and 2-D ones for `ln(pₛ)`."""
+    return {
+        '3d': semi_lagrangian.departure_points_3d(
+            velocities.u, velocities.v, velocities.sigma_dot, self.coords, dt
+        ),
+        '2d': semi_lagrangian.horizontal_departure_points(
+            velocities.u_mean,
+            velocities.v_mean,
+            self.coords.horizontal,
+            dt,
+        ),
+    }
+
+  @jax.named_call
+  def semi_lagrangian_transport(
+      self,
+      bracket: State,
+      departure: dict[str, semi_lagrangian.DeparturePoints],
+  ) -> State:
+    """Remaps the advected representation of a modal state-like pytree."""
+    grid = self.coords.horizontal
+    vertical = self.coords.vertical
+    interpolator = semi_lagrangian.GridInterpolator(
+        grid, self.interpolation_order
+    )
+    u, v = spherical_harmonic.vor_div_to_uv_nodal(
+        grid, bracket.vorticity, bracket.divergence, clip=False
+    )
+    u, v = semi_lagrangian.transport_wind(
+        u,
+        v,
+        departure['3d'],
+        vertical,
+        interpolator,
+        planetary_rotation_rate=self._planetary_rotation_rate,
+    )
+    vorticity, divergence = spherical_harmonic.uv_nodal_to_vor_div_modal(
+        grid, u, v, clip=False
+    )
+    temperature_variation = semi_lagrangian.transport_scalar(
+        grid.to_nodal(bracket.temperature_variation),
+        departure['3d'],
+        vertical,
+        interpolator,
+    )
+    log_surface_pressure = semi_lagrangian.transport_scalar_2d(
+        grid.to_nodal(bracket.log_surface_pressure),
+        departure['2d'],
+        interpolator,
+    )
+    tracers = {}
+    for name, value in bracket.tracers.items():
+      tracer_interpolator = semi_lagrangian.GridInterpolator(
+          grid,
+          self.interpolation_order,
+          monotone=name in self.monotone_tracers,
+      )
+      tracers[name] = grid.to_modal(
+          semi_lagrangian.transport_scalar(
+              grid.to_nodal(value),
+              departure['3d'],
+              vertical,
+              tracer_interpolator,
+          )
+      )
+    transported = State(
+        vorticity=vorticity,
+        divergence=divergence,
+        temperature_variation=grid.to_modal(temperature_variation),
+        log_surface_pressure=grid.to_modal(log_surface_pressure),
+        tracers=tracers,
+        sim_time=bracket.sim_time,
+    )
+    return grid.clip_wavenumbers(transported)
 
 
 ################################################################################
