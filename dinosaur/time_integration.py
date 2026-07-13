@@ -335,6 +335,11 @@ def semi_lagrangian_settls_init(
   `semi_lagrangian_crank_nicolson_rk2` while recording the initial
   tendencies and velocities, so no accuracy-degraded startup step is needed.
 
+  The bootstrap step is unfiltered: in pipelines that wrap
+  `semi_lagrangian_settls` with `step_with_filters`, apply the state filter
+  to the first element of the returned tuple manually if a filtered first
+  step matters.
+
   Args:
     equation: equation to solve.
     time_step: time step.
@@ -404,6 +409,11 @@ def compose_equations(
   the composed equation is too, delegating trajectories and transport to it:
   the explicit terms of the other equations are treated as additional
   non-advective forcing.
+
+  All equations must return tendency pytrees with matching structure. In
+  particular, forcings that construct states with empty `tracers` (e.g.
+  `HeldSuarezForcingSigma`) fail loudly when composed over states carrying
+  tracers.
   """
   implicit_explicit_eqs = list(
       filter(lambda x: isinstance(x, ImplicitExplicitODE), equations))

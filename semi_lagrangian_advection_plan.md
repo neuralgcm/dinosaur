@@ -808,6 +808,34 @@ Issues encountered while implementing this plan, by milestone.
   (i, j) stage pair) is a research-grade extension deferred with the §12
   roadmap.
 
+**Final review pass (M5/M5b/M5c) and wrap-up.**
+
+- The final adversarial review verified the SETTLS formula, bootstrap
+  history, sim_time bookkeeping, the coefficient-1 bracket invariant, and —
+  by auditing every method in the stepping path — that nodal tracers never
+  touch a spectral transform. Its main finding was a test blind spot: both
+  ring toys had state-independent forcing, so nothing pinned SETTLS's
+  defining `2N^n − N^{n−1}` extrapolation (mutants deleting or
+  time-swapping it passed everything). A state-dependent-forcing toy now
+  discriminates: correct scheme converges at order 2.0, both mutants drop
+  to ~0.9.
+- The gradient test was widened per review: both steppers (RK2 and
+  SETTLS), two directional derivatives (vorticity scale through
+  departure-point/wind-transport paths; tracer scale through scalar
+  transport), run in float64 so central differences resolve the gradient —
+  tolerance tightened from 1e-2 to 1e-4 (the original float32 test hid
+  ~1e-2 cancellation noise).
+- Documented limitations surfaced by review: `compose_equations` requires
+  structurally matching tendency pytrees (Held-Suarez forcing fails loudly
+  on states carrying tracers — pre-existing Eulerian limitation); the
+  SETTLS bootstrap step is unfiltered (documented workaround).
+- Full-suite gotcha worth knowing: several existing test modules enable
+  jax x64 globally at import time, so full-suite runs execute later tests
+  in float64. The instability-onset and threshold-calibrated SL test
+  classes now pin float32 in setUp.
+- Per user instruction, the branch is left local — no PR was created. A
+  draft PR description exists in the session scratchpad.
+
 **M5c — SETTLS stepper.**
 
 - Implemented per §3.6 with one documented deviation: trajectories reuse

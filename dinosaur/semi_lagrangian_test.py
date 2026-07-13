@@ -816,6 +816,22 @@ class _StateDependentRingODE(_RingAdvectionODE):
     return self.omega + self.coupling * jnp.mean(state)
 
 
+class _StateDependentForcingRingODE(_RingAdvectionODE):
+  """Ring advection whose non-advective forcing depends on the state.
+
+  DX/Dt = cos(θ)·(1 + c·mean(X)) − γX: exercises SETTLS's defining tendency
+  extrapolation `2N^n − N^{n−1}`, which state-independent forcings cannot
+  (they make `N^n ≡ N^{n−1}` identically).
+  """
+
+  def __init__(self, num_points, omega, gamma, coupling):
+    super().__init__(num_points, omega, gamma)
+    self.coupling = coupling
+
+  def explicit_terms(self, state):
+    return jnp.cos(self.theta) * (1 + self.coupling * jnp.mean(state))
+
+
 class SemiLagrangianSteppersTest(X64TestCase):
 
   def test_reduces_to_crank_nicolson_rk2_for_zero_velocities(self):
@@ -911,6 +927,35 @@ class SemiLagrangianSteppersTest(X64TestCase):
   def test_settls_second_order_convergence_state_dependent_velocity(self):
     """SETTLS wind extrapolation is second order for evolving flows."""
     equation = _StateDependentRingODE(
+        num_points=64, omega=1.1, gamma=0.4, coupling=2.0
+    )
+    state0 = jnp.sin(2 * equation.theta) + 0.8
+    total_time = 1.0
+
+    def solve(num_steps):
+      dt = total_time / num_steps
+      init_fn = time_integration.semi_lagrangian_settls_init(equation, dt)
+      step_fn = jax.jit(time_integration.semi_lagrangian_settls(equation, dt))
+      carry = time_integration.repeated(step_fn, num_steps - 1)(init_fn(state0))
+      return carry[0]
+
+    reference = np.asarray(solve(512))
+    errors = [
+        np.abs(np.asarray(solve(n)) - reference).max() for n in [8, 16, 32]
+    ]
+    orders = [np.log2(errors[i] / errors[i + 1]) for i in range(2)]
+    for order in orders:
+      self.assertGreater(order, 1.7)
+      self.assertLess(order, 2.4)
+
+  def test_settls_second_order_convergence_state_dependent_forcing(self):
+    """Pins SETTLS's tendency extrapolation `2N^n − N^{n−1}`.
+
+    With state-dependent forcing, dropping the extrapolation (using `N^n`
+    alone) or swapping the time levels reduces measured convergence to
+    first order; the correct scheme stays second order.
+    """
+    equation = _StateDependentForcingRingODE(
         num_points=64, omega=1.1, gamma=0.4, coupling=2.0
     )
     state0 = jnp.sin(2 * equation.theta) + 0.8

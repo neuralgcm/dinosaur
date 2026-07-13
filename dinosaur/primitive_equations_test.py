@@ -1072,12 +1072,13 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
   def test_settls_tracks_rk2_on_baroclinic_wave(self):
     """The SETTLS stepper matches the RK2 stepper at half the per-step cost.
 
-    A one-day baroclinic-wave comparison of the two SL steppers, plus JW
-    steady-state stability for SETTLS.
+    A one-day baroclinic-wave comparison of the two SL steppers, including
+    sim_time bookkeeping through the SETTLS bracket.
     """
     equation, _, state0 = self._setup(
         spherical_harmonic.Grid.T21(), perturbation=True
     )
+    state0.sim_time = 0.0
     grid = equation.coords.horizontal
     dt = self._nondim_minutes(equation.physics_specs, 30)
     rk2_final = time_integration.repeated(
@@ -1100,6 +1101,7 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
     self.assertTrue(
         np.isfinite(grid.to_nodal(settls_final.temperature_variation)).all()
     )
+    np.testing.assert_allclose(settls_final.sim_time, 48 * dt, rtol=1e-5)
 
   def test_sim_time_advances_by_dt_per_step(self):
     equation, _, state0 = self._setup(spherical_harmonic.Grid.T21())
@@ -1133,6 +1135,17 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
 
 class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
   """Moist dynamics, tracer limiting and differentiability of the SL core."""
+
+  def setUp(self):
+    # thresholds calibrated in float32; guard against the module-level x64
+    # enablement that other test files leak into full-suite runs.
+    super().setUp()
+    self._x64_was_enabled = jax.config.jax_enable_x64
+    jax.config.update('jax_enable_x64', False)
+
+  def tearDown(self):
+    jax.config.update('jax_enable_x64', self._x64_was_enabled)
+    super().tearDown()
 
   def _setup(self, layers=8, humidity=False, **kwargs):
     physics_specs = units.SimUnits.from_si()
@@ -1195,7 +1208,8 @@ class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
         time_integration.semi_lagrangian_crank_nicolson_rk2(dry, dt)
     )
     jax.tree.map(
-        lambda x, y: np.testing.assert_allclose(x, y, atol=1e-6),
+        # jitted steps differ by XLA re-association noise (measured 6e-7).
+        lambda x, y: np.testing.assert_allclose(x, y, atol=3e-6),
         step_moist(state),
         step_dry(state),
     )
@@ -1401,26 +1415,61 @@ class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
           0.0,
       )
 
-  def test_gradients_match_finite_differences(self):
-    """jax.grad through SL steps agrees with finite differences."""
+  @parameterized.parameters(dict(stepper='rk2'), dict(stepper='settls'))
+  def test_gradients_match_finite_differences(self, stepper):
+    """jax.grad through SL steps agrees with finite differences.
+
+    Differentiates two directional derivatives — a scale on the initial
+    vorticity (through departure points and wind transport) and a scale on
+    an initial tracer (through scalar transport) — against a loss over both
+    temperature and the tracer. Runs in float64 (state built after enabling
+    x64) so central differences resolve the gradient well below the
+    comparison tolerance; setUp/tearDown restore the float32 default.
+    """
+    jax.config.update('jax_enable_x64', True)
     equation, state0, _, _ = self._setup(layers=4)
-    dt = self._nondim_minutes(equation.physics_specs, 30)
-    step_fn = time_integration.semi_lagrangian_crank_nicolson_rk2(
-        equation, dt
-    )
+    physics_specs = equation.physics_specs
+    state0.tracers = {
+        'tracer': primitive_equations_states.gaussian_scalar(
+            coords=equation.coords, physics_specs=physics_specs
+        )
+    }
+    dt = self._nondim_minutes(physics_specs, 30)
+    if stepper == 'rk2':
+      step_fn = time_integration.semi_lagrangian_crank_nicolson_rk2(
+          equation, dt
+      )
+      advance = lambda state: step_fn(step_fn(state))
+    else:
+      init_fn = time_integration.semi_lagrangian_settls_init(equation, dt)
+      settls_fn = time_integration.semi_lagrangian_settls(equation, dt)
+      advance = lambda state: settls_fn(init_fn(state))[0]
 
     @jax.jit
-    def loss(scale):
-      state = state0.replace(vorticity=scale * state0.vorticity)
-      out = step_fn(step_fn(state))
-      return jnp.sum(out.temperature_variation**2)
+    def loss(scales):
+      vorticity_scale, tracer_scale = scales
+      state = state0.replace(
+          vorticity=vorticity_scale * state0.vorticity,
+          tracers={'tracer': tracer_scale * state0.tracers['tracer']},
+      )
+      out = advance(state)
+      return jnp.sum(out.temperature_variation**2) + jnp.sum(
+          out.tracers['tracer'] ** 2
+      )
 
-    gradient = float(jax.grad(loss)(1.0))
-    epsilon = 1e-3
-    finite_difference = float(
-        (loss(1.0 + epsilon) - loss(1.0 - epsilon)) / (2 * epsilon)
-    )
-    np.testing.assert_allclose(gradient, finite_difference, rtol=1e-2)
+    ones = jnp.asarray([1.0, 1.0])
+    gradient = np.asarray(jax.grad(loss)(ones))
+    epsilon = 1e-4
+    for direction in range(2):
+      unit = jnp.zeros(2).at[direction].set(1.0)
+      finite_difference = float(
+          (loss(ones + epsilon * unit) - loss(ones - epsilon * unit))
+          / (2 * epsilon)
+      )
+      np.testing.assert_allclose(
+          gradient[direction], finite_difference, rtol=1e-4,
+          err_msg=f'{direction=}',
+      )
 
   def test_held_suarez_composition(self):
     """compose_equations preserves the SL interface; a forced run is stable."""
