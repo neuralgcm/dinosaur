@@ -511,7 +511,7 @@ def interpolate_levels(
   extended = _extend_with_pole_halo(field, grid)
   extended_latitude_size = extended.shape[-1]
   # int32 indices limit the flattened size to 2**31 elements: ample for any
-  # realistic grid (the limit is ~T2000 at 137 levels).
+  # realistic grid (the limit is roughly T1700 at 137 levels).
   flat_index = (
       level_index[..., :, jnp.newaxis, jnp.newaxis] * grid.longitude_nodes
       + stencil.lon_index[..., jnp.newaxis, :, jnp.newaxis]
@@ -835,7 +835,9 @@ def transport_wind(
       `planetary_velocity`). Along-trajectory transport of this quantity has
       no Coriolis force, so equations using it drop `f k ✕ v` from their
       explicit terms entirely — the standard configuration for long time
-      steps.
+      steps. Note this makes transport affine rather than linear: the
+      caller's (u, v) must carry the state winds with coefficient exactly
+      one (see `SemiLagrangianImplicitExplicitODE.semi_lagrangian_transport`).
 
   Returns:
     Tuple (u, v) of transported winds at arrival points.

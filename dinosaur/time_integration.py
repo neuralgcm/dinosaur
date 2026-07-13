@@ -169,6 +169,13 @@ class SemiLagrangianImplicitExplicitODE(ImplicitExplicitODE):
     `bracket` (a state or state-like linear combination of states and
     tendencies) at the departure points of the trajectories.
 
+    Implementations need not be linear in `bracket`: equations that
+    transport planetary momentum add an analytic `2Ω✕R` term with a fixed
+    unit coefficient. Steppers must therefore only pass brackets of the
+    form `state + (weighted tendencies)` — carrying the state with
+    coefficient exactly one — and must not transport tendency-only brackets
+    or rescale transported results.
+
     Args:
       bracket: modal state-like pytree to transport.
       departure: departure points from `departure_points`.
@@ -281,7 +288,13 @@ class TimeReversedImExODE(ImplicitExplicitODE):
 def compose_equations(
     equations: Sequence[Union[ImplicitExplicitODE, ExplicitODE]],
 ) -> ImplicitExplicitODE:
-  """Combines a `equations` with at-most one ImplicitExplicitODE instance."""
+  """Combines a `equations` with at-most one ImplicitExplicitODE instance.
+
+  If the ImplicitExplicitODE instance is a SemiLagrangianImplicitExplicitODE,
+  the composed equation is too, delegating trajectories and transport to it:
+  the explicit terms of the other equations are treated as additional
+  non-advective forcing.
+  """
   implicit_explicit_eqs = list(
       filter(lambda x: isinstance(x, ImplicitExplicitODE), equations))
   if len(implicit_explicit_eqs) != 1:
@@ -295,6 +308,19 @@ def compose_equations(
     return tree_map(
         lambda *args: sum([x for x in args if x is not None]),
         *explicit_tendencies)
+
+  if isinstance(
+      implicit_explicit_equation, SemiLagrangianImplicitExplicitODE
+  ):
+    base = implicit_explicit_equation
+    composed = SemiLagrangianImplicitExplicitODE()
+    composed.explicit_terms = explicit_fn
+    composed.implicit_terms = base.implicit_terms
+    composed.implicit_inverse = base.implicit_inverse
+    composed.nodal_velocities = base.nodal_velocities
+    composed.departure_points = base.departure_points
+    composed.semi_lagrangian_transport = base.semi_lagrangian_transport
+    return composed
 
   return ImplicitExplicitODE.from_functions(
       explicit_fn, implicit_explicit_equation.implicit_terms,

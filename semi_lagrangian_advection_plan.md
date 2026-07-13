@@ -808,6 +808,39 @@ Issues encountered while implementing this plan, by milestone.
   (i, j) stage pair) is a research-grade extension deferred with the §12
   roadmap.
 
+**M5 / M5b — Moist terms, tracers, gradients, nodal storage.**
+
+- Moisture needed no new physics code: the M0 split already classifies the
+  humidity corrections as non-advective, so moist SL is `humidity_key` +
+  the humidity tracer transported like any other. Verified by a q=0
+  reduction test and a moist baroclinic consistency run vs the Eulerian
+  core.
+- The plan §7 caveat is now quantified: a barely resolved tracer at T21
+  undershoots to ~−6% of peak in *modal* storage with or without the
+  quasi-monotone limiter (the per-step modal round trip reintroduces the
+  ringing the limiter removed). With `nodal_tracers` storage (M5b) the same
+  configuration is exactly non-negative over a two-day run, with no new
+  maxima and small tracer-mass drift. Nodal tracers may not participate in
+  the dynamics (`humidity_key`/`cloud_keys` rejected) and are excluded from
+  modal filters via `step_filter_excluding_nodal_tracers`.
+- `compose_equations` now preserves the semi-Lagrangian interface when its
+  ImplicitExplicitODE member is semi-Lagrangian (extra explicit equations
+  become additional non-advective forcing), letting Held-Suarez forcing
+  compose unchanged: a 3-day forced T21 run stays stable with physical
+  temperatures.
+- `jax.grad` through two full SL primitive-equation steps matches central
+  finite differences to 1e-2 relative (float32 end-to-end).
+- Adversarial review of M3b/M4 verified the LADVF factor-2/sign/projection
+  derivation independently and mutation-tested it (sign or factor errors
+  exceed test thresholds by >100✕). Review-driven fixes: documented the
+  coefficient-1-on-state bracket invariant that planetary-momentum
+  transport imposes on steppers (transport is affine, not linear), warned
+  in both SL equation docstrings that Eulerian steppers would silently
+  integrate advection-free dynamics, covered the previously untested
+  multi-layer pressure coupling and orography paths in the shallow-water
+  tests, aligned the SW nodal-conversion clipping convention, and
+  corrected the int32 gather-limit comment.
+
 **M4 — `SemiLagrangianPrimitiveEquations` (dry, sigma).**
 
 - Worked essentially on first assembly thanks to the earlier de-risking: on

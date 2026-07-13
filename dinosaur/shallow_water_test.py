@@ -314,19 +314,19 @@ class ShallowWaterTest(parameterized.TestCase):
 class SemiLagrangianShallowWaterTest(parameterized.TestCase):
   """Tests for the semi-Lagrangian shallow water equations."""
 
-  def _coords(self):
+  def _coords(self, layers=1):
     # T42 rather than `with_wavenumbers` because cross-pole halos require an
     # even number of longitude nodes.
     return coordinate_systems.CoordinateSystem(
-        spherical_harmonic.Grid.T42(), layer_coordinates.LayerCoordinates(1)
+        spherical_harmonic.Grid.T42(), layer_coordinates.LayerCoordinates(layers)
     )
 
-  def _steady_state_setup(self, coriolis_mode):
-    coords = self._coords()
+  def _steady_state_setup(self, coriolis_mode, layers=1):
+    coords = self._coords(layers)
     grid = coords.horizontal
     physics_specs = units.SimUnits.from_si()
-    densities = np.ones(1)
-    mean_potential = np.ones(1) / 10
+    densities = np.array([0.9 ** n for n in range(layers)][::-1])
+    mean_potential = np.ones(layers) / 10
     equation = shallow_water.SemiLagrangianShallowWaterEquations(
         coords,
         physics_specs,
@@ -336,7 +336,7 @@ class SemiLagrangianShallowWaterTest(parameterized.TestCase):
         coriolis_mode=coriolis_mode,
     )
     lat = np.arccos(grid.cos_lat)
-    velocity = jnp.stack([np.cos(3 * lat) / 5])
+    velocity = jnp.stack([np.cos(3 * lat) / 5] * layers)
     initial_state = shallow_water_states.multi_layer(
         velocity, densities, coords
     )
@@ -354,10 +354,16 @@ class SemiLagrangianShallowWaterTest(parameterized.TestCase):
   @parameterized.parameters(
       dict(coriolis_mode='planetary_momentum'),
       dict(coriolis_mode='explicit'),
+      dict(coriolis_mode='planetary_momentum', layers=2),
   )
-  def test_steady_state_geostrophic_flow(self, coriolis_mode):
-    """Williamson case 2 analog: geostrophic flow remains steady."""
-    equation, initial_state = self._steady_state_setup(coriolis_mode)
+  def test_steady_state_geostrophic_flow(self, coriolis_mode, layers=1):
+    """Williamson case 2 analog: geostrophic flow remains steady.
+
+    The two-layer case exercises the inter-layer pressure-gradient coupling
+    in the non-advective terms (`density_ratios @ potential`), which is
+    identically zero for a single layer.
+    """
+    equation, initial_state = self._steady_state_setup(coriolis_mode, layers)
     grid = equation.coords.horizontal
     dt = 0.01
     step_fn = jax.jit(
@@ -366,6 +372,56 @@ class SemiLagrangianShallowWaterTest(parameterized.TestCase):
     final = time_integration.repeated(step_fn, 300)(initial_state)
     # measured l2 error ~6e-5 for both Coriolis modes.
     self.assertLess(self._potential_l2_error(grid, final, initial_state), 5e-4)
+
+  def test_consistency_with_eulerian_core_with_orography(self):
+    """Flow over a mountain: SL and Eulerian cores track each other.
+
+    Exercises the orography contribution to the non-advective terms, which
+    the steady-state tests (flat) never touch.
+    """
+    coords = self._coords()
+    grid = coords.horizontal
+    physics_specs = units.SimUnits.from_si()
+    densities = np.ones(1)
+    mean_potential = np.ones(1) / 10
+    lon, sin_lat = grid.nodal_mesh
+    lat = np.arcsin(sin_lat)
+    mountain = 0.005 * np.exp(
+        -((lat - np.pi / 6) ** 2 + (lon - np.pi) ** 2) / 0.1
+    )[np.newaxis]
+    orography = grid.to_modal(jnp.asarray(mountain))
+    velocity_profile = np.cos(3 * np.arccos(grid.cos_lat)) / 5
+    initial_state = shallow_water_states.multi_layer(
+        jnp.stack([velocity_profile]), densities, coords
+    )
+    common = dict(densities=densities)
+    sl_equation = shallow_water.SemiLagrangianShallowWaterEquations(
+        coords, physics_specs, orography, mean_potential, **common
+    )
+    eulerian = shallow_water.ShallowWaterEquations(
+        coords, physics_specs, orography, mean_potential, **common
+    )
+    dt = 0.01
+    steps = 100
+    sl_final = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(
+                sl_equation, dt
+            )
+        ),
+        steps,
+    )(initial_state)
+    eulerian_final = time_integration.repeated(
+        jax.jit(time_integration.imex_rk_sil3(eulerian, dt)), steps
+    )(initial_state)
+    with self.subTest('the mountain drives dynamics'):
+      self.assertGreater(
+          self._potential_l2_error(grid, eulerian_final, initial_state), 1e-3
+      )
+    with self.subTest('SL tracks the Eulerian core'):
+      self.assertLess(
+          self._potential_l2_error(grid, sl_final, eulerian_final), 1e-3
+      )
 
   def test_large_time_step_stability(self):
     """SL stays stable and accurate at time steps where the Eulerian core

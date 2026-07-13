@@ -1697,8 +1697,10 @@ class SemiLagrangianPrimitiveEquations(
   The state layout (modal vorticity, divergence, T', log surface pressure and
   tracers) and the implicit terms/inverse are unchanged from
   `PrimitiveEquationsSigma`, so this class plugs into
-  `time_integration.semi_lagrangian_crank_nicolson_rk2`. All advection is
-  handled by trajectories:
+  `time_integration.semi_lagrangian_crank_nicolson_rk2`. It must NOT be used
+  with Eulerian steppers (`imex_rk_sil3` etc.), which would silently
+  integrate advection-free dynamics: `explicit_terms` returns only the
+  non-advective forcing. All advection is handled by trajectories:
 
   - momentum is transported as grid-point winds along 3-D trajectories
     (converted from/to modal vorticity and divergence at the transport
@@ -1724,6 +1726,13 @@ class SemiLagrangianPrimitiveEquations(
     monotone_tracers: names of tracers transported with the quasi-monotone
       limiter, which prevents new extrema (and preserves positivity) at the
       cost of formal accuracy at extrema. Dynamical fields are never limited.
+    nodal_tracers: names of tracers carried in `State.tracers` as *nodal*
+      arrays instead of modal coefficients. They skip all spectral
+      transforms, so sharp fields (aerosols, chemistry) avoid the per-step
+      Gibbs ringing of a modal round trip, and combined with
+      `monotone_tracers` their non-negativity is exact. They must be
+      excluded from modal filters (`step_filter_excluding_nodal_tracers`)
+      and cannot participate in the dynamics (`humidity_key`, `cloud_keys`).
   """
 
   coriolis_mode: str = dataclasses.field(
@@ -1733,11 +1742,18 @@ class SemiLagrangianPrimitiveEquations(
   monotone_tracers: tuple[str, ...] = dataclasses.field(
       default=(), kw_only=True
   )
+  nodal_tracers: tuple[str, ...] = dataclasses.field(default=(), kw_only=True)
 
   def __post_init__(self):
     super().__post_init__()
     if self.coriolis_mode not in ('planetary_momentum', 'explicit'):
       raise ValueError(f'unknown {self.coriolis_mode=}')
+    dynamics_keys = {self.humidity_key, *(self.cloud_keys or ())}
+    if set(self.nodal_tracers) & dynamics_keys:
+      raise ValueError(
+          'tracers that enter the dynamics (humidity_key, cloud_keys) cannot '
+          f'be stored nodally: {self.nodal_tracers=}'
+      )
 
   @property
   def _planetary_rotation_rate(self) -> float | None:
@@ -1745,12 +1761,47 @@ class SemiLagrangianPrimitiveEquations(
       return self.physics_specs.angular_velocity
     return None
 
+  def _split_nodal_tracers(
+      self, state: State
+  ) -> tuple[State, Mapping[str, Array]]:
+    """Splits `state` into a modal-only state and the nodal tracers.
+
+    Tracers named in `nodal_tracers` are carried in `State.tracers` as
+    *nodal* arrays: they skip all spectral transforms — semi-Lagrangian
+    transport operates on their grid values directly — so sharp fields do
+    not incur per-step Gibbs ringing from a modal round trip, and the
+    quasi-monotone limiter's non-negativity is exact. They must also be
+    excluded from modal filters (see `step_filter_excluding_nodal_tracers`).
+    """
+    modal = {
+        k: v for k, v in state.tracers.items() if k not in self.nodal_tracers
+    }
+    nodal = {
+        k: v for k, v in state.tracers.items() if k in self.nodal_tracers
+    }
+    return state.replace(tracers=modal), nodal
+
   @jax.named_call
   def explicit_terms(self, state: State) -> State:
     """Computes non-advective explicit tendencies ("N")."""
-    return self.explicit_nonadvective_terms(
-        state, include_coriolis=self.coriolis_mode == 'explicit'
+    modal_state, nodal_tracers = self._split_nodal_tracers(state)
+    tendency = self.explicit_nonadvective_terms(
+        modal_state, include_coriolis=self.coriolis_mode == 'explicit'
     )
+    if not nodal_tracers:
+      return tendency
+    tracers = dict(tendency.tracers)
+    tracers.update(jax.tree_util.tree_map(jnp.zeros_like, nodal_tracers))
+    return tendency.replace(tracers=tracers)
+
+  @jax.named_call
+  def nodal_velocities(
+      self,
+      state: State,
+      aux_state: DiagnosticStateSigma | None = None,
+  ) -> NodalVelocities:
+    modal_state, _ = self._split_nodal_tracers(state)
+    return super().nodal_velocities(modal_state, aux_state)
 
   @jax.named_call
   def departure_points(
@@ -1806,30 +1857,82 @@ class SemiLagrangianPrimitiveEquations(
         departure['2d'],
         interpolator,
     )
-    tracers = {}
+    modal_tracers = {}
+    nodal_tracers = {}
     for name, value in bracket.tracers.items():
       tracer_interpolator = semi_lagrangian.GridInterpolator(
           grid,
           self.interpolation_order,
           monotone=name in self.monotone_tracers,
       )
-      tracers[name] = grid.to_modal(
-          semi_lagrangian.transport_scalar(
-              grid.to_nodal(value),
-              departure['3d'],
-              vertical,
-              tracer_interpolator,
-          )
-      )
+      if name in self.nodal_tracers:
+        # nodal tracers never touch the spectral basis: transport their grid
+        # values directly (no modal round trip, no wavenumber clipping).
+        nodal_tracers[name] = semi_lagrangian.transport_scalar(
+            value, departure['3d'], vertical, tracer_interpolator
+        )
+      else:
+        modal_tracers[name] = grid.to_modal(
+            semi_lagrangian.transport_scalar(
+                grid.to_nodal(value),
+                departure['3d'],
+                vertical,
+                tracer_interpolator,
+            )
+        )
     transported = State(
         vorticity=vorticity,
         divergence=divergence,
         temperature_variation=grid.to_modal(temperature_variation),
         log_surface_pressure=grid.to_modal(log_surface_pressure),
-        tracers=tracers,
+        tracers=modal_tracers,
         sim_time=bracket.sim_time,
     )
-    return grid.clip_wavenumbers(transported)
+    transported = grid.clip_wavenumbers(transported)
+    if not nodal_tracers:
+      return transported
+    tracers = dict(transported.tracers)
+    tracers.update(nodal_tracers)
+    return transported.replace(tracers=tracers)
+
+
+def step_filter_excluding_nodal_tracers(
+    step_filter: typing.PyTreeStepFilterFn,
+    nodal_tracers: Sequence[str],
+) -> typing.PyTreeStepFilterFn:
+  """Wraps a modal step filter to pass nodal tracers through untouched.
+
+  Modal filters (hyperdiffusion, exponential) multiply by masks shaped like
+  the spectral basis, which is meaningless (and shape-incompatible) for
+  tracers stored nodally. This wrapper removes nodal tracers before applying
+  `step_filter` and reattaches them unfiltered.
+
+  Args:
+    step_filter: a step filter mapping `(u, u_next) -> filtered u_next`.
+    nodal_tracers: names of nodal tracers to exclude from filtering.
+
+  Returns:
+    A step filter safe to use with `SemiLagrangianPrimitiveEquations` states
+    holding nodal tracers.
+  """
+  nodal_tracers = tuple(nodal_tracers)
+
+  def strip(state: State) -> State:
+    tracers = {
+        k: v for k, v in state.tracers.items() if k not in nodal_tracers
+    }
+    return state.replace(tracers=tracers)
+
+  def _filter(u: State, u_next: State) -> State:
+    protected = {
+        k: v for k, v in u_next.tracers.items() if k in nodal_tracers
+    }
+    filtered = step_filter(strip(u), strip(u_next))
+    tracers = dict(filtered.tracers)
+    tracers.update(protected)
+    return filtered.replace(tracers=tracers)
+
+  return _filter
 
 
 ################################################################################

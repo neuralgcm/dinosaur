@@ -241,7 +241,9 @@ class SemiLagrangianShallowWaterEquations(
   The state layout (modal vorticity, divergence and potential) and the
   implicit terms/inverse are unchanged from `ShallowWaterEquations`, so this
   class plugs into `time_integration.semi_lagrangian_crank_nicolson_rk2`.
-  All advection is handled by trajectories: momentum is transported as
+  It must NOT be used with Eulerian steppers (`imex_rk_sil3` etc.), which
+  would silently integrate advection-free dynamics: `explicit_terms` returns
+  only the non-advective forcing. All advection is handled by trajectories: momentum is transported as
   grid-point winds (converted from/to modal vorticity and divergence at the
   transport boundaries) and the potential perturbation as a scalar, so
   `explicit_terms` returns only the non-advective forcing:
@@ -302,9 +304,10 @@ class SemiLagrangianShallowWaterEquations(
       explicit_vorticity = explicit_vorticity - grid.div_cos_lat(b)
       explicit_divergence = explicit_divergence + grid.curl_cos_lat(b)
     # DΦ'/Dt = -Φ'δ - Φ_ref δ; the first term is the explicit source and the
-    # second is the implicit term.
-    nodal_divergence = grid.to_nodal(state.divergence)
-    nodal_potential = grid.to_nodal(state.potential)
+    # second is the implicit term. Clipping before the nodal conversion
+    # matches the Eulerian class's state_to_nodal convention.
+    nodal_divergence = grid.to_nodal(grid.clip_wavenumbers(state.divergence))
+    nodal_potential = grid.to_nodal(grid.clip_wavenumbers(state.potential))
     explicit_potential = -grid.to_modal(nodal_potential * nodal_divergence)
     return grid.clip_wavenumbers(
         State(explicit_vorticity, explicit_divergence, explicit_potential)

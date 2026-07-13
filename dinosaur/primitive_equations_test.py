@@ -16,6 +16,7 @@ import functools
 from absl.testing import absltest
 from absl.testing import parameterized
 from dinosaur import coordinate_systems
+from dinosaur import held_suarez
 from dinosaur import hybrid_coordinates
 from dinosaur import primitive_equations
 from dinosaur import primitive_equations_states
@@ -1083,6 +1084,325 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
     np.testing.assert_allclose(
         nodal_tracer, np.ones_like(nodal_tracer), rtol=1e-4
     )
+
+
+class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
+  """Moist dynamics, tracer limiting and differentiability of the SL core."""
+
+  def _setup(self, layers=8, humidity=False, **kwargs):
+    physics_specs = units.SimUnits.from_si()
+    grid = spherical_harmonic.Grid.T21()
+    vertical = sigma_coordinates.SigmaCoordinates.equidistant(layers)
+    coords = coordinate_systems.CoordinateSystem(grid, vertical)
+    init_fn, aux_features = primitive_equations_states.steady_state_jw(
+        coords, physics_specs
+    )
+    state = init_fn()
+    state = state + primitive_equations_states.baroclinic_perturbation_jw(
+        coords, physics_specs
+    )
+    if humidity:
+      state.tracers = {
+          'specific_humidity': primitive_equations_states.gaussian_scalar(
+              coords, physics_specs, amplitude=0.01
+          )
+      }
+    orography = primitive_equations.truncated_modal_orography(
+        aux_features[xarray_utils.OROGRAPHY], coords
+    )
+    ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
+    equation = primitive_equations.SemiLagrangianPrimitiveEquations(
+        ref_temps,
+        orography,
+        coords,
+        physics_specs,
+        humidity_key='specific_humidity' if humidity else None,
+        **kwargs,
+    )
+    return equation, state, ref_temps, orography
+
+  def _nondim_minutes(self, physics_specs, minutes):
+    return float(physics_specs.nondimensionalize(minutes * 60 * s_units.s))
+
+  def _l2(self, grid, x, y):
+    x, y = grid.to_nodal(x), grid.to_nodal(y)
+    return float(np.sqrt(np.square(x - y).sum() / np.square(y).sum()))
+
+  def test_moist_equations_reduce_to_dry_for_zero_humidity(self):
+    """With q = 0, moist SL tendencies match treating q as a passive tracer."""
+    moist, state, ref_temps, orography = self._setup(humidity=True)
+    state.tracers = {
+        'specific_humidity': jnp.zeros_like(state.temperature_variation)
+    }
+    dry = primitive_equations.SemiLagrangianPrimitiveEquations(
+        ref_temps, orography, moist.coords, moist.physics_specs
+    )
+    jax.tree.map(
+        lambda x, y: np.testing.assert_allclose(x, y, atol=1e-7),
+        moist.explicit_terms(state),
+        dry.explicit_terms(state),
+    )
+    dt = self._nondim_minutes(moist.physics_specs, 30)
+    step_moist = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(moist, dt)
+    )
+    step_dry = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(dry, dt)
+    )
+    jax.tree.map(
+        lambda x, y: np.testing.assert_allclose(x, y, atol=1e-6),
+        step_moist(state),
+        step_dry(state),
+    )
+
+  def test_moist_baroclinic_consistency_with_eulerian(self):
+    """Moist SL at dt=30min tracks the moist Eulerian core at dt=10min."""
+    equation, state0, ref_temps, orography = self._setup(humidity=True)
+    grid = equation.coords.horizontal
+    physics_specs = equation.physics_specs
+    eulerian = primitive_equations.PrimitiveEquationsSigma(
+        ref_temps,
+        orography,
+        equation.coords,
+        physics_specs,
+        humidity_key='specific_humidity',
+    )
+    sl_final = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(
+                equation, self._nondim_minutes(physics_specs, 30)
+            )
+        ),
+        48,
+    )(state0)
+    eulerian_final = time_integration.repeated(
+        jax.jit(
+            time_integration.imex_rk_sil3(
+                eulerian, self._nondim_minutes(physics_specs, 10)
+            )
+        ),
+        144,
+    )(state0)
+    self.assertLess(
+        self._l2(
+            grid,
+            sl_final.temperature_variation,
+            eulerian_final.temperature_variation,
+        ),
+        5e-3,
+    )
+    self.assertLess(
+        self._l2(
+            grid,
+            sl_final.tracers['specific_humidity'],
+            eulerian_final.tracers['specific_humidity'],
+        ),
+        0.1,
+    )
+
+  def test_tracer_positivity_with_limiter(self):
+    """Pins the modal-storage positivity floor the limiter cannot beat.
+
+    Because the state stays modal, each step's modal round trip reintroduces
+    Gibbs ringing regardless of how good the transport is: for this barely
+    resolved tracer at T21 the undershoot is ~-6% of peak with or without
+    the limiter (measured -0.061 limited vs -0.069 unlimited). This is
+    precisely the plan §7 caveat motivating opt-in *nodal* tracer storage,
+    where the limiter's exact non-negativity survives (see
+    `test_nodal_tracer_positivity`). The limiter must still never make
+    things worse, never amplify the peak, and approximately conserve mass.
+    """
+    results = {}
+    for limited in [False, True]:
+      equation, state0, _, _ = self._setup(
+          monotone_tracers=('tracer',) if limited else ()
+      )
+      physics_specs = equation.physics_specs
+      state0.tracers = {
+          'tracer': primitive_equations_states.gaussian_scalar(
+              coords=equation.coords,
+              physics_specs=physics_specs,
+              perturbation_radius=0.1,
+          )
+      }
+      grid = equation.coords.horizontal
+      dt = self._nondim_minutes(physics_specs, 30)
+      step_fn = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+      )
+      final = time_integration.repeated(step_fn, 96)(state0)  # two days
+      nodal = np.asarray(grid.to_nodal(final.tracers['tracer']))
+      initial_nodal = np.asarray(grid.to_nodal(state0.tracers['tracer']))
+      mass = grid.integrate(nodal).sum()
+      initial_mass = grid.integrate(initial_nodal).sum()
+      results[limited] = dict(
+          min=nodal.min(),
+          max=nodal.max(),
+          mass_drift=abs(float(mass - initial_mass)) / float(initial_mass),
+      )
+    with self.subTest('limiter does not worsen the modal ringing floor'):
+      self.assertLess(results[True]['min'], 0.0)  # modal round trip
+      self.assertGreaterEqual(
+          results[True]['min'], results[False]['min'] - 1e-3
+      )
+    with self.subTest('no amplification of the maximum'):
+      self.assertLess(results[True]['max'], 1.05)
+    with self.subTest('mass approximately conserved'):
+      self.assertLess(results[True]['mass_drift'], 0.05)
+
+  def test_nodal_tracer_positivity(self):
+    """Nodal tracer storage delivers exact non-negativity for sharp tracers.
+
+    The companion test above measures a ~-6% undershoot floor for the same
+    tracer in modal storage; storing it nodally removes the modal round trip
+    entirely, so the quasi-monotone limiter's bounds hold exactly.
+    """
+    equation, state0, _, _ = self._setup(
+        monotone_tracers=('tracer',), nodal_tracers=('tracer',)
+    )
+    grid = equation.coords.horizontal
+    physics_specs = equation.physics_specs
+    modal_tracer = primitive_equations_states.gaussian_scalar(
+        coords=equation.coords,
+        physics_specs=physics_specs,
+        perturbation_radius=0.1,
+    )
+    nodal_tracer = jnp.maximum(grid.to_nodal(modal_tracer), 0.0)
+    state0.tracers = {'tracer': nodal_tracer}
+    dt = self._nondim_minutes(physics_specs, 30)
+    step_fn = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+    )
+    final = time_integration.repeated(step_fn, 96)(state0)  # two days
+    tracer = np.asarray(final.tracers['tracer'])
+    self.assertEqual(tracer.shape, equation.coords.nodal_shape)
+    with self.subTest('exactly non-negative'):
+      self.assertGreaterEqual(tracer.min(), 0.0)
+    with self.subTest('no new maximum'):
+      self.assertLessEqual(tracer.max(), float(np.asarray(nodal_tracer).max()))
+    with self.subTest('mass approximately conserved'):
+      mass = grid.integrate(tracer).sum()
+      initial_mass = grid.integrate(np.asarray(nodal_tracer)).sum()
+      self.assertLess(
+          abs(float(mass - initial_mass)) / float(initial_mass), 0.05
+      )
+
+  def test_nodal_tracer_consistent_with_modal_tracer(self):
+    """For a well-resolved tracer, both storage formats evolve alike."""
+    finals = {}
+    for nodal in [False, True]:
+      equation, state0, _, _ = self._setup(
+          nodal_tracers=('tracer',) if nodal else ()
+      )
+      grid = equation.coords.horizontal
+      physics_specs = equation.physics_specs
+      modal_tracer = primitive_equations_states.gaussian_scalar(
+          coords=equation.coords,
+          physics_specs=physics_specs,
+          perturbation_radius=0.3,
+      )
+      state0.tracers = {
+          'tracer': grid.to_nodal(modal_tracer) if nodal else modal_tracer
+      }
+      dt = self._nondim_minutes(physics_specs, 30)
+      step_fn = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+      )
+      final = time_integration.repeated(step_fn, 48)(state0)
+      tracer = final.tracers['tracer']
+      finals[nodal] = np.asarray(
+          grid.to_nodal(tracer) if not nodal else tracer
+      )
+    difference = np.sqrt(
+        np.square(finals[True] - finals[False]).sum()
+        / np.square(finals[False]).sum()
+    )
+    self.assertLess(float(difference), 0.05)
+
+  def test_nodal_tracers_reject_dynamics_keys(self):
+    with self.assertRaisesRegex(ValueError, 'cannot be stored nodally'):
+      self._setup(humidity=True, nodal_tracers=('specific_humidity',))
+
+  def test_step_filter_excluding_nodal_tracers(self):
+    equation, state0, _, _ = self._setup(nodal_tracers=('tracer',))
+    grid = equation.coords.horizontal
+    nodal_tracer = jnp.maximum(
+        grid.to_nodal(
+            primitive_equations_states.gaussian_scalar(
+                coords=equation.coords, physics_specs=equation.physics_specs
+            )
+        ),
+        0.0,
+    )
+    state0.tracers = {'tracer': nodal_tracer}
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    base_filter = time_integration.exponential_step_filter(grid, dt)
+    step_filter = primitive_equations.step_filter_excluding_nodal_tracers(
+        base_filter, ('tracer',)
+    )
+    filtered = step_filter(state0, state0)
+    with self.subTest('nodal tracer untouched'):
+      np.testing.assert_array_equal(filtered.tracers['tracer'], nodal_tracer)
+    with self.subTest('modal fields filtered'):
+      self.assertGreater(
+          float(
+              np.abs(
+                  np.asarray(
+                      filtered.temperature_variation
+                      - state0.temperature_variation
+                  )
+              ).max()
+          ),
+          0.0,
+      )
+
+  def test_gradients_match_finite_differences(self):
+    """jax.grad through SL steps agrees with finite differences."""
+    equation, state0, _, _ = self._setup(layers=4)
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    step_fn = time_integration.semi_lagrangian_crank_nicolson_rk2(
+        equation, dt
+    )
+
+    @jax.jit
+    def loss(scale):
+      state = state0.replace(vorticity=scale * state0.vorticity)
+      out = step_fn(step_fn(state))
+      return jnp.sum(out.temperature_variation**2)
+
+    gradient = float(jax.grad(loss)(1.0))
+    epsilon = 1e-3
+    finite_difference = float(
+        (loss(1.0 + epsilon) - loss(1.0 - epsilon)) / (2 * epsilon)
+    )
+    np.testing.assert_allclose(gradient, finite_difference, rtol=1e-2)
+
+  def test_held_suarez_composition(self):
+    """compose_equations preserves the SL interface; a forced run is stable."""
+    equation, state0, ref_temps, _ = self._setup()
+    coords = equation.coords
+    grid = coords.horizontal
+    physics_specs = equation.physics_specs
+    forcing = held_suarez.HeldSuarezForcingSigma(
+        coords, physics_specs, ref_temps
+    )
+    composed = time_integration.compose_equations([equation, forcing])
+    self.assertIsInstance(
+        composed, time_integration.SemiLagrangianImplicitExplicitODE
+    )
+    dt = self._nondim_minutes(physics_specs, 30)
+    step_fn = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(composed, dt)
+    )
+    final = time_integration.repeated(step_fn, 144)(state0)  # three days
+    temperature = np.asarray(
+        grid.to_nodal(final.temperature_variation)
+        + ref_temps[:, np.newaxis, np.newaxis]
+    )
+    self.assertTrue(np.isfinite(temperature).all())
+    # temperatures remain physical under Held-Suarez relaxation.
+    self.assertGreater(temperature.min(), 150.0)
+    self.assertLess(temperature.max(), 350.0)
 
 
 def interpolate_state_hybrid_to_sigma(
