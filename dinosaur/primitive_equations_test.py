@@ -915,6 +915,19 @@ class ExplicitTermsSplitTest(parameterized.TestCase):
 class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
   """Tests for the semi-Lagrangian primitive equations (dry, sigma)."""
 
+  def setUp(self):
+    # Some test modules (e.g. time_integration_test) enable x64 globally at
+    # import time, which leaks into full-suite runs. These tests are
+    # calibrated in float32, and test_time_step_extension pins the *onset*
+    # of an Eulerian instability, which shifts with precision.
+    super().setUp()
+    self._x64_was_enabled = jax.config.jax_enable_x64
+    jax.config.update('jax_enable_x64', False)
+
+  def tearDown(self):
+    jax.config.update('jax_enable_x64', self._x64_was_enabled)
+    super().tearDown()
+
   def _setup(self, grid, layers=8, perturbation=False, **kwargs):
     physics_specs = units.SimUnits.from_si()
     vertical = sigma_coordinates.SigmaCoordinates.equidistant(layers)
