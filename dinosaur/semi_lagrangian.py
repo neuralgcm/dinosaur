@@ -223,7 +223,15 @@ def _latitude_halo_axis(grid: spherical_harmonic.Grid) -> np.ndarray:
     raise ValueError('expected latitudes in increasing order')
   south = -np.pi - phi[_HALO_WIDTH - 1 :: -1]
   north = np.pi - phi[: -_HALO_WIDTH - 1 : -1]
-  return np.concatenate([south, phi, north])
+  extended = np.concatenate([south, phi, north])
+  if not np.all(np.diff(extended) > 0):
+    # e.g. 'equiangular_with_poles' grids, whose mirrored halo coordinates
+    # duplicate the pole nodes and would produce 0/0 Lagrange weights.
+    raise ValueError(
+        'halo-extended latitudes are not strictly increasing; grids with '
+        'nodes at the poles are not supported'
+    )
+  return extended
 
 
 def _extend_with_pole_halo(field: Array, grid: spherical_harmonic.Grid) -> Array:
@@ -293,7 +301,14 @@ def _horizontal_stencil(
   """Computes gather indices and weights for points (lon, sin_lat)."""
   offsets = _stencil_offsets(order)
   lon = jnp.asarray(lon)
-  phi = jnp.arcsin(jnp.clip(jnp.asarray(sin_lat), -1, 1))
+  # Latitude via arctan2 rather than arcsin: for |sin_lat| within float
+  # rounding of 1 (a trajectory point on a pole), arcsin has an infinite
+  # derivative and its reverse-mode gradient becomes NaN. The epsilon keeps
+  # the gradient finite while perturbing the pole latitude by less than
+  # 1e-6 radians.
+  sin_lat = jnp.clip(jnp.asarray(sin_lat), -1, 1)
+  cos_lat = jnp.sqrt(jnp.maximum(1 - jnp.square(sin_lat), 1e-12))
+  phi = jnp.arctan2(sin_lat, cos_lat)
 
   # Longitude nodes are uniform, so the bracketing index is a floor divide.
   # Weights are computed with unwrapped (real line) node coordinates; only
@@ -470,6 +485,8 @@ def interpolate_levels(
     Interpolated values of shape `lon.shape`.
   """
   field = jnp.asarray(field)
+  if len(sigma_nodes) < 2:
+    raise ValueError('vertical interpolation requires at least 2 levels')
   if field.ndim != 3 or field.shape[0] != len(sigma_nodes):
     raise ValueError(
         f'expected field of shape [{len(sigma_nodes)}, lon, lat]; '
@@ -493,6 +510,8 @@ def interpolate_levels(
 
   extended = _extend_with_pole_halo(field, grid)
   extended_latitude_size = extended.shape[-1]
+  # int32 indices limit the flattened size to 2**31 elements: ample for any
+  # realistic grid (the limit is ~T2000 at 137 levels).
   flat_index = (
       level_index[..., :, jnp.newaxis, jnp.newaxis] * grid.longitude_nodes
       + stencil.lon_index[..., jnp.newaxis, :, jnp.newaxis]

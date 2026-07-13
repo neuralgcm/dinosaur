@@ -258,6 +258,20 @@ class InterpolatorTest(parameterized.TestCase):
       )
       np.testing.assert_allclose(batched[k], single, atol=1e-6)
 
+  def test_grids_with_pole_nodes_are_rejected(self):
+    grid = spherical_harmonic.Grid(
+        longitude_wavenumbers=22,
+        total_wavenumbers=23,
+        longitude_nodes=64,
+        latitude_nodes=33,
+        latitude_spacing='equiangular_with_poles',
+    )
+    interpolator = semi_lagrangian.GridInterpolator(grid)
+    field = jnp.zeros(grid.nodal_shape)
+    points = jnp.zeros((4,))
+    with self.assertRaisesRegex(ValueError, 'nodes at the poles'):
+      interpolator(field, points, points)
+
   def test_batched_interpolation_shape_mismatch_raises(self):
     grid = spherical_harmonic.Grid.T21()
     fields = jnp.zeros((3,) + grid.nodal_shape)
@@ -437,6 +451,82 @@ class DeparturePointsTest(X64TestCase):
     )
     self.assertLess(error.max(), 1e-3)
 
+  def test_departure_points_with_physical_radius(self):
+    """The dt/radius scaling must convert physical winds to angular motion."""
+    radius = 6.371e6
+    grid = spherical_harmonic.Grid.T42(radius=radius)
+    omega = 2 * np.pi / (86400.0 * 12)  # one revolution per 12 days
+    u, v = solid_body_winds(grid, axis=[0, 0, 1], omega=omega * radius)
+    lon_mesh, sin_lat_mesh = grid.nodal_mesh
+    dt = 3600.0  # one hour, in the same (SI) units as the winds
+    departure = semi_lagrangian.horizontal_departure_points(
+        jnp.asarray(u), jnp.asarray(v), grid, dt=dt
+    )
+    r_exact = rotation_matrix([0, 0, 1], -omega * dt) @ np.stack(
+        semi_lagrangian.lon_lat_to_cartesian(lon_mesh, sin_lat_mesh)
+    ).reshape(3, -1)
+    error = np.linalg.norm(
+        np.asarray(departure.cartesian).reshape(3, -1) - r_exact, axis=0
+    )
+    # angular displacement is ~6e-3 radians; errors are interpolation-level.
+    self.assertLess(error.max(), 1e-5)
+
+  def test_vertical_departure_convergence(self):
+    """σ̇ interpolated at the trajectory midpoint beats frozen-at-arrival."""
+    coords = coordinate_systems.CoordinateSystem(
+        spherical_harmonic.Grid.T21(),
+        sigma_coordinates.SigmaCoordinates.equidistant(16),
+    )
+    grid = coords.horizontal
+    layers = coords.vertical.layers
+    boundaries = coords.vertical.boundaries
+    centers = coords.vertical.centers
+    zeros = jnp.zeros((layers,) + grid.nodal_shape)
+    # σ̇ = c·σ is linear in σ, so vertical interpolation is exact and all
+    # error comes from the trajectory iteration. dσ/dt = cσ has the exact
+    # solution σ_d = σ_a·exp(-c·dt).
+    rate = 0.5
+    sigma_dot = jnp.broadcast_to(
+        rate * boundaries[:, np.newaxis, np.newaxis],
+        (layers + 1,) + grid.nodal_shape,
+    )
+    dt = 0.6
+    departure = semi_lagrangian.departure_points_3d(
+        zeros, zeros, sigma_dot, coords, dt=dt
+    )
+    exact = centers * np.exp(-rate * dt)
+    frozen_at_arrival = centers * (1 - rate * dt)
+    # exclude layers whose exact departure point is clipped to the
+    # layer-center range.
+    unclipped = exact > centers[0]
+    error = np.abs(np.asarray(departure.sigma)[:, 0, 0] - exact)[unclipped]
+    frozen_error = np.abs(frozen_at_arrival - exact)[unclipped]
+    # the midpoint iteration is second order: much closer than frozen winds.
+    np.testing.assert_array_less(error, 0.2 * frozen_error)
+
+  def test_vertical_departure_clipping(self):
+    """Departure σ beyond the layer-center range is clipped on both sides."""
+    coords = coordinate_systems.CoordinateSystem(
+        spherical_harmonic.Grid.T21(),
+        sigma_coordinates.SigmaCoordinates.equidistant(4),
+    )
+    grid = coords.horizontal
+    layers = coords.vertical.layers
+    centers = coords.vertical.centers
+    zeros = jnp.zeros((layers,) + grid.nodal_shape)
+    for rate in [2.0, -2.0]:  # strong downward and upward motion
+      sigma_dot = rate * jnp.ones((layers + 1,) + grid.nodal_shape)
+      departure = semi_lagrangian.departure_points_3d(
+          zeros, zeros, sigma_dot, coords, dt=1.0
+      )
+      sigma = np.asarray(departure.sigma)
+      self.assertGreaterEqual(sigma.min(), centers[0])
+      self.assertLessEqual(sigma.max(), centers[-1])
+      if rate > 0:
+        np.testing.assert_allclose(sigma, centers[0], atol=1e-12)
+      else:
+        np.testing.assert_allclose(sigma, centers[-1], atol=1e-12)
+
   def test_vertical_departure_points(self):
     coords = coordinate_systems.CoordinateSystem(
         spherical_harmonic.Grid.T21(),
@@ -570,9 +660,10 @@ class TransportTest(X64TestCase):
         lon_mesh,
         sin_lat_mesh,
     )
-    # errors here are only interpolation and departure-point errors.
-    np.testing.assert_allclose(u_rot[0], u_expected, atol=2e-3)
-    np.testing.assert_allclose(v_rot[0], v_expected, atol=2e-3)
+    # errors here are only interpolation and departure-point errors
+    # (measured ~6e-5; rotate=False fails at ~5e-3).
+    np.testing.assert_allclose(u_rot[0], u_expected, atol=5e-4)
+    np.testing.assert_allclose(v_rot[0], v_expected, atol=5e-4)
 
     with self.subTest('flow returned up to Coriolis-scale turning'):
       # Transporting a solid-body wind along its own flow does not return the
@@ -812,6 +903,22 @@ class DifferentiabilityTest(parameterized.TestCase):
     # gradients w.r.t. winds flow through the departure points.
     self.assertGreater(np.abs(np.asarray(grads[0])).max(), 0.0)
     self.assertGreater(np.abs(np.asarray(grads[3])).max(), 0.0)
+
+  def test_gradients_finite_for_interpolation_at_the_pole(self):
+    """Interpolating exactly at a pole must not produce NaN gradients."""
+    grid = spherical_harmonic.Grid.T21()
+    rng = np.random.RandomState(1)
+    field = jnp.asarray(rng.normal(size=grid.nodal_shape))
+    interpolator = semi_lagrangian.GridInterpolator(grid, order='cubic')
+
+    def loss(sin_lat):
+      lon = jnp.asarray([0.3, 1.0, 2.0])
+      return jnp.sum(interpolator(field, lon, sin_lat) ** 2)
+
+    # points at and within float32 rounding of both poles.
+    sin_lat = jnp.asarray([1.0, -1.0, 1.0 - 1e-8])
+    grad = jax.grad(loss)(sin_lat)
+    self.assertTrue(np.all(np.isfinite(np.asarray(grad))))
 
 
 if __name__ == '__main__':

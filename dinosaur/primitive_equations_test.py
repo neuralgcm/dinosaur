@@ -860,17 +860,19 @@ class ExplicitTermsSplitTest(parameterized.TestCase):
     rhs = jax.tree.map(lambda a, b: 2 * (a - b), n1, n0)
     assert_states_close(lhs, rhs, rtol=1e-4, atol=1e-6)
 
-  def test_advective_terms_scaling_in_winds(self):
+  @parameterized.parameters(dict(humidity=False), dict(humidity=True))
+  def test_advective_terms_scaling_in_winds(self, humidity):
     """Pins the classification: advection scales polynomially in (ζ, δ).
 
     At fixed (T', ln pₛ, tracers), scaling the winds by 2 scales momentum
     advection (vorticity flux, kinetic energy, vertical advection) by 4 and
     scalar advection (T', ln pₛ, tracers) by 2, and all advective terms
     vanish for zero winds. Non-advective terms like Coriolis (2✕), the
-    pressure gradient or orography (1✕) would break these scalings.
+    pressure gradient, orography or wind-independent humidity corrections
+    (1✕) would break these scalings.
     """
     primitive, state = self._make_equation_and_state(
-        humidity=False, variable_t_ref=True
+        humidity=humidity, variable_t_ref=True
     )
 
     def with_winds(factor):
