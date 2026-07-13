@@ -133,17 +133,25 @@ class WilliamsonCase1Test(parameterized.TestCase):
     field0 = cosine_bell(r, center)
 
     u0 = 2 * np.pi  # one revolution per unit time
-    steps = 100
-    dt = 1.0 / steps  # max CFL ~1.3 at T42: beyond Eulerian limits
+    steps = 75  # three quarters of a revolution
+    dt = 1.0 / 100  # max CFL ~1.3 at T42: beyond Eulerian limits
     u, v = solid_body_winds_tilted(grid, alpha, u0)
     result = advect_static_flow(
         grid, u, v, field0, dt, steps, order='cubic', monotone=False
     )
-    # After a full revolution the exact solution is the initial condition.
-    # The error is dominated by accumulated interpolation (remap) error, so
-    # it *decreases* with larger dt — the defining semi-Lagrangian property
-    # (measured: l2 = 0.07 at 100 steps vs 0.16 at 250 steps).
-    l2, linf = normalized_errors(grid, result, field0)
+    # Compare against the analytically rotated initial condition (a partial
+    # revolution, so a no-op transport cannot pass). The error is dominated
+    # by accumulated interpolation (remap) error, so it *decreases* with
+    # larger dt — the defining semi-Lagrangian property (measured: l2 = 0.07
+    # at 100 steps vs 0.16 at 250 steps for a full revolution).
+    axis = np.array([-np.sin(alpha), 0.0, np.cos(alpha)])
+    exact = cosine_bell(
+        np.einsum(
+            'ab,b...->a...', rotation_matrix(axis, -u0 * steps * dt), r
+        ),
+        center,
+    )
+    l2, linf = normalized_errors(grid, result, exact)
     self.assertLess(l2, 0.1)
     self.assertLess(linf, 0.1)
 
@@ -171,15 +179,26 @@ class WilliamsonCase1Test(parameterized.TestCase):
     center = np.array([0.0, -1.0, 0.0])
     field0 = cosine_bell(r, center)
     u, v = solid_body_winds_tilted(grid, np.pi / 2, 2 * np.pi)
+    steps = 75  # three quarters of a revolution: a no-op transport fails
     result = advect_static_flow(
-        grid, u, v, field0, dt=1 / 100, steps=100, order='cubic', monotone=True
+        grid, u, v, field0, dt=1 / 100, steps=steps, order='cubic',
+        monotone=True,
     )
     result = np.asarray(result)
+    axis = np.array([-1.0, 0.0, 0.0])
+    exact = cosine_bell(
+        np.einsum(
+            'ab,b...->a...',
+            rotation_matrix(axis, -2 * np.pi * steps / 100),
+            r,
+        ),
+        center,
+    )
     with self.subTest('bounds preserved'):
       self.assertGreaterEqual(result.min(), 0.0)
       self.assertLessEqual(result.max(), field0.max() + 1e-6)
     with self.subTest('accuracy'):
-      l2, _ = normalized_errors(grid, result, field0)
+      l2, _ = normalized_errors(grid, result, exact)
       self.assertLess(l2, 0.12)
     with self.subTest('mass approximately conserved'):
       # semi-Lagrangian transport does not conserve mass exactly; the
@@ -276,9 +295,12 @@ class PositivityTest(parameterized.TestCase):
     grid = spherical_harmonic.Grid.T42()
     lon, sin_lat = grid.nodal_mesh
     r = np.stack(semi_lagrangian.lon_lat_to_cartesian(lon, sin_lat))
-    # a hill only a few grid cells wide, on an exactly zero background.
-    field0 = np.asarray(gaussian_hills(r, width=100.0))
-    u, v = solid_body_winds_tilted(grid, np.pi / 4, 2 * np.pi)
+    # hills ~1.5 grid cells wide on an exactly zero background, advected
+    # along the equator (where the spectral baseline is stable; tilted
+    # flows make the unfiltered pseudo-spectral operator pole-unstable).
+    width = 400.0
+    field0 = np.asarray(gaussian_hills(r, width=width))
+    u, v = solid_body_winds_tilted(grid, 0.0, 2 * np.pi)
 
     revolution_fraction = 0.25
     sl_steps = 16  # CFL ~2: fewer remaps preserve the sharp hill better
@@ -289,16 +311,25 @@ class PositivityTest(parameterized.TestCase):
     unlimited = advect_static_flow(
         grid, u, v, field0, sl_dt, sl_steps, order='cubic', monotone=False
     )
-    # the spectral core needs CFL < 1: max|u| dt / min(dx) ~ 0.8 at 512 steps.
     spectral_steps = 512
     spectral = self.spectral_advection(
         grid, u, v, field0, revolution_fraction / spectral_steps,
         spectral_steps,
     )
+    exact = gaussian_hills(
+        np.einsum(
+            'ab,b...->a...',
+            rotation_matrix([0, 0, 1], -2 * np.pi * revolution_fraction),
+            r,
+        ),
+        width=width,
+    )
 
     peak = field0.max()
     with self.subTest('spectral transport rings negative'):
-      self.assertLess(np.asarray(spectral).min(), -0.01 * peak)
+      # measured -5.8% of peak: genuine Gibbs ringing of the sharp hill
+      # (the transport itself is stable and accurate in this configuration).
+      self.assertLess(np.asarray(spectral).min(), -0.02 * peak)
     with self.subTest('unlimited cubic undershoots'):
       self.assertLess(np.asarray(unlimited).min(), -1e-4 * peak)
     with self.subTest('limited transport stays non-negative'):
@@ -306,20 +337,13 @@ class PositivityTest(parameterized.TestCase):
     with self.subTest('limited transport does not amplify the peak'):
       self.assertLessEqual(np.asarray(limited).max(), peak * (1 + 1e-6))
     with self.subTest('limited transport retains the signal'):
-      l2, _ = normalized_errors(
-          grid,
-          limited,
-          # exact solution: the initial condition rotated.
-          gaussian_hills(
-              rotation_matrix(
-                  [-np.sin(np.pi / 4), 0, np.cos(np.pi / 4)],
-                  -2 * np.pi * revolution_fraction,
-              )
-              @ r.reshape(3, -1),
-              width=100.0,
-          ).reshape(field0.shape),
-      )
-      self.assertLess(l2, 0.25)
+      l2, _ = normalized_errors(grid, limited, exact)
+      self.assertLess(l2, 0.5)
+    with self.subTest('spectral accuracy for reference'):
+      # the spectral core remains more accurate in l2 on this barely
+      # resolved field — the SL win is positivity, not accuracy.
+      l2_spectral, _ = normalized_errors(grid, spectral, exact)
+      self.assertLess(l2_spectral, 0.5)
 
 
 if __name__ == '__main__':

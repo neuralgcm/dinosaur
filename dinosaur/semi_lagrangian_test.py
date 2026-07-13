@@ -800,6 +800,22 @@ class _RingAdvectionODE(time_integration.SemiLagrangianImplicitExplicitODE):
     return initial_term + forced
 
 
+class _StateDependentRingODE(_RingAdvectionODE):
+  """Ring advection whose velocity depends on the state.
+
+  dθ/dt = ω₀ + c·mean(X): exercises the stepper's time-centered stage-2
+  winds `(V(x) + V(x*)) / 2`, which constant-velocity toys cannot (their
+  V(x*) equals V(x) identically).
+  """
+
+  def __init__(self, num_points, omega, gamma, coupling):
+    super().__init__(num_points, omega, gamma)
+    self.coupling = coupling
+
+  def nodal_velocities(self, state):
+    return self.omega + self.coupling * jnp.mean(state)
+
+
 class SemiLagrangianSteppersTest(X64TestCase):
 
   def test_reduces_to_crank_nicolson_rk2_for_zero_velocities(self):
@@ -845,6 +861,32 @@ class SemiLagrangianSteppersTest(X64TestCase):
     for order in orders:
       self.assertGreater(order, 1.7)
       self.assertLess(order, 2.3)
+
+  def test_second_order_convergence_state_dependent_velocity(self):
+    """Second order requires the time-centered stage-2 winds ½(V(x)+V(x*))."""
+    equation = _StateDependentRingODE(
+        num_points=64, omega=1.1, gamma=0.4, coupling=2.0
+    )
+    state0 = jnp.sin(2 * equation.theta) + 0.8
+    total_time = 1.0
+
+    def solve(num_steps):
+      dt = total_time / num_steps
+      step = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+      )
+      return time_integration.repeated(step, num_steps)(state0)
+
+    # self-convergence against a fine-step reference (no closed form:
+    # trajectories depend on the evolving mean state).
+    reference = np.asarray(solve(512))
+    errors = [
+        np.abs(np.asarray(solve(n)) - reference).max() for n in [8, 16, 32]
+    ]
+    orders = [np.log2(errors[i] / errors[i + 1]) for i in range(2)]
+    for order in orders:
+      self.assertGreater(order, 1.7)
+      self.assertLess(order, 2.4)
 
   def test_off_centering(self):
     equation = _RingAdvectionODE(num_points=64, omega=1.3, gamma=0.7)

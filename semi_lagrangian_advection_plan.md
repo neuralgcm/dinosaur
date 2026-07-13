@@ -866,10 +866,23 @@ Issues encountered while implementing this plan, by milestone.
   to 0.021 at T85 with the same step count — consistent with published
   behavior, so the T42 threshold is set accordingly rather than chasing the
   headline numbers from finer grids.
-- The positivity stress case behaves exactly as issue #55 hopes: spectral
-  flux-form transport of a ~2-cell Gaussian hill rings negative (min <
-  −1% of peak), unlimited cubic SL undershoots slightly, and quasi-monotone
-  SL stays exactly non-negative without amplifying the peak.
+- The positivity stress case behaves as issue #55 hopes, with an important
+  correction found by adversarial review: the first version's spectral
+  baseline used a tilted flow for which the *unfiltered* flux-form
+  pseudo-spectral operator is pole-unstable, so its negative values were a
+  blow-up artifact, not Gibbs ringing. The test now advects along the
+  equator (where the same baseline is verified stable and accurate) with a
+  ~1.5-cell hill: genuine Gibbs ringing measures −5.8% of peak, unlimited
+  cubic SL undershoots, and quasi-monotone SL stays exactly non-negative.
+  Notably the spectral core remains *more accurate in l2* on this barely
+  resolved field — the SL win is positivity, not accuracy.
+- Review also showed the full-revolution Williamson tests were individually
+  vacuous against a no-op transport (exact solution = initial condition);
+  they now compare a partial revolution against the analytically rotated
+  field. A state-dependent-velocity ring toy was added after review noted
+  constant-velocity toys cannot detect a broken stage-2 wind average
+  `½(V^n + V^*)`; mutation-tested (correct scheme: order 2.00; a
+  no-averaging mutant: 1.02).
 
 ## 14. References
 
