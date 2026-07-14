@@ -95,8 +95,9 @@ def cartesian_to_lon_sin_lat(r: Array) -> tuple[jnp.ndarray, jnp.ndarray]:
   Returns:
     Tuple of longitudes in [0, 2π) and sines of latitude.
   """
-  lon = jnp.arctan2(r[1], r[0]) % (2 * np.pi)
-  sin_lat = jnp.clip(r[2], -1, 1)
+  x, y, z = r
+  lon = jnp.arctan2(y, x) % (2 * np.pi)
+  sin_lat = jnp.clip(z, -1, 1)
   return lon, sin_lat
 
 
@@ -144,8 +145,9 @@ def tangent_wind(
   cos_lat = jnp.sqrt(1 - jnp.square(sin_lat))
   sin_lon = jnp.sin(lon)
   cos_lon = jnp.cos(lon)
-  u = -w[0] * sin_lon + w[1] * cos_lon
-  v = -w[0] * sin_lat * cos_lon - w[1] * sin_lat * sin_lon + w[2] * cos_lat
+  w_x, w_y, w_z = w
+  u = -w_x * sin_lon + w_y * cos_lon
+  v = -w_x * sin_lat * cos_lon - w_y * sin_lat * sin_lon + w_z * cos_lat
   return u, v
 
 
@@ -409,12 +411,11 @@ class GridInterpolator:
     """Interpolates `field` at the points (lon, sin_lat).
 
     Args:
-      field: nodal values of shape [longitude_nodes, latitude_nodes], or a
-        batch of such fields with shape [*batch, longitude_nodes,
-        latitude_nodes].
-      lon: longitudes in radians. For unbatched `field`, any shape. For
-        batched `field`, shape [*batch, *points]: each batch element is
-        interpolated at its own set of points.
+      field: nodal values of shape [longitude_nodes, latitude_nodes] (points
+        may then have any shape), or [levels, longitude_nodes,
+        latitude_nodes], in which case each level is interpolated at its own
+        set of points via `jax.vmap` over the leading axis.
+      lon: longitudes in radians, of shape [*points] or [levels, *points].
       sin_lat: sine of latitudes, same shape as `lon`.
 
     Returns:
@@ -426,20 +427,16 @@ class GridInterpolator:
     )
     if field.ndim == 2:
       return interpolate(field, lon, sin_lat)
-    batch_shape = field.shape[:-2]
-    if lon.shape[: len(batch_shape)] != batch_shape:
+    if field.ndim != 3:
       raise ValueError(
-          'batched interpolation requires points with leading dimensions '
-          f'matching the field batch: {field.shape=}, {lon.shape=}'
+          f'expected a field with 2 or 3 dimensions; got {field.shape=}'
       )
-    batch_size = math.prod(batch_shape)
-    flat_field = field.reshape((batch_size,) + field.shape[-2:])
-    flat_lon = lon.reshape((batch_size,) + lon.shape[len(batch_shape) :])
-    flat_sin_lat = sin_lat.reshape(
-        (batch_size,) + sin_lat.shape[len(batch_shape) :]
-    )
-    result = jax.vmap(interpolate)(flat_field, flat_lon, flat_sin_lat)
-    return result.reshape(lon.shape)
+    if lon.shape[0] != field.shape[0]:
+      raise ValueError(
+          'batched interpolation requires points with a leading levels axis '
+          f'matching the field: {field.shape=}, {lon.shape=}'
+      )
+    return jax.vmap(interpolate)(field, lon, sin_lat)
 
   def _interpolate_single(
       self, field: Array, lon: Array, sin_lat: Array, order: str, monotone: bool
@@ -580,9 +577,9 @@ def horizontal_departure_points(
   departure points.
 
   Args:
-    u: nodal zonal wind (true winds, not cosθ-scaled) of shape [*batch,
-      longitude_nodes, latitude_nodes]. Each batch element (e.g. model level)
-      is advected by its own wind field.
+    u: nodal zonal wind (true winds, not cosθ-scaled) of shape
+      [longitude_nodes, latitude_nodes] or [levels, longitude_nodes,
+      latitude_nodes]. Each level is advected by its own wind field.
     v: nodal meridional wind, same shape as `u`.
     grid: the horizontal grid.
     dt: time step. Trajectories are integrated backwards over `dt`.
@@ -703,9 +700,9 @@ def transport_scalar_2d(
   """Remaps a scalar field to arrival points along 2-D trajectories.
 
   Args:
-    field: nodal values of shape [*batch, longitude_nodes, latitude_nodes].
-    departure: horizontal departure points with fields shaped like `field`
-      (or like a single level of it, for unbatched fields).
+    field: nodal values of shape [longitude_nodes, latitude_nodes] or
+      [levels, longitude_nodes, latitude_nodes].
+    departure: horizontal departure points with fields shaped like `field`.
     interpolator: horizontal interpolation rule.
 
   Returns:

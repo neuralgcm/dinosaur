@@ -855,7 +855,11 @@ Issues encountered while implementing this plan, by milestone.
   by design: the fused Eulerian path sums nodal terms before a single
   spectral transform per equation, which is cheaper than adding the two
   split tendencies and keeps the default path bit-for-bit unchanged; the
-  reconstruction identity is pinned by a regression test instead.
+  reconstruction identity is pinned by a regression test instead. Also from
+  review: `GridInterpolator` no longer supports arbitrary leading batch
+  dimensions via silent reshapes — fields are [lon, lat] or
+  [levels, lon, lat] with an explicit `jax.vmap` over the levels axis,
+  matching dinosaur's array conventions.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
