@@ -373,6 +373,12 @@ class SemiLagrangianShallowWaterTest(parameterized.TestCase):
     # measured l2 error ~6e-5 for both Coriolis modes.
     self.assertLess(self._potential_l2_error(grid, final, initial_state), 5e-4)
 
+  def test_eulerian_stepper_use_is_rejected(self):
+    """explicit_terms raises so Eulerian steppers cannot silently misuse."""
+    equation, initial_state = self._steady_state_setup('planetary_momentum')
+    with self.assertRaisesRegex(TypeError, 'semi-Lagrangian'):
+      equation.explicit_terms(initial_state)
+
   def test_consistency_with_eulerian_core_with_orography(self):
     """Flow over a mountain: SL and Eulerian cores track each other.
 

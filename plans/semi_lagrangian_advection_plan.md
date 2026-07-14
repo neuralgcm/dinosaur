@@ -844,8 +844,20 @@ Issues encountered while implementing this plan, by milestone.
   command-line-only runs were mutation checks (verifying that committed
   tests discriminate against seeded bugs) and threshold-calibration runs
   whose measured values are recorded in test comments.
-- Per user instruction, the branch is left local — no PR was created. A
-  draft PR description exists in the session scratchpad.
+- Post-PR review follow-up: the §3.5 interface originally reused the name
+  `explicit_terms` for the non-advective forcing N, leaving semi-Lagrangian
+  equations silently accepted by Eulerian steppers (which would integrate
+  advection-free dynamics). The prohibition is now encoded in the data
+  model: the interface exposes N as `nonadvective_terms`, and
+  `explicit_terms` on semi-Lagrangian equations raises TypeError with
+  guidance (tested for both equation classes). The advective/non-advective
+  split methods on the Eulerian class remain distinct from `explicit_terms`
+  by design: the fused Eulerian path sums nodal terms before a single
+  spectral transform per equation, which is cheaper than adding the two
+  split tendencies and keeps the default path bit-for-bit unchanged; the
+  reconstruction identity is pinned by a regression test instead.
+- Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
+  moved into plans/ in the same PR).
 
 **M5c — SETTLS stepper.**
 

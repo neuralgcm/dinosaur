@@ -1275,6 +1275,13 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
     computed here with transport along trajectories, keeping only the
     non-advective part as explicit tendencies.
 
+    `explicit_terms` deliberately does not compute this sum: all three
+    methods assemble the same flag-selected helpers, but the fused path sums
+    nodal terms before a single spectral transform per equation, which is
+    both cheaper and bit-for-bit identical to the original Eulerian
+    implementation. The reconstruction identity is pinned by a regression
+    test instead.
+
     The advective part consists of: the `ζ (k ✕ v)` and kinetic energy
     gradient terms (together the vector-invariant form of momentum
     advection), vertical advection of momentum, horizontal and vertical
@@ -1697,10 +1704,10 @@ class SemiLagrangianPrimitiveEquations(
   The state layout (modal vorticity, divergence, T', log surface pressure and
   tracers) and the implicit terms/inverse are unchanged from
   `PrimitiveEquationsSigma`, so this class plugs into
-  `time_integration.semi_lagrangian_crank_nicolson_rk2`. It must NOT be used
-  with Eulerian steppers (`imex_rk_sil3` etc.), which would silently
-  integrate advection-free dynamics: `explicit_terms` returns only the
-  non-advective forcing. All advection is handled by trajectories:
+  `time_integration.semi_lagrangian_crank_nicolson_rk2`. `explicit_terms`
+  raises TypeError so that Eulerian steppers (`imex_rk_sil3` etc.), which
+  would silently integrate advection-free dynamics, are rejected. All
+  advection is handled by trajectories:
 
   - momentum is transported as grid-point winds along 3-D trajectories
     (converted from/to modal vorticity and divergence at the transport
@@ -1710,8 +1717,8 @@ class SemiLagrangianPrimitiveEquations(
     vertically averaged wind, which is exact for the continuity equation
     (`∫v·∇ln(pₛ)dσ = v̄·∇ln(pₛ)` since `ln(pₛ)` is independent of σ),
 
-  and `explicit_terms` returns only the non-advective forcing
-  (`explicit_nonadvective_terms`).
+  and the non-advective forcing (`explicit_nonadvective_terms`) is exposed
+  as `nonadvective_terms`.
 
   Attributes:
     coriolis_mode: 'planetary_momentum' (default) transports the planetary
@@ -1781,8 +1788,15 @@ class SemiLagrangianPrimitiveEquations(
     }
     return state.replace(tracers=modal), nodal
 
+  # Reject Eulerian-stepper misuse (see the class docstring): the inherited
+  # PrimitiveEquationsSigma.explicit_terms would otherwise take precedence
+  # over the interface's raising version in the MRO.
+  explicit_terms = (
+      time_integration.SemiLagrangianImplicitExplicitODE.explicit_terms
+  )
+
   @jax.named_call
-  def explicit_terms(self, state: State) -> State:
+  def nonadvective_terms(self, state: State) -> State:
     """Computes non-advective explicit tendencies ("N")."""
     modal_state, nodal_tracers = self._split_nodal_tracers(state)
     tendency = self.explicit_nonadvective_terms(

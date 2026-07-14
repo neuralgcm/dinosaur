@@ -1069,6 +1069,15 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
           0.1,
       )
 
+  def test_eulerian_stepper_use_is_rejected(self):
+    """explicit_terms raises so Eulerian steppers cannot silently misuse."""
+    equation, _, state0 = self._setup(spherical_harmonic.Grid.T21())
+    with self.assertRaisesRegex(TypeError, 'semi-Lagrangian'):
+      equation.explicit_terms(state0)
+    step_fn = time_integration.imex_rk_sil3(equation, 0.01)
+    with self.assertRaisesRegex(TypeError, 'semi-Lagrangian'):
+      step_fn(state0)
+
   def test_settls_tracks_rk2_on_baroclinic_wave(self):
     """The SETTLS stepper matches the RK2 stepper at half the per-step cost.
 
@@ -1197,8 +1206,8 @@ class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
     )
     jax.tree.map(
         lambda x, y: np.testing.assert_allclose(x, y, atol=1e-7),
-        moist.explicit_terms(state),
-        dry.explicit_terms(state),
+        moist.nonadvective_terms(state),
+        dry.nonadvective_terms(state),
     )
     dt = self._nondim_minutes(moist.physics_specs, 30)
     step_moist = jax.jit(

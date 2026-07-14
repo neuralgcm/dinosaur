@@ -1,11 +1,11 @@
 # Copyright 2026 Google LLC
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     https://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -446,7 +446,7 @@ class _IdentityTransportODE(
   def __init__(self, base: time_integration.ImplicitExplicitODE):
     self.base = base
 
-  def explicit_terms(self, state):
+  def nonadvective_terms(self, state):
     return self.base.explicit_terms(state)
 
   def implicit_terms(self, state):
@@ -482,7 +482,7 @@ class _RingAdvectionODE(time_integration.SemiLagrangianImplicitExplicitODE):
     self.omega = omega
     self.gamma = gamma
 
-  def explicit_terms(self, state):
+  def nonadvective_terms(self, state):
     return jnp.cos(self.theta)
 
   def implicit_terms(self, state):
@@ -547,7 +547,7 @@ class _StateDependentForcingRingODE(_RingAdvectionODE):
     super().__init__(num_points, omega, gamma)
     self.coupling = coupling
 
-  def explicit_terms(self, state):
+  def nonadvective_terms(self, state):
     return jnp.cos(self.theta) * (1 + self.coupling * jnp.mean(state))
 
 

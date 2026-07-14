@@ -119,18 +119,37 @@ class SemiLagrangianImplicitExplicitODE(ImplicitExplicitODE):
 
   The structure of the equation is assumed to be:
 
-    DX/Dt = explicit_terms(X) + implicit_terms(X),  dr/dt = V(X)
+    DX/Dt = nonadvective_terms(X) + implicit_terms(X),  dr/dt = V(X)
 
   where D/Dt is the material derivative along trajectories moving with the
   velocities V. Unlike `ImplicitExplicitODE`, *all* advection is handled by
-  remapping fields along trajectories (`semi_lagrangian_transport`), so
-  `explicit_terms(x)` returns only the non-advective explicit tendencies
-  ("N" in the semi-Lagrangian literature). `implicit_terms` and
+  remapping fields along trajectories (`semi_lagrangian_transport`), and
+  the non-advective explicit forcing ("N" in the semi-Lagrangian
+  literature) is exposed as `nonadvective_terms`. `implicit_terms` and
   `implicit_inverse` are unchanged from the Eulerian equations.
 
+  `explicit_terms` raises TypeError: an Eulerian time stepper handed a
+  semi-Lagrangian equation would silently integrate advection-free
+  dynamics, so the misuse is rejected instead of inherited.
+
   Any `sim_time` field passes through transport untouched and keeps its
-  existing convention (`explicit_terms` contributes rate 1.0).
+  existing convention (`nonadvective_terms` contributes rate 1.0).
   """
+
+  def nonadvective_terms(self, state: PyTreeState) -> PyTreeState:
+    """Evaluates the non-advective explicit tendencies ("N")."""
+    raise NotImplementedError
+
+  def explicit_terms(self, state: PyTreeState) -> PyTreeState:
+    """Raises TypeError: see the class docstring."""
+    raise TypeError(
+        f'{type(self).__name__} is a semi-Lagrangian equation: advection is'
+        ' handled by transport along trajectories, so explicit_terms is'
+        ' disabled to prevent silently advection-free integration with'
+        ' Eulerian time steppers. Use a semi-Lagrangian stepper (e.g.'
+        ' semi_lagrangian_crank_nicolson_rk2 or semi_lagrangian_settls), or'
+        ' nonadvective_terms for the non-advective forcing.'
+    )
 
   def nodal_velocities(self, state: PyTreeState) -> typing.Pytree:
     """Computes the velocities that define trajectories.
@@ -237,7 +256,7 @@ def semi_lagrangian_crank_nicolson_rk2(
   β = (0.5 - off_centering) * dt
 
   def step_fn(x0: PyTreeState) -> PyTreeState:
-    n0 = equation.explicit_terms(x0)
+    n0 = equation.nonadvective_terms(x0)
     l0 = equation.implicit_terms(x0)
     v0 = equation.nodal_velocities(x0)
 
@@ -252,7 +271,7 @@ def semi_lagrangian_crank_nicolson_rk2(
     v_star = equation.nodal_velocities(x_star)
     v_mid = tree_map(lambda a, b: 0.5 * (a + b), v0, v_star)
     departure2 = equation.departure_points(v_mid, dt)
-    n_star = equation.explicit_terms(x_star)
+    n_star = equation.nonadvective_terms(x_star)
     bracket2 = tree_map(lambda x, l, n: x + β * (l + n), x0, l0, n0)
     transported = equation.semi_lagrangian_transport(bracket2, departure2)
     combined = tree_map(lambda t, n: t + α * n, transported, n_star)
@@ -305,7 +324,7 @@ def semi_lagrangian_settls(
 
   def step_fn(carry):
     x, (n_prev, v_prev) = carry
-    n = equation.explicit_terms(x)
+    n = equation.nonadvective_terms(x)
     l = equation.implicit_terms(x)
     v = equation.nodal_velocities(x)
     v_mid = tree_map(lambda a, b: 1.5 * a - 0.5 * b, v, v_prev)
@@ -351,7 +370,7 @@ def semi_lagrangian_settls_init(
   rk2_step = semi_lagrangian_crank_nicolson_rk2(equation, time_step)
 
   def init_fn(x0):
-    n0 = equation.explicit_terms(x0)
+    n0 = equation.nonadvective_terms(x0)
     v0 = equation.nodal_velocities(x0)
     return (rk2_step(x0), (n0, v0))
 
@@ -433,8 +452,17 @@ def compose_equations(
       implicit_explicit_equation, SemiLagrangianImplicitExplicitODE
   ):
     base = implicit_explicit_equation
+
+    def nonadvective_fn(x: PyTreeState) -> PyTreeState:
+      tendencies = [
+          base.nonadvective_terms(x) if fn is base else fn.explicit_terms(x)
+          for fn in equations
+      ]
+      return tree_map(
+          lambda *args: sum([x for x in args if x is not None]), *tendencies)
+
     composed = SemiLagrangianImplicitExplicitODE()
-    composed.explicit_terms = explicit_fn
+    composed.nonadvective_terms = nonadvective_fn
     composed.implicit_terms = base.implicit_terms
     composed.implicit_inverse = base.implicit_inverse
     composed.nodal_velocities = base.nodal_velocities

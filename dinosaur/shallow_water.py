@@ -241,12 +241,12 @@ class SemiLagrangianShallowWaterEquations(
   The state layout (modal vorticity, divergence and potential) and the
   implicit terms/inverse are unchanged from `ShallowWaterEquations`, so this
   class plugs into `time_integration.semi_lagrangian_crank_nicolson_rk2`.
-  It must NOT be used with Eulerian steppers (`imex_rk_sil3` etc.), which
-  would silently integrate advection-free dynamics: `explicit_terms` returns
-  only the non-advective forcing. All advection is handled by trajectories: momentum is transported as
-  grid-point winds (converted from/to modal vorticity and divergence at the
-  transport boundaries) and the potential perturbation as a scalar, so
-  `explicit_terms` returns only the non-advective forcing:
+  `explicit_terms` raises TypeError so that Eulerian steppers
+  (`imex_rk_sil3` etc.), which would silently integrate advection-free
+  dynamics, are rejected. All advection is handled by trajectories: momentum
+  is transported as grid-point winds (converted from/to modal vorticity and
+  divergence at the transport boundaries) and the potential perturbation as
+  a scalar, so `nonadvective_terms` returns only the non-advective forcing:
 
   - the pressure-gradient coupling between layers and orography,
   - the potential's stretching source `-Φ'δ` (the flux-form Eulerian
@@ -282,7 +282,14 @@ class SemiLagrangianShallowWaterEquations(
       return self.physics_specs.angular_velocity
     return None
 
-  def explicit_terms(self, state: State) -> State:
+  # Reject Eulerian-stepper misuse (see the class docstring): the inherited
+  # ShallowWaterEquations.explicit_terms would otherwise take precedence
+  # over the interface's raising version in the MRO.
+  explicit_terms = (
+      time_integration.SemiLagrangianImplicitExplicitODE.explicit_terms
+  )
+
+  def nonadvective_terms(self, state: State) -> State:
     """Computes non-advective explicit tendencies ("N")."""
     grid = self.coords.horizontal
     # Pressure gradients from other layers and orography; the own-layer
