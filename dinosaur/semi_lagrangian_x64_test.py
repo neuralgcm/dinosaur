@@ -696,6 +696,61 @@ class SemiLagrangianSteppersTest(parameterized.TestCase):
       self.assertGreater(order, 1.7)
       self.assertLess(order, 2.4)
 
+  def test_time_reversed_matches_eulerian_reversal_for_zero_velocities(self):
+    rng = np.random.RandomState(1)
+    state = jnp.asarray(rng.normal(size=(8,)))
+    base = time_integration.ImplicitExplicitODE.from_functions(
+        explicit_terms=lambda x: jnp.sin(x),
+        implicit_terms=lambda x: -2.0 * x,
+        implicit_inverse=lambda x, eta: x / (1 + 2.0 * eta),
+    )
+    dt = 0.2
+    expected = time_integration.crank_nicolson_rk2(
+        time_integration.TimeReversedImExODE(base), dt
+    )(state)
+    reversed_sl = time_integration.TimeReversedSemiLagrangianODE(
+        _IdentityTransportODE(base)
+    )
+    actual = time_integration.semi_lagrangian_crank_nicolson_rk2(
+        reversed_sl, dt
+    )(state)
+    np.testing.assert_allclose(actual, expected, rtol=1e-12)
+
+  def test_time_reversed_round_trip_is_nearly_exact(self):
+    """Forward-then-backward integration returns the initial state.
+
+    For this toy the ring velocity is spatially uniform, which makes the
+    reversed step the near-exact algebraic inverse of the forward step
+    (measured ~2e-14 in float64); any inconsistency in the time-reversed
+    equation (wrong sign, wrong velocity, wrong implicit inverse) would
+    instead show up at the O(dt²) ≈ 1e-3 discretization scale.
+    """
+    equation = _StateDependentRingODE(
+        num_points=64, omega=1.1, gamma=0.4, coupling=2.0
+    )
+    reversed_equation = time_integration.TimeReversedSemiLagrangianODE(
+        equation
+    )
+    state0 = jnp.sin(2 * equation.theta) + 0.8
+    num_steps = 16
+    dt = 0.5 / num_steps
+    forward = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+        ),
+        num_steps,
+    )
+    backward = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(
+                reversed_equation, dt
+            )
+        ),
+        num_steps,
+    )
+    round_trip_error = float(jnp.abs(backward(forward(state0)) - state0).max())
+    self.assertLess(round_trip_error, 1e-9)
+
   def test_settls_step_filter(self):
     equation = _RingAdvectionODE(num_points=16, omega=1.0, gamma=0.5)
     state = jnp.sin(equation.theta)

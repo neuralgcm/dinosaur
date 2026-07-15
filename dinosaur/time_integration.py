@@ -411,6 +411,47 @@ def settls_step_filter(
 
 
 @dataclasses.dataclass
+class TimeReversedSemiLagrangianODE(SemiLagrangianImplicitExplicitODE):
+  """A SemiLagrangianImplicitExplicitODE reversed in time.
+
+  In reversed time τ = -t, trajectories follow the negated velocities and
+  the material derivative of any transported quantity ψ satisfies
+  D̃ψ/D̃τ = -Dψ/Dt, so the reversed equation negates the non-advective and
+  implicit tendencies while reusing transport unchanged. In particular,
+  planetary-momentum transport (`v + 2Ω✕R`) remains correct: the analytic
+  planetary term depends only on position, and its along-trajectory
+  bookkeeping is the same along reversed trajectories.
+
+  Used for digital filter initialization, which integrates both forwards
+  and backwards over the filter window.
+  """
+
+  forward_eq: SemiLagrangianImplicitExplicitODE
+
+  def nonadvective_terms(self, state: PyTreeState) -> PyTreeState:
+    return tree_map(jnp.negative, self.forward_eq.nonadvective_terms(state))
+
+  def implicit_terms(self, state: PyTreeState) -> PyTreeState:
+    return tree_map(jnp.negative, self.forward_eq.implicit_terms(state))
+
+  def implicit_inverse(
+      self, state: PyTreeState, step_size: float,
+  ) -> PyTreeState:
+    return self.forward_eq.implicit_inverse(state, -step_size)
+
+  def nodal_velocities(self, state: PyTreeState) -> typing.Pytree:
+    return tree_map(jnp.negative, self.forward_eq.nodal_velocities(state))
+
+  def departure_points(self, velocities: typing.Pytree, dt: float) -> Any:
+    return self.forward_eq.departure_points(velocities, dt)
+
+  def semi_lagrangian_transport(
+      self, bracket: PyTreeState, departure: Any
+  ) -> PyTreeState:
+    return self.forward_eq.semi_lagrangian_transport(bracket, departure)
+
+
+@dataclasses.dataclass
 class TimeReversedImExODE(ImplicitExplicitODE):
   """An ImplicitExplicitODE reversed in time.
 
@@ -1008,7 +1049,7 @@ def _dfi_lanczos_weights(
 
 
 def digital_filter_initialization(
-    equation: ImplicitExplicitODE,
+    equation: Union[ImplicitExplicitODE, SemiLagrangianImplicitExplicitODE],
     ode_solver: Callable[[ImplicitExplicitODE, float], StateFn],
     filters: Sequence[PyTreeStepFilterFn],
     time_span: float,
@@ -1019,7 +1060,9 @@ def digital_filter_initialization(
 
   Args:
     equation: equation to solve for forward dynamics. This equation must be
-      reversible (i.e., it should only include dynamics).
+      reversible (i.e., it should only include dynamics). Semi-Lagrangian
+      equations are supported (pass a semi-Lagrangian `ode_solver`, e.g.
+      `semi_lagrangian_crank_nicolson_rk2`).
     ode_solver: ODE solver to use for time-stepping.
     filters: sequence of filters to apply after each ODE step forward or
       backwards.
@@ -1038,9 +1081,13 @@ def digital_filter_initialization(
     https://doi.org/10.1175/1520-0493(1992)120<1019:IOTHMU>2.0.CO;2
   """
   def f(state):
+    if isinstance(equation, SemiLagrangianImplicitExplicitODE):
+      reversed_equation = TimeReversedSemiLagrangianODE(equation)
+    else:
+      reversed_equation = TimeReversedImExODE(equation)
     forward_step = step_with_filters(ode_solver(equation, dt), filters)
     backward_step = step_with_filters(
-        ode_solver(TimeReversedImExODE(equation), dt), filters)
+        ode_solver(reversed_equation, dt), filters)
     # for times [1, ..., N] and [-1, ..., -N]
     weights = _dfi_lanczos_weights(time_span, cutoff_period, dt)
     init_weight = 1.0  # for time=0

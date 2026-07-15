@@ -1078,6 +1078,82 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
     with self.assertRaisesRegex(TypeError, 'semi-Lagrangian'):
       step_fn(state0)
 
+  @parameterized.parameters(
+      dict(coriolis_mode='planetary_momentum'),
+      dict(coriolis_mode='explicit'),
+  )
+  def test_jw_steady_state_stays_steady_backward_in_time(self, coriolis_mode):
+    """Reversed-time SL integration also holds the steady state.
+
+    A sign error in the time-reversed planetary-momentum bookkeeping or
+    Coriolis treatment would destroy steadiness immediately.
+    """
+    equation, _, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), coriolis_mode=coriolis_mode
+    )
+    grid = equation.coords.horizontal
+    reversed_equation = time_integration.TimeReversedSemiLagrangianODE(
+        equation
+    )
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    backward_step = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(
+            reversed_equation, dt
+        )
+    )
+    forward_step = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+    )
+    backward = time_integration.repeated(backward_step, 24)(state0)
+    forward = time_integration.repeated(forward_step, 24)(state0)
+    backward_drift = self._l2(
+        grid, backward.temperature_variation, state0.temperature_variation
+    )
+    forward_drift = self._l2(
+        grid, forward.temperature_variation, state0.temperature_variation
+    )
+    # backward integration is exactly as steady as forward (measured drifts
+    # agree to 0.5% at 24 steps); a sign error in the reversed planetary
+    # momentum would inflate the backward drift by orders of magnitude.
+    self.assertLess(backward_drift, 1.5 * forward_drift + 1e-4)
+
+  def test_semi_lagrangian_digital_filter_initialization(self):
+    """SL DFI runs and agrees with Eulerian DFI on the same window."""
+    sl_equation, eulerian, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True
+    )
+    grid = sl_equation.coords.horizontal
+    physics_specs = sl_equation.physics_specs
+    dt = self._nondim_minutes(physics_specs, 30)
+    time_span = self._nondim_minutes(physics_specs, 6 * 60)
+    common = dict(time_span=time_span, cutoff_period=time_span, dt=dt)
+    sl_dfi = jax.jit(
+        time_integration.digital_filter_initialization(
+            equation=sl_equation,
+            ode_solver=time_integration.semi_lagrangian_crank_nicolson_rk2,
+            filters=[],
+            **common,
+        )
+    )
+    eulerian_dfi = jax.jit(
+        time_integration.digital_filter_initialization(
+            equation=eulerian,
+            ode_solver=time_integration.imex_rk_sil3,
+            filters=[],
+            **common,
+        )
+    )
+    sl_filtered = sl_dfi(state0)
+    eulerian_filtered = eulerian_dfi(state0)
+    for field in ['temperature_variation', 'log_surface_pressure']:
+      actual = getattr(sl_filtered, field)
+      self.assertTrue(np.isfinite(np.asarray(actual)).all(), field)
+      self.assertLess(
+          self._l2(grid, actual, getattr(eulerian_filtered, field)),
+          2e-3,
+          field,
+      )
+
   def test_settls_tracks_rk2_on_baroclinic_wave(self):
     """The SETTLS stepper matches the RK2 stepper at half the per-step cost.
 

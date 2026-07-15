@@ -888,6 +888,18 @@ Issues encountered while implementing this plan, by milestone.
   ~560 GB/s (H100) at T85 and drops to ~160 GB/s at T340 with fully random
   indices (a pessimistic bound; real departure points are spatially
   coherent).
+- Digital filter initialization now supports semi-Lagrangian equations
+  (removing the §3.6-era limitation): `TimeReversedSemiLagrangianODE`
+  negates the non-advective and implicit tendencies and the trajectory
+  velocities while reusing transport unchanged — valid because in reversed
+  time the material derivative of any transported quantity flips sign, so
+  planetary-momentum transport needs no special handling.
+  `digital_filter_initialization` dispatches on the equation type. Tests:
+  reversed dynamics match the Eulerian reversal at zero velocities; a
+  forward-backward round trip on the uniform-velocity ring toy is exact to
+  machine precision; the JW steady state is exactly as steady backward as
+  forward (drifts agree to 0.5%); SL DFI matches Eulerian DFI on a ±3 h
+  window to l2 < 2e-3.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
