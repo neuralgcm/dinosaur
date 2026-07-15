@@ -36,4 +36,4 @@ import dinosaur.vertical_interpolation
 import dinosaur.weatherbench_utils
 import dinosaur.xarray_utils
 
-__version__ = "1.3.6"  # keep sync with pyproject.toml
+__version__ = "1.4.0"  # keep sync with pyproject.toml
