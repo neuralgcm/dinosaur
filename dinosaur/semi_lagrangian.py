@@ -633,9 +633,11 @@ def horizontal_departure_points(
   for _ in range(iterations):
     midpoint = _normalize((arrival + departure) / 2)
     lon_mid, sin_lat_mid = cartesian_to_lon_sin_lat(midpoint)
-    wind_mid = jnp.stack(
-        [interpolator(wind[c], lon_mid, sin_lat_mid) for c in range(3)]
-    )
+    # vmap over the three Cartesian components: the stencil indices and
+    # weights are computed once and the gathers batch into one.
+    wind_mid = jax.vmap(
+        lambda component: interpolator(component, lon_mid, sin_lat_mid)
+    )(wind)
     departure = _normalize(arrival - angular_dt * wind_mid)
 
   lon, sin_lat = cartesian_to_lon_sin_lat(departure)
@@ -702,9 +704,11 @@ def departure_points_3d(
     sigma_mid = (sigma_arrival + sigma_departure) / 2
     lon_mid, sin_lat_mid = cartesian_to_lon_sin_lat(midpoint)
     point = dict(lon=lon_mid, sin_lat=sin_lat_mid, sigma=sigma_mid)
-    wind_mid = jnp.stack(
-        [interpolate(wind[c], sigma_nodes=centers, **point) for c in range(3)]
-    )
+    # vmap over the three Cartesian components: the stencil indices and
+    # weights are computed once and the gathers batch into one.
+    wind_mid = jax.vmap(
+        functools.partial(interpolate, sigma_nodes=centers, **point)
+    )(wind)
     sigma_dot_mid = interpolate(sigma_dot, sigma_nodes=boundaries, **point)
     departure = _normalize(arrival - angular_dt * wind_mid)
     sigma_departure = jnp.clip(
@@ -883,7 +887,9 @@ def transport_wind(
       order=interpolator.order,
       limiter=None,
   )
-  wind_departure = jnp.stack([interpolate(wind[c]) for c in range(3)])
+  # vmap over the three Cartesian components: the stencil indices and
+  # weights are computed once and the gathers batch into one.
+  wind_departure = jax.vmap(interpolate)(wind)
   return _finish_wind_transport(
       wind_departure, departure, grid, rotate, planetary_rotation_rate
   )
@@ -919,9 +925,11 @@ def transport_wind_2d(
   unlimited = dataclasses.replace(interpolator, limiter=None)
   lon_mesh, sin_lat_mesh = grid.nodal_mesh
   wind = cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
-  wind_departure = jnp.stack(
-      [unlimited(wind[c], departure.lon, departure.sin_lat) for c in range(3)]
-  )
+  # vmap over the three Cartesian components: the stencil indices and
+  # weights are computed once and the gathers batch into one.
+  wind_departure = jax.vmap(
+      lambda component: unlimited(component, departure.lon, departure.sin_lat)
+  )(wind)
   return _finish_wind_transport(
       wind_departure, departure, grid, rotate, planetary_rotation_rate
   )
