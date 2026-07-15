@@ -900,6 +900,18 @@ Issues encountered while implementing this plan, by milestone.
   machine precision; the JW steady state is exactly as steady backward as
   forward (drifts agree to 0.5%); SL DFI matches Eulerian DFI on a ±3 h
   window to l2 < 2e-3.
+- The §9.8 Δt-extension study now has real-data GPU numbers (Modal
+  A100-80GB, float32): 2-day T170/L32 forecasts from ERA5 (1990-05-01),
+  raw initialization, hyperdiffusion filter as in the ERA5 notebook.
+  Eulerian `imex_rk_sil3` at its notebook dt = 5 min costs 7.2 s per
+  simulated day; the SL core is stable through dt = 60 min with day-2
+  surface-pressure agreement of 0.2% (10-20 min), 0.3% (30 min), 0.5%
+  (45 min) and 0.7% (60 min). Quality degrades before stability does: the
+  temperature maximum develops a localized hot anomaly beyond 30 min
+  (+9 K at 45 min, +34 K at 60 min — the classic large-Δt symptom that
+  off-centering exists to treat), so dt = 30 min (6✕ the Eulerian
+  notebook, 3.9✕ wall-clock speedup at 1.8 s per simulated day) is the
+  tuned operating point used in the semi-Lagrangian ERA5 notebook.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
