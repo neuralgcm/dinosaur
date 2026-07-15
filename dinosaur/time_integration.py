@@ -276,10 +276,12 @@ def semi_lagrangian_crank_nicolson_rk2(
       arrival mesh, which compiles to cheaper code — hence False by
       default. Its use is enabling `departure_iterations=1` on the
       equation: one warm-started iteration matches the residual of two
-      cold ones, saving ~18% of step time at T170/L32 on A100, with
-      trajectory error still an order of magnitude below discretization
-      error at a 30-minute step (a cold single iteration is not accurate
-      enough).
+      cold ones, saving ~18% of step time at T170/L32 on A100. The
+      trajectory-truncation error stays below — though within a factor of
+      ~2 of — the converged scheme's own sensitivity to the time step
+      (1.1e-4 vs 2.3e-4 relative l2 on T′ over a 12 h T85 baroclinic wave
+      at dt = 30 min, against 30 → 7.5 min refinement); a cold single
+      iteration (3.6e-3) is not accurate enough.
 
   Returns:
     Function that performs a time step.
@@ -364,7 +366,10 @@ def semi_lagrangian_settls(
       residual by well over an order of magnitude at two iterations, since
       the carried refinement compounds across steps; with
       `departure_iterations=1` on the equation it matches the two-cold-
-      iteration residual at ~22% less step time.
+      iteration residual at ~22% less step time (trajectory-truncation
+      error 1.5e-5 relative l2 on T′ over a 12 h T85 baroclinic wave at
+      dt = 30 min, ~15✕ below the converged scheme's 2.3e-4 sensitivity
+      to 30 → 7.5 min time-step refinement).
 
   Returns:
     Function mapping `(x, aux)` to the next `(x, aux)`.

@@ -1011,9 +1011,17 @@ Issues encountered while implementing this plan, by milestone.
   iterations — it is slightly slower because a cold corrector's first
   iteration interpolates at the constant arrival mesh, which XLA
   constant-folds (visible on CPU and GPU alike) — and documented as the
-  enabler for `departure_iterations=1` (−18% RK2 / −22% SETTLS step time
-  at trajectory error still an order of magnitude below discretization
-  error at the 30-minute operating point).
+  enabler for `departure_iterations=1` (−18% RK2 / −22% SETTLS step time).
+  Yardstick for the single-iteration accuracy: the converged
+  (8-iteration) scheme's own sensitivity to time-step refinement
+  (30 → 7.5 min) in the same 12 h T85 experiment is 2.3e-4 on T′, so
+  warm-1 trajectory truncation sits ~2✕ below it for RK2 (1.1e-4) and
+  ~15✕ below for SETTLS (1.5e-5). Note the refinement comparison is not a
+  clean time-order measurement (observed rate ~0.6, not 2): in SL cores
+  smaller steps mean *more* interpolation applications, so interpolation
+  diffusion partially offsets the smaller truncation terms — a
+  well-known SL trade-off that also argues for the long-step operating
+  points used here.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
