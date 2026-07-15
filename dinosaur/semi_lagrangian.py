@@ -660,15 +660,15 @@ def horizontal_departure_points(
   components, with no per-iteration rotation matrices, no spherical-polar
   trigonometric solve, and no double-precision requirement near the poles —
   is the same reformulation ECMWF adopted for the IFS in Cycle 48r1
-  (Diamantakis & Váňa 2022; ECMWF Newsletter 173). A refinement from that
-  work not implemented here: warm-starting the iteration from previously
-  computed departure points instead of the arrival points (the IFS uses the
-  previous time step's, cutting its iteration count from 5 to 3 at equal
-  accuracy). The natural analog for the one-step RK2 stepper would be
-  initializing the corrector stage's solve from the predictor stage's
-  departure points — no multistep memory required — which would need an
-  initial-guess argument here; profiling shows the departure solve dominates
-  semi-Lagrangian cost on GPU, so this is a worthwhile extension.
+  (Diamantakis & Váňa 2022; ECMWF Newsletter 173). That work's warm-start
+  refinement — starting the iteration from previously computed departure
+  points instead of the arrival points, which let the IFS cut its iteration
+  count from 5 to 3 at equal accuracy — is available via `initial_guess`:
+  the SETTLS stepper carries the previous step's departure points
+  (`warm_start_departures`), and the one-step RK2 stepper seeds its
+  corrector stage's solve from the predictor's (`warm_start_corrector`,
+  no multistep memory required). One warm-started iteration matches the
+  residual of two cold ones on baroclinic flows.
 
   Args:
     u: nodal zonal wind (true winds, not cosθ-scaled) of shape
