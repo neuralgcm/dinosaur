@@ -21,7 +21,6 @@ from dinosaur import hybrid_coordinates
 from dinosaur import primitive_equations
 from dinosaur import primitive_equations_states
 from dinosaur import scales
-from dinosaur import semi_lagrangian
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
@@ -1222,52 +1221,6 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
     # measured 2.4e-4, same scale as the RK2 warm-start difference above.
     self.assertLess(difference, 1e-3)
     self.assertGreater(difference, 0.0)
-
-  def test_step_filter_for_nodal_tracers_touches_only_nodal_tracers(self):
-    """The nodal filter applies to named nodal tracers and nothing else."""
-    grid = spherical_harmonic.Grid.T21()
-    rng = np.random.RandomState(0)
-    nodal_shape = (4,) + grid.nodal_shape
-    state0 = primitive_equations.State(
-        vorticity=jnp.asarray(rng.standard_normal(nodal_shape)),
-        divergence=jnp.asarray(rng.standard_normal(nodal_shape)),
-        temperature_variation=jnp.asarray(rng.standard_normal(nodal_shape)),
-        log_surface_pressure=jnp.asarray(
-            rng.standard_normal((1,) + grid.nodal_shape)
-        ),
-        tracers={
-            'modal_tracer': jnp.asarray(rng.standard_normal(nodal_shape)),
-            'sharp_tracer': jnp.asarray(rng.uniform(0.0, 1.0, nodal_shape)),
-        },
-    )
-    nodal_filter = semi_lagrangian.nodal_diffusion_filter(
-        grid, dt=1.0, tau=1.0, order=2
-    )
-    step_filter = primitive_equations.step_filter_for_nodal_tracers(
-        nodal_filter, nodal_tracers=('sharp_tracer',)
-    )
-    filtered = step_filter(state0, state0)
-    with self.subTest('nodal tracer is filtered'):
-      self.assertGreater(
-          float(
-              np.abs(
-                  np.asarray(filtered.tracers['sharp_tracer'])
-                  - np.asarray(state0.tracers['sharp_tracer'])
-              ).max()
-          ),
-          0.0,
-      )
-    with self.subTest('other tracers and state pass through untouched'):
-      np.testing.assert_array_equal(
-          filtered.tracers['modal_tracer'], state0.tracers['modal_tracer']
-      )
-      np.testing.assert_array_equal(filtered.vorticity, state0.vorticity)
-    with self.subTest('missing tracer name fails fast'):
-      bad_filter = primitive_equations.step_filter_for_nodal_tracers(
-          nodal_filter, nodal_tracers=('absent',)
-      )
-      with self.assertRaises(KeyError):
-        bad_filter(state0, state0)
 
   def test_settls_tracks_rk2_on_baroclinic_wave(self):
     """The SETTLS stepper matches the RK2 stepper at half the per-step cost.

@@ -43,21 +43,15 @@ References:
     climate models. Q. J. R. Meteorol. Soc., 148, 670-684. (Introduced in
     the IFS as "a new way of computing semi-Lagrangian advection", ECMWF
     Newsletter 173, 2022.)
-  Shapiro, R., 1970: Smoothing, filtering, and boundary effects. Rev.
-    Geophys., 8, 359-387.
   Staniforth, A. & Côté, J., 1991: Semi-Lagrangian integration schemes for
     atmospheric models — a review. Mon. Wea. Rev., 119.
-  Váňa, F., Bénard, P., Geleyn, J.-F., Simon, A. & Seity, Y., 2008:
-    Semi-Lagrangian advection scheme with controlled damping: an
-    alternative to nonlinear horizontal diffusion in a numerical weather
-    prediction model. Q. J. R. Meteorol. Soc., 134, 523-537.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Callable, NamedTuple
+from typing import NamedTuple
 
 from dinosaur import coordinate_systems
 from dinosaur import sigma_coordinates
@@ -1024,107 +1018,3 @@ def transport_wind_2d(
   return _finish_wind_transport(
       wind_departure, departure, grid, rotate, planetary_rotation_rate
   )
-
-
-def nodal_diffusion_filter(
-    grid: spherical_harmonic.Grid,
-    dt: float,
-    tau: float,
-    order: int = 2,
-) -> Callable[[Array], jnp.ndarray]:
-  """Returns a grid-space smoothing filter for nodal fields.
-
-  The nodal analogue of `time_integration.horizontal_diffusion_step_filter`:
-  nodal tracers never enter the spectral basis, so they receive no spectral
-  hyperdiffusion, and with purely advective dynamics nothing removes the
-  grid-scale variance that the deformation of the flow generates — cubic
-  interpolation's implicit damping vanishes for near-stationary features.
-  This filter supplies that missing dissipation with a separable
-  index-space smoother: periodic in longitude and using cross-pole halo
-  rows in latitude (the same halo machinery as transport, so the pole rows
-  are handled exactly).
-
-  Per step and per direction the response on a wave of index wavenumber k
-  is `1 - mu·sin²(kΔ/2)` for `order=1` (the 1-2-1 kernel) or
-  `1 - mu·sin⁴(kΔ/2)` for `order=2` (a Shapiro-type δ⁴ kernel), with
-  `mu = 1 - exp(-dt/tau)` so that `tau` is the e-folding time of the
-  two-gridpoint mode — the same convention as the spectral filter, whose
-  `tau` is a natural default here. `order=2` matches the scale selectivity
-  of the modal ∇⁴ hyperdiffusion (at equal `tau` it damps an 8Δ wave ~7x
-  more slowly than `order=1`) and is the default.
-
-  Shape preservation: the `order=1` kernel is a convex combination, so it
-  is positivity-preserving and creates no new extrema unconditionally. The
-  `order=2` kernel can overshoot, so its result is clipped to the local
-  3✕3 range of the unfiltered field (Bermejo & Staniforth-style), which
-  restores the same guarantee.
-
-  Caveats: the filter acts in index space (like operational Shapiro
-  filtering), so near the poles the longitude pass acts on physically
-  small scales, and the two rings nearest each pole receive slightly
-  stronger smoothing because the latitude spacing jumps across the pole
-  (a ~1% one-pass effect at mu = 1 for smooth O(1) fields, bounded by the
-  order-2 range clip); and like semi-Lagrangian transport itself it is
-  not exactly mass-conserving (the latitude pass ignores Gaussian
-  quadrature weights). For flow-adaptive damping applied through the transport
-  interpolation itself, see the SLHD scheme of Váňa et al. (2008), noted
-  in the module references.
-
-  Args:
-    grid: the horizontal grid.
-    dt: (nondimensional) time step between filter applications.
-    tau: e-folding time of the two-gridpoint mode, in the units of `dt`.
-    order: 1 for the monotone 1-2-1 kernel, 2 (default) for the
-      scale-selective Shapiro δ⁴ kernel with a local-range clip.
-
-  Returns:
-    A function mapping a nodal field of shape [..., longitude_nodes,
-    latitude_nodes] to the filtered field of the same shape.
-  """
-  if order not in (1, 2):
-    raise ValueError(f'unsupported {order=}; expected 1 or 2')
-  mu = float(1 - np.exp(-dt / tau))
-  h = _HALO_WIDTH
-
-  def second_difference_lon(x):
-    return (jnp.roll(x, 1, axis=-2) - 2 * x + jnp.roll(x, -1, axis=-2)) / 4
-
-  def second_difference_lat(x):
-    n = x.shape[-1]
-    extended = _extend_with_pole_halo(x, grid)
-    return (
-        extended[..., h - 1 : h - 1 + n]
-        - 2 * x
-        + extended[..., h + 1 : h + 1 + n]
-    ) / 4
-
-  def local_range(x):
-    n = x.shape[-1]
-    extended = _extend_with_pole_halo(x, grid)
-    low = high = None
-    for lat_slice in (
-        slice(h - 1, h - 1 + n),
-        slice(h, h + n),
-        slice(h + 1, h + 1 + n),
-    ):
-      band = extended[..., lat_slice]
-      for shift in (-1, 0, 1):
-        rolled = jnp.roll(band, shift, axis=-2) if shift else band
-        low = rolled if low is None else jnp.minimum(low, rolled)
-        high = rolled if high is None else jnp.maximum(high, rolled)
-    return low, high
-
-  def apply_filter(field: Array) -> jnp.ndarray:
-    field = jnp.asarray(field)
-    result = field
-    for second_difference in (second_difference_lon, second_difference_lat):
-      increment = second_difference(result)
-      if order == 2:
-        increment = -second_difference(increment)
-      result = result + mu * increment
-    if order == 2:
-      low, high = local_range(field)
-      result = jnp.clip(result, low, high)
-    return result
-
-  return apply_filter
