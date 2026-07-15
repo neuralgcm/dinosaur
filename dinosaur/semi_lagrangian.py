@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import math
 
 from dinosaur import coordinate_systems
 from dinosaur import sigma_coordinates
@@ -365,7 +364,12 @@ def _linear_cell_slice(order: str) -> slice:
 
 
 def _gather_2d(field_extended: Array, stencil: _HorizontalStencil) -> Array:
-  """Gathers stencil values [..., stencil, stencil] from [lon, lat_ext]."""
+  """Gathers stencil values [..., stencil, stencil] from [lon, lat_ext].
+
+  Uses a single 1-D gather with precomputed linear indices; the `ravel` of
+  the contiguous field compiles to a zero-cost bitcast (see the analogous
+  gather in `interpolate_3d`).
+  """
   flat_index = (
       stencil.lon_index[..., :, jnp.newaxis] * stencil.extended_latitude_size
       + stencil.lat_index[..., jnp.newaxis, :]
@@ -465,7 +469,7 @@ class GridInterpolator:
     return _interpolate_horizontal(field, self.grid, stencil, order, limiter)
 
 
-def interpolate_levels(
+def interpolate_3d(
     field: Array,
     grid: spherical_harmonic.Grid,
     lon: Array,
@@ -529,6 +533,10 @@ def interpolate_levels(
 
   extended = _extend_with_pole_halo(field, grid)
   extended_latitude_size = extended.shape[-1]
+  # One 1-D gather on the flattened field with precomputed linear indices:
+  # `ravel` of the contiguous field compiles to a zero-cost bitcast, and the
+  # single gather lowers more efficiently than the equivalent multi-array
+  # advanced indexing, with defined out-of-bounds semantics via mode='clip'.
   # int32 indices limit the flattened size to 2**31 elements: ample for any
   # realistic grid (the limit is roughly T1700 at 137 levels).
   flat_index = (
@@ -684,7 +692,7 @@ def departure_points_3d(
   wind = cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
   angular_dt = dt / grid.radius
   interpolate = functools.partial(
-      interpolate_levels, grid=grid, order='linear'
+      interpolate_3d, grid=grid, order='linear'
   )
 
   departure = arrival
@@ -754,7 +762,7 @@ def transport_scalar(
   """
   if departure.sigma is None:
     raise ValueError('transport_scalar requires 3-D departure points')
-  return interpolate_levels(
+  return interpolate_3d(
       field,
       interpolator.grid,
       departure.lon,
@@ -866,7 +874,7 @@ def transport_wind(
   lon_mesh, sin_lat_mesh = grid.nodal_mesh
   wind = cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
   interpolate = functools.partial(
-      interpolate_levels,
+      interpolate_3d,
       grid=grid,
       lon=departure.lon,
       sin_lat=departure.sin_lat,

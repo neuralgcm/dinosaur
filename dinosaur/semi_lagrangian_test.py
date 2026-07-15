@@ -226,7 +226,7 @@ class InterpolatorTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, 'unknown interpolation limiter'):
       semi_lagrangian.GridInterpolator(grid, 'cubic', limiter='bogus')
     with self.assertRaisesRegex(ValueError, 'unknown interpolation limiter'):
-      semi_lagrangian.interpolate_levels(
+      semi_lagrangian.interpolate_3d(
           jnp.zeros((2,) + grid.nodal_shape),
           grid,
           jnp.zeros((3,)),
@@ -279,7 +279,7 @@ class InterpolatorTest(parameterized.TestCase):
       self.assertGreaterEqual(np.min(np.asarray(limited)), 0.0)
       self.assertLessEqual(np.max(np.asarray(limited)), 1.0)
 
-  def test_interpolate_levels_linear_in_sigma(self):
+  def test_interpolate_3d_linear_in_sigma(self):
     grid = spherical_harmonic.Grid.T21()
     vertical = sigma_coordinates.SigmaCoordinates.equidistant(8)
     centers = vertical.centers
@@ -295,7 +295,7 @@ class InterpolatorTest(parameterized.TestCase):
     sin_lat = jnp.asarray(np.sin(rng.uniform(-1.4, 1.4, size=shape)))
     # includes out-of-range sigma to exercise constant extrapolation.
     sigma = jnp.asarray(rng.uniform(-0.2, 1.2, size=shape))
-    values = semi_lagrangian.interpolate_levels(
+    values = semi_lagrangian.interpolate_3d(
         field, grid, lon, sin_lat, sigma, sigma_nodes=centers, order='linear'
     )
     sigma_clipped = np.clip(sigma, centers[0], centers[-1])
@@ -305,7 +305,7 @@ class InterpolatorTest(parameterized.TestCase):
     # exact in phi, so allow a modest tolerance.
     np.testing.assert_allclose(values, expected, rtol=1e-3)
 
-  def test_interpolate_levels_monotone(self):
+  def test_interpolate_3d_monotone(self):
     grid = spherical_harmonic.Grid.T21()
     vertical = sigma_coordinates.SigmaCoordinates.equidistant(6)
     rng = np.random.RandomState(7)
@@ -316,7 +316,7 @@ class InterpolatorTest(parameterized.TestCase):
     lon = jnp.asarray(rng.uniform(0, 2 * np.pi, size=shape))
     sin_lat = jnp.asarray(np.sin(rng.uniform(-1.5, 1.5, size=shape)))
     sigma = jnp.asarray(rng.uniform(0, 1, size=shape))
-    values = semi_lagrangian.interpolate_levels(
+    values = semi_lagrangian.interpolate_3d(
         field,
         grid,
         lon,
