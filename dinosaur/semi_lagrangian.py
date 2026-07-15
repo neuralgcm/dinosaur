@@ -347,6 +347,17 @@ def _horizontal_stencil(
   )
 
 
+_LIMITERS = ('quasi_monotone',)
+
+
+def _validate_limiter(limiter: str | None) -> None:
+  if limiter is not None and limiter not in _LIMITERS:
+    raise ValueError(
+        f'unknown interpolation {limiter=}; valid values are None (no '
+        f'limiting) or one of {_LIMITERS}'
+    )
+
+
 def _linear_cell_slice(order: str) -> slice:
   """Slice selecting the 2-point bracketing cell within a stencil."""
   start = -int(_stencil_offsets(order)[0])
@@ -367,14 +378,14 @@ def _interpolate_horizontal(
     grid: spherical_harmonic.Grid,
     stencil: _HorizontalStencil,
     order: str,
-    monotone: bool,
+    limiter: str | None,
 ) -> jnp.ndarray:
   """Interpolates a single [lon, lat] field with a precomputed stencil."""
   values = _gather_2d(_extend_with_pole_halo(field, grid), stencil)
   result = einsum(
       '...i,...j,...ij->...', stencil.lon_weights, stencil.lat_weights, values
   )
-  if monotone:
+  if limiter == 'quasi_monotone':
     cell = _linear_cell_slice(order)
     corners = values[..., cell, cell]
     result = jnp.clip(
@@ -397,15 +408,19 @@ class GridInterpolator:
   Attributes:
     grid: the horizontal grid holding the source data.
     order: 'linear' (2✕2 stencil) or 'cubic' (4✕4 stencil).
-    monotone: if True, applies the quasi-monotone limiter of Bermejo &
-      Staniforth (1992): interpolated values are clipped to the range of the
-      2✕2 bracketing cell corners, which prevents new extrema (and preserves
-      positivity) at the cost of formal accuracy at extrema.
+    limiter: None (the default) for unlimited interpolation, or
+      'quasi_monotone' for the limiter of Bermejo & Staniforth (1992):
+      interpolated values are clipped to the range of the 2✕2 bracketing
+      cell corners, which prevents new extrema (and preserves positivity)
+      at the cost of formal accuracy at extrema.
   """
 
   grid: spherical_harmonic.Grid
   order: str = 'cubic'
-  monotone: bool = False
+  limiter: str | None = None
+
+  def __post_init__(self):
+    _validate_limiter(self.limiter)
 
   def __call__(self, field: Array, lon: Array, sin_lat: Array) -> jnp.ndarray:
     """Interpolates `field` at the points (lon, sin_lat).
@@ -423,7 +438,7 @@ class GridInterpolator:
     """
     field = jnp.asarray(field)
     interpolate = functools.partial(
-        self._interpolate_single, order=self.order, monotone=self.monotone
+        self._interpolate_single, order=self.order, limiter=self.limiter
     )
     if field.ndim == 2:
       return interpolate(field, lon, sin_lat)
@@ -439,10 +454,15 @@ class GridInterpolator:
     return jax.vmap(interpolate)(field, lon, sin_lat)
 
   def _interpolate_single(
-      self, field: Array, lon: Array, sin_lat: Array, order: str, monotone: bool
+      self,
+      field: Array,
+      lon: Array,
+      sin_lat: Array,
+      order: str,
+      limiter: str | None,
   ) -> jnp.ndarray:
     stencil = _horizontal_stencil(self.grid, lon, sin_lat, order)
-    return _interpolate_horizontal(field, self.grid, stencil, order, monotone)
+    return _interpolate_horizontal(field, self.grid, stencil, order, limiter)
 
 
 def interpolate_levels(
@@ -454,7 +474,7 @@ def interpolate_levels(
     sigma_nodes: np.ndarray,
     *,
     order: str = 'cubic',
-    monotone: bool = False,
+    limiter: str | None = None,
 ) -> jnp.ndarray:
   """Interpolates a 3-D field at points (lon, sin_lat, sigma).
 
@@ -475,12 +495,14 @@ def interpolate_levels(
     sigma_nodes: increasing σ values at which `field` levels live (layer
       centers for prognostic fields, layer boundaries for vertical velocity).
     order: horizontal interpolation order, 'linear' or 'cubic'.
-    monotone: if True, clips interpolated values to the range of the 2✕2✕2
-      bracketing cell corners (quasi-monotone limiter).
+    limiter: None for unlimited interpolation, or 'quasi_monotone' to clip
+      interpolated values to the range of the 2✕2✕2 bracketing cell corners
+      (the Bermejo & Staniforth 1992 limiter).
 
   Returns:
     Interpolated values of shape `lon.shape`.
   """
+  _validate_limiter(limiter)
   field = jnp.asarray(field)
   if len(sigma_nodes) < 2:
     raise ValueError('vertical interpolation requires at least 2 levels')
@@ -523,7 +545,7 @@ def interpolate_levels(
       stencil.lat_weights,
       values,
   )
-  if monotone:
+  if limiter == 'quasi_monotone':
     cell = _linear_cell_slice(order)
     corners = values[..., :, cell, cell]
     result = jnp.clip(
@@ -724,8 +746,8 @@ def transport_scalar(
       latitude_nodes].
     departure: 3-D departure points (with σ coordinates).
     vertical: vertical coordinates on which `field` lives.
-    interpolator: interpolation rule (its grid, order and monotone limiter
-      settings are used).
+    interpolator: interpolation rule (its grid, order and limiter settings
+      are used).
 
   Returns:
     The transported field at arrival points, shaped like `departure.lon`.
@@ -740,7 +762,7 @@ def transport_scalar(
       departure.sigma,
       sigma_nodes=vertical.centers,
       order=interpolator.order,
-      monotone=interpolator.monotone,
+      limiter=interpolator.limiter,
   )
 
 
@@ -822,8 +844,7 @@ def transport_wind(
     v: nodal meridional wind, same shape as `u`.
     departure: 3-D departure points (with σ coordinates).
     vertical: vertical coordinates on which the winds live.
-    interpolator: interpolation rule. The monotone limiter is not applied to
-      winds.
+    interpolator: interpolation rule. Limiters are never applied to winds.
     rotate: whether to parallel-transport interpolated vectors from the
       departure to the arrival tangent plane.
     planetary_rotation_rate: if not None, transport the planetary momentum
@@ -852,7 +873,7 @@ def transport_wind(
       sigma=departure.sigma,
       sigma_nodes=vertical.centers,
       order=interpolator.order,
-      monotone=False,
+      limiter=None,
   )
   wind_departure = jnp.stack([interpolate(wind[c]) for c in range(3)])
   return _finish_wind_transport(
@@ -872,12 +893,12 @@ def transport_wind_2d(
   """Remaps horizontal winds along 2-D trajectories (see `transport_wind`).
 
   Args:
-    u: nodal zonal wind (true winds, not cosθ-scaled) of shape [*batch,
-      longitude_nodes, latitude_nodes].
+    u: nodal zonal wind (true winds, not cosθ-scaled) of shape
+      [longitude_nodes, latitude_nodes] or [levels, longitude_nodes,
+      latitude_nodes].
     v: nodal meridional wind, same shape as `u`.
     departure: horizontal departure points with fields shaped like `u`.
-    interpolator: interpolation rule. The monotone limiter is not applied to
-      winds.
+    interpolator: interpolation rule. Limiters are never applied to winds.
     rotate: whether to parallel-transport interpolated vectors from the
       departure to the arrival tangent plane.
     planetary_rotation_rate: if not None, transport the planetary momentum
@@ -887,7 +908,7 @@ def transport_wind_2d(
     Tuple (u, v) of transported winds at arrival points.
   """
   grid = interpolator.grid
-  unlimited = dataclasses.replace(interpolator, monotone=False)
+  unlimited = dataclasses.replace(interpolator, limiter=None)
   lon_mesh, sin_lat_mesh = grid.nodal_mesh
   wind = cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
   wind_departure = jnp.stack(

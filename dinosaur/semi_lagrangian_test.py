@@ -116,14 +116,14 @@ class GeometryTest(parameterized.TestCase):
 class InterpolatorTest(parameterized.TestCase):
 
   @parameterized.parameters(
-      dict(order='linear', monotone=False),
-      dict(order='linear', monotone=True),
-      dict(order='cubic', monotone=False),
-      dict(order='cubic', monotone=True),
+      dict(order='linear', limiter=None),
+      dict(order='linear', limiter='quasi_monotone'),
+      dict(order='cubic', limiter=None),
+      dict(order='cubic', limiter='quasi_monotone'),
   )
-  def test_exact_for_constants(self, order, monotone):
+  def test_exact_for_constants(self, order, limiter):
     grid = spherical_harmonic.Grid.T21()
-    interpolator = semi_lagrangian.GridInterpolator(grid, order, monotone)
+    interpolator = semi_lagrangian.GridInterpolator(grid, order, limiter)
     field = 2.5 * jnp.ones(grid.nodal_shape)
     rng = np.random.RandomState(0)
     lon = rng.uniform(0, 2 * np.pi, size=200)
@@ -221,6 +221,21 @@ class InterpolatorTest(parameterized.TestCase):
       )
       np.testing.assert_allclose(batched[k], single, atol=1e-6)
 
+  def test_unknown_limiter_is_rejected(self):
+    grid = spherical_harmonic.Grid.T21()
+    with self.assertRaisesRegex(ValueError, 'unknown interpolation limiter'):
+      semi_lagrangian.GridInterpolator(grid, 'cubic', limiter='bogus')
+    with self.assertRaisesRegex(ValueError, 'unknown interpolation limiter'):
+      semi_lagrangian.interpolate_levels(
+          jnp.zeros((2,) + grid.nodal_shape),
+          grid,
+          jnp.zeros((3,)),
+          jnp.zeros((3,)),
+          jnp.zeros((3,)),
+          sigma_nodes=np.array([0.25, 0.75]),
+          limiter='bogus',
+      )
+
   def test_grids_with_pole_nodes_are_rejected(self):
     grid = spherical_harmonic.Grid(
         longitude_wavenumbers=22,
@@ -251,10 +266,10 @@ class InterpolatorTest(parameterized.TestCase):
     rng = np.random.RandomState(5)
     lon = jnp.asarray(rng.uniform(0, 2 * np.pi, size=1000))
     sin_lat = jnp.asarray(np.sin(rng.uniform(-0.3, 0.3, size=1000)))
-    unlimited = semi_lagrangian.GridInterpolator(grid, 'cubic', False)(
+    unlimited = semi_lagrangian.GridInterpolator(grid, 'cubic')(
         field, lon, sin_lat
     )
-    limited = semi_lagrangian.GridInterpolator(grid, 'cubic', True)(
+    limited = semi_lagrangian.GridInterpolator(grid, 'cubic', 'quasi_monotone')(
         field, lon, sin_lat
     )
     with self.subTest('cubic overshoots without limiter'):
@@ -309,7 +324,7 @@ class InterpolatorTest(parameterized.TestCase):
         sigma,
         sigma_nodes=vertical.centers,
         order='cubic',
-        monotone=True,
+        limiter='quasi_monotone',
     )
     self.assertGreaterEqual(np.min(np.asarray(values)), 0.0)
 

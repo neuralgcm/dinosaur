@@ -859,7 +859,13 @@ Issues encountered while implementing this plan, by milestone.
   review: `GridInterpolator` no longer supports arbitrary leading batch
   dimensions via silent reshapes — fields are [lon, lat] or
   [levels, lon, lat] with an explicit `jax.vmap` over the levels axis,
-  matching dinosaur's array conventions.
+  matching dinosaur's array conventions. The limiter option became a string
+  (`limiter='quasi_monotone' | None` instead of `monotone: bool`, validated
+  with a clear error) so future shape-preservation variants — e.g. an
+  IFS-style positive-definite clip — extend the same option rather than
+  breaking it; conservative fixers (Priestley/Bermejo–Conde) remain
+  deliberately outside this interface, as global post-transport corrections
+  at the equation level.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 

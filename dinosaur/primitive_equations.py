@@ -1877,7 +1877,7 @@ class SemiLagrangianPrimitiveEquations(
       tracer_interpolator = semi_lagrangian.GridInterpolator(
           grid,
           self.interpolation_order,
-          monotone=name in self.monotone_tracers,
+          limiter='quasi_monotone' if name in self.monotone_tracers else None,
       )
       if name in self.nodal_tracers:
         # nodal tracers never touch the spectral basis: transport their grid

@@ -98,7 +98,7 @@ def normalized_errors(grid, actual, expected):
   return float(l2), float(linf)
 
 
-def advect_static_flow(grid, u, v, field, dt, steps, order, monotone):
+def advect_static_flow(grid, u, v, field, dt, steps, order, limiter):
   """Advects `field` by a steady flow with repeated SL transport steps.
 
   For a steady flow the departure points are the same every step, so they are
@@ -107,7 +107,7 @@ def advect_static_flow(grid, u, v, field, dt, steps, order, monotone):
   departure = semi_lagrangian.horizontal_departure_points(
       jnp.asarray(u), jnp.asarray(v), grid, dt=dt
   )
-  interpolator = semi_lagrangian.GridInterpolator(grid, order, monotone)
+  interpolator = semi_lagrangian.GridInterpolator(grid, order, limiter)
   transport = functools.partial(
       semi_lagrangian.transport_scalar_2d,
       departure=departure,
@@ -137,7 +137,7 @@ class WilliamsonCase1Test(parameterized.TestCase):
     dt = 1.0 / 100  # max CFL ~1.3 at T42: beyond Eulerian limits
     u, v = solid_body_winds_tilted(grid, alpha, u0)
     result = advect_static_flow(
-        grid, u, v, field0, dt, steps, order='cubic', monotone=False
+        grid, u, v, field0, dt, steps, order='cubic', limiter=None
     )
     # Compare against the analytically rotated initial condition (a partial
     # revolution, so a no-op transport cannot pass). The error is dominated
@@ -166,7 +166,7 @@ class WilliamsonCase1Test(parameterized.TestCase):
       u, v = solid_body_winds_tilted(grid, np.pi / 2, 2 * np.pi)
       result = advect_static_flow(
           grid, u, v, field0, dt=1 / 100, steps=100, order='cubic',
-          monotone=False,
+          limiter=None,
       )
       errors[name], _ = normalized_errors(grid, result, field0)
     # measured ratio ~5x (l2 of 0.37 vs 0.07).
@@ -182,7 +182,7 @@ class WilliamsonCase1Test(parameterized.TestCase):
     steps = 75  # three quarters of a revolution: a no-op transport fails
     result = advect_static_flow(
         grid, u, v, field0, dt=1 / 100, steps=steps, order='cubic',
-        monotone=True,
+        limiter='quasi_monotone',
     )
     result = np.asarray(result)
     axis = np.array([-1.0, 0.0, 0.0])
@@ -306,10 +306,10 @@ class PositivityTest(parameterized.TestCase):
     sl_steps = 16  # CFL ~2: fewer remaps preserve the sharp hill better
     sl_dt = revolution_fraction / sl_steps
     limited = advect_static_flow(
-        grid, u, v, field0, sl_dt, sl_steps, order='cubic', monotone=True
+        grid, u, v, field0, sl_dt, sl_steps, order='cubic', limiter='quasi_monotone'
     )
     unlimited = advect_static_flow(
-        grid, u, v, field0, sl_dt, sl_steps, order='cubic', monotone=False
+        grid, u, v, field0, sl_dt, sl_steps, order='cubic', limiter=None
     )
     spectral_steps = 512
     spectral = self.spectral_advection(
