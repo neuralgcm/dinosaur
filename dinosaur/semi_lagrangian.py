@@ -38,6 +38,11 @@ References:
     advection schemes to quasi-monotone schemes. Mon. Wea. Rev., 120.
   Diamantakis, M., 2014: The semi-Lagrangian technique in atmospheric
     modelling. ECMWF Seminar on Numerical Methods.
+  Diamantakis, M. & Váňa, F., 2022: A fast converging and concise algorithm
+    for computing the departure points in semi-Lagrangian weather and
+    climate models. Q. J. R. Meteorol. Soc., 148, 670-684. (Introduced in
+    the IFS as "a new way of computing semi-Lagrangian advection", ECMWF
+    Newsletter 173, 2022.)
   Staniforth, A. & Côté, J., 1991: Semi-Lagrangian integration schemes for
     atmospheric models — a review. Mon. Wea. Rev., 119.
 """
@@ -649,6 +654,20 @@ def horizontal_departure_points(
   fixed (no tolerances) for reverse-mode differentiability; convergence
   requires `dt * max‖∇V‖ < 1`. Two iterations give second-order accurate
   departure points.
+
+  This geocentric-Cartesian formulation — interpolating Cartesian wind
+  components, with no per-iteration rotation matrices, no spherical-polar
+  trigonometric solve, and no double-precision requirement near the poles —
+  is the same reformulation ECMWF adopted for the IFS in Cycle 48r1
+  (Diamantakis & Váňa 2022; ECMWF Newsletter 173). A refinement from that
+  work not implemented here: warm-starting the iteration from previously
+  computed departure points instead of the arrival points (the IFS uses the
+  previous time step's, cutting its iteration count from 5 to 3 at equal
+  accuracy). The natural analog for the one-step RK2 stepper would be
+  initializing the corrector stage's solve from the predictor stage's
+  departure points — no multistep memory required — which would need an
+  initial-guess argument here; profiling shows the departure solve dominates
+  semi-Lagrangian cost on GPU, so this is a worthwhile extension.
 
   Args:
     u: nodal zonal wind (true winds, not cosθ-scaled) of shape
