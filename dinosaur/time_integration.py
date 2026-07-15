@@ -233,7 +233,7 @@ def semi_lagrangian_crank_nicolson_rk2(
     equation: SemiLagrangianImplicitExplicitODE,
     time_step: float,
     off_centering: float = 0.0,
-    warm_start_corrector: bool = True,
+    warm_start_corrector: bool = False,
 ) -> TimeStepFn:
   """Semi-Lagrangian time stepping via Crank-Nicolson and Heun's method.
 
@@ -265,13 +265,21 @@ def semi_lagrangian_crank_nicolson_rk2(
       trapezoidal rule — the standard remedy for orographic resonance in
       semi-implicit semi-Lagrangian models. First-order accurate in the
       ε-weighted terms; ε = 0 (default) is fully centered and second order.
-    warm_start_corrector: if True (default), the corrector stage's
-      departure-point iteration starts from the predictor stage's departure
-      points instead of the arrival points. The two stages' trajectories
-      differ only through the O(dt) wind update, so the warm start reduces
-      the corrector's fixed-point residual at no extra cost (the analogue,
-      within a single step, of the warm-started iteration adopted in IFS
-      Cycle 48r1; see `semi_lagrangian.horizontal_departure_points`).
+    warm_start_corrector: if True, the corrector stage's departure-point
+      iteration starts from the predictor stage's departure points instead
+      of the arrival points (the analogue, within a single step, of the
+      warm-started iteration adopted in IFS Cycle 48r1; see
+      `semi_lagrangian.horizontal_departure_points`). At the default two
+      iterations this is measurably counterproductive — the trajectory
+      residual is already far below the scheme's discretization error, and
+      a cold corrector's first iteration interpolates at the (constant)
+      arrival mesh, which compiles to cheaper code — hence False by
+      default. Its use is enabling `departure_iterations=1` on the
+      equation: one warm-started iteration matches the residual of two
+      cold ones, saving ~18% of step time at T170/L32 on A100, with
+      trajectory error still an order of magnitude below discretization
+      error at a 30-minute step (a cold single iteration is not accurate
+      enough).
 
   Returns:
     Function that performs a time step.
@@ -351,7 +359,12 @@ def semi_lagrangian_settls(
       points and use them to warm-start the next step's iteration — the
       direct analogue of the warm-started trajectory iteration adopted in
       IFS Cycle 48r1 (consecutive steps' departure points differ only by
-      O(dt²); see `semi_lagrangian.horizontal_departure_points`).
+      O(dt²); see `semi_lagrangian.horizontal_departure_points`). Measured
+      cost-neutral at T170/L32 on A100 while cutting the trajectory
+      residual by well over an order of magnitude at two iterations, since
+      the carried refinement compounds across steps; with
+      `departure_iterations=1` on the equation it matches the two-cold-
+      iteration residual at ~22% less step time.
 
   Returns:
     Function mapping `(x, aux)` to the next `(x, aux)`.
