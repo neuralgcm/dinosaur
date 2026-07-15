@@ -643,6 +643,7 @@ def horizontal_departure_points(
     dt: float,
     *,
     iterations: int = 2,
+    initial_guess: DeparturePoints | None = None,
 ) -> DeparturePoints:
   """Solves for departure points of horizontal-only trajectories.
 
@@ -677,6 +678,9 @@ def horizontal_departure_points(
     grid: the horizontal grid.
     dt: time step. Trajectories are integrated backwards over `dt`.
     iterations: number of fixed-point iterations.
+    initial_guess: optional departure points to warm-start the iteration
+      (e.g. a predictor stage's or the previous step's solution, following
+      the IFS practice noted above); defaults to the arrival points.
 
   Returns:
     DeparturePoints with fields of shape [*batch, longitude_nodes,
@@ -692,7 +696,7 @@ def horizontal_departure_points(
   interpolator = GridInterpolator(grid, order='linear')
   angular_dt = dt / grid.radius
 
-  departure = arrival
+  departure = arrival if initial_guess is None else initial_guess.cartesian
   for _ in range(iterations):
     midpoint = _normalize((arrival + departure) / 2)
     lon_mid, sin_lat_mid = cartesian_to_lon_sin_lat(midpoint)
@@ -718,6 +722,7 @@ def departure_points_3d(
     *,
     iterations: int = 2,
     vertical_nodes: VerticalNodes | None = None,
+    initial_guess: DeparturePoints | None = None,
 ) -> DeparturePoints:
   """Solves for 3-D departure points of trajectories arriving at layer centers.
 
@@ -740,6 +745,8 @@ def departure_points_3d(
     vertical_nodes: optional fixed vertical nodes to use instead of
       `coords.vertical` (e.g. hybrid-coordinate reference-σ nodes, with
       `sigma_dot` the rate of change of that node coordinate).
+    initial_guess: optional departure points to warm-start the iteration;
+      defaults to the arrival points. See `horizontal_departure_points`.
 
   Returns:
     DeparturePoints with fields of shape [layers, longitude_nodes,
@@ -768,8 +775,12 @@ def departure_points_3d(
       interpolate_3d, grid=grid, order='linear'
   )
 
-  departure = arrival
-  sigma_departure = sigma_arrival
+  if initial_guess is None:
+    departure = arrival
+    sigma_departure = sigma_arrival
+  else:
+    departure = initial_guess.cartesian
+    sigma_departure = initial_guess.sigma
   for _ in range(iterations):
     midpoint = _normalize((arrival + departure) / 2)
     sigma_mid = (sigma_arrival + sigma_departure) / 2

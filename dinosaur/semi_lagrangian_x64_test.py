@@ -152,6 +152,58 @@ class DeparturePointsTest(parameterized.TestCase):
       self.assertGreater(ratio, 5.0)
       self.assertLess(ratio, 12.0)
 
+  def test_warm_start_continues_the_iteration(self):
+    """Warm-starting from a k-iteration solve reproduces a (k+j)-solve.
+
+    The fixed-point loop's only state is the current departure estimate, so
+    seeding it with `initial_guess` must be equivalent to having run those
+    iterations in one call: warm(j, guess=cold(k)) == cold(k + j).
+    """
+    grid = spherical_harmonic.Grid.T85()
+    u, v = solid_body_winds(grid, axis=[0, 1, 0], omega=1.0)
+    u, v = jnp.asarray(u), jnp.asarray(v)
+    dt = 0.2
+    with self.subTest('horizontal'):
+      cold2 = semi_lagrangian.horizontal_departure_points(
+          u, v, grid, dt=dt, iterations=2
+      )
+      warm = semi_lagrangian.horizontal_departure_points(
+          u, v, grid, dt=dt, iterations=1, initial_guess=cold2
+      )
+      cold3 = semi_lagrangian.horizontal_departure_points(
+          u, v, grid, dt=dt, iterations=3
+      )
+      np.testing.assert_allclose(warm.cartesian, cold3.cartesian, atol=1e-13)
+      np.testing.assert_allclose(warm.lon, cold3.lon, atol=1e-13)
+    with self.subTest('zero iterations returns the guess'):
+      unmoved = semi_lagrangian.horizontal_departure_points(
+          u, v, grid, dt=dt, iterations=0, initial_guess=cold2
+      )
+      np.testing.assert_array_equal(unmoved.cartesian, cold2.cartesian)
+    with self.subTest('3d'):
+      coords = coordinate_systems.CoordinateSystem(
+          spherical_harmonic.Grid.T21(),
+          sigma_coordinates.SigmaCoordinates.equidistant(8),
+      )
+      shape = (8,) + coords.horizontal.nodal_shape
+      rng = np.random.RandomState(0)
+      u3 = jnp.asarray(0.3 * rng.standard_normal(shape))
+      v3 = jnp.asarray(0.3 * rng.standard_normal(shape))
+      sigma_dot = jnp.asarray(
+          0.1 * rng.standard_normal((9,) + coords.horizontal.nodal_shape)
+      )
+      cold2 = semi_lagrangian.departure_points_3d(
+          u3, v3, sigma_dot, coords, dt=dt, iterations=2
+      )
+      warm = semi_lagrangian.departure_points_3d(
+          u3, v3, sigma_dot, coords, dt=dt, iterations=1, initial_guess=cold2
+      )
+      cold3 = semi_lagrangian.departure_points_3d(
+          u3, v3, sigma_dot, coords, dt=dt, iterations=3
+      )
+      np.testing.assert_allclose(warm.cartesian, cold3.cartesian, atol=1e-13)
+      np.testing.assert_allclose(warm.sigma, cold3.sigma, atol=1e-13)
+
   def test_solid_body_departure_over_pole(self):
     """Trajectories crossing the poles are handled by Cartesian iteration."""
     grid = spherical_harmonic.Grid.T85()
@@ -458,8 +510,8 @@ class _IdentityTransportODE(
   def nodal_velocities(self, state):
     return jnp.zeros(())
 
-  def departure_points(self, velocities, dt):
-    del velocities, dt  # unused
+  def departure_points(self, velocities, dt, initial_guess=None):
+    del velocities, dt, initial_guess  # unused
     return None
 
   def semi_lagrangian_transport(self, bracket, departure):
@@ -494,7 +546,8 @@ class _RingAdvectionODE(time_integration.SemiLagrangianImplicitExplicitODE):
   def nodal_velocities(self, state):
     return jnp.asarray(self.omega)
 
-  def departure_points(self, velocities, dt):
+  def departure_points(self, velocities, dt, initial_guess=None):
+    del initial_guess  # departure points are exact on the ring
     return velocities * dt
 
   def semi_lagrangian_transport(self, bracket, departure):

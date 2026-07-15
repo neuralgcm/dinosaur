@@ -181,12 +181,21 @@ class SemiLagrangianImplicitExplicitODE:
     """
     raise NotImplementedError
 
-  def departure_points(self, velocities: typing.Pytree, dt: float) -> Any:
+  def departure_points(
+      self,
+      velocities: typing.Pytree,
+      dt: float,
+      initial_guess: Any | None = None,
+  ) -> Any:
     """Solves for departure points of trajectories arriving at grid points.
 
     Args:
       velocities: velocities as returned by `nodal_velocities`.
       dt: time step over which to integrate trajectories backwards.
+      initial_guess: optional previously computed departure points (in the
+        same equation-specific representation this method returns) used to
+        warm-start the fixed-point iteration, e.g. a predictor stage's or
+        the previous time step's solution.
 
     Returns:
       An equation-specific representation of departure points, passed on to
@@ -224,6 +233,7 @@ def semi_lagrangian_crank_nicolson_rk2(
     equation: SemiLagrangianImplicitExplicitODE,
     time_step: float,
     off_centering: float = 0.0,
+    warm_start_corrector: bool = True,
 ) -> TimeStepFn:
   """Semi-Lagrangian time stepping via Crank-Nicolson and Heun's method.
 
@@ -255,6 +265,13 @@ def semi_lagrangian_crank_nicolson_rk2(
       trapezoidal rule — the standard remedy for orographic resonance in
       semi-implicit semi-Lagrangian models. First-order accurate in the
       ε-weighted terms; ε = 0 (default) is fully centered and second order.
+    warm_start_corrector: if True (default), the corrector stage's
+      departure-point iteration starts from the predictor stage's departure
+      points instead of the arrival points. The two stages' trajectories
+      differ only through the O(dt) wind update, so the warm start reduces
+      the corrector's fixed-point residual at no extra cost (the analogue,
+      within a single step, of the warm-started iteration adopted in IFS
+      Cycle 48r1; see `semi_lagrangian.horizontal_departure_points`).
 
   Returns:
     Function that performs a time step.
@@ -285,7 +302,8 @@ def semi_lagrangian_crank_nicolson_rk2(
     # Stage 2 (corrector): time-centered trajectories and trapezoidal update.
     v_star = equation.nodal_velocities(x_star)
     v_mid = tree_map(lambda a, b: 0.5 * (a + b), v0, v_star)
-    departure2 = equation.departure_points(v_mid, dt)
+    guess = departure1 if warm_start_corrector else None
+    departure2 = equation.departure_points(v_mid, dt, initial_guess=guess)
     n_star = equation.nonadvective_terms(x_star)
     bracket2 = tree_map(lambda x, l, n: x + β * (l + n), x0, l0, n0)
     transported = equation.semi_lagrangian_transport(bracket2, departure2)
@@ -298,6 +316,7 @@ def semi_lagrangian_crank_nicolson_rk2(
 def semi_lagrangian_settls(
     equation: SemiLagrangianImplicitExplicitODE,
     time_step: float,
+    warm_start_departures: bool = True,
 ) -> TimeStepFn:
   """Two-time-level SETTLS semi-Lagrangian stepper.
 
@@ -319,13 +338,20 @@ def semi_lagrangian_settls(
   2001), rather than Hortal's endpoint-form iteration, so the equation
   interface is reused verbatim.
 
-  The step state is a tuple `(x, (N_prev, V_prev))`; build the initial tuple
-  with `semi_lagrangian_settls_init` (a self-starting RK2 bootstrap), and
-  adapt modal filters with `settls_step_filter`.
+  The step state is a tuple `(x, (N_prev, V_prev))`, or
+  `(x, (N_prev, V_prev, D_prev))` with `warm_start_departures=True`; build
+  the initial tuple with `semi_lagrangian_settls_init` (a self-starting RK2
+  bootstrap, with a matching flag), and adapt modal filters with
+  `settls_step_filter`.
 
   Args:
     equation: equation to solve.
     time_step: time step.
+    warm_start_departures: if True (default), carry each step's departure
+      points and use them to warm-start the next step's iteration — the
+      direct analogue of the warm-started trajectory iteration adopted in
+      IFS Cycle 48r1 (consecutive steps' departure points differ only by
+      O(dt²); see `semi_lagrangian.horizontal_departure_points`).
 
   Returns:
     Function mapping `(x, aux)` to the next `(x, aux)`.
@@ -338,12 +364,16 @@ def semi_lagrangian_settls(
   dt = time_step
 
   def step_fn(carry):
-    x, (n_prev, v_prev) = carry
+    if warm_start_departures:
+      x, (n_prev, v_prev, dep_prev) = carry
+    else:
+      x, (n_prev, v_prev) = carry
+      dep_prev = None
     n = equation.nonadvective_terms(x)
     l = equation.implicit_terms(x)
     v = equation.nodal_velocities(x)
     v_mid = tree_map(lambda a, b: 1.5 * a - 0.5 * b, v, v_prev)
-    departure = equation.departure_points(v_mid, dt)
+    departure = equation.departure_points(v_mid, dt, initial_guess=dep_prev)
     bracket = tree_map(
         lambda xi, li, ni, pi: xi + 0.5 * dt * (li + 2 * ni - pi),
         x,
@@ -354,6 +384,8 @@ def semi_lagrangian_settls(
     transported = equation.semi_lagrangian_transport(bracket, departure)
     combined = tree_map(lambda t, ni: t + 0.5 * dt * ni, transported, n)
     x_next = equation.implicit_inverse(combined, 0.5 * dt)
+    if warm_start_departures:
+      return (x_next, (n, v, departure))
     return (x_next, (n, v))
 
   return step_fn
@@ -362,6 +394,7 @@ def semi_lagrangian_settls(
 def semi_lagrangian_settls_init(
     equation: SemiLagrangianImplicitExplicitODE,
     time_step: float,
+    warm_start_departures: bool = True,
 ) -> TimeStepFn:
   """Returns a function building the initial SETTLS step state.
 
@@ -377,16 +410,24 @@ def semi_lagrangian_settls_init(
   Args:
     equation: equation to solve.
     time_step: time step.
+    warm_start_departures: must match the flag passed to
+      `semi_lagrangian_settls`. If True, the step state additionally
+      carries the departure points of trajectories arriving at `x1` (from
+      the initial winds `V(x0)`), warm-starting the first SETTLS step.
 
   Returns:
     Function mapping an initial state `x0` to the `(x1, (N(x0), V(x0)))`
-    tuple consumed by `semi_lagrangian_settls`.
+    tuple (plus carried departure points if warm-starting) consumed by
+    `semi_lagrangian_settls`.
   """
   rk2_step = semi_lagrangian_crank_nicolson_rk2(equation, time_step)
 
   def init_fn(x0):
     n0 = equation.nonadvective_terms(x0)
     v0 = equation.nodal_velocities(x0)
+    if warm_start_departures:
+      dep0 = equation.departure_points(v0, time_step)
+      return (rk2_step(x0), (n0, v0, dep0))
     return (rk2_step(x0), (n0, v0))
 
   return init_fn
@@ -442,8 +483,13 @@ class TimeReversedSemiLagrangianODE(SemiLagrangianImplicitExplicitODE):
   def nodal_velocities(self, state: PyTreeState) -> typing.Pytree:
     return tree_map(jnp.negative, self.forward_eq.nodal_velocities(state))
 
-  def departure_points(self, velocities: typing.Pytree, dt: float) -> Any:
-    return self.forward_eq.departure_points(velocities, dt)
+  def departure_points(
+      self,
+      velocities: typing.Pytree,
+      dt: float,
+      initial_guess: Any | None = None,
+  ) -> Any:
+    return self.forward_eq.departure_points(velocities, dt, initial_guess)
 
   def semi_lagrangian_transport(
       self, bracket: PyTreeState, departure: Any

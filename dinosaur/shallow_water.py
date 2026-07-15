@@ -261,10 +261,14 @@ class SemiLagrangianShallowWaterEquations(
       small `f·dt` (Heun's method has no imaginary-axis stability).
     interpolation_order: horizontal interpolation order for transport
       ('cubic' or 'linear'); trajectories always use linear interpolation.
+    departure_iterations: number of fixed-point iterations in the
+      departure-point solve (see
+      `semi_lagrangian.horizontal_departure_points`).
   """
 
   coriolis_mode: str = 'planetary_momentum'
   interpolation_order: str = 'cubic'
+  departure_iterations: int = 2
 
   def __post_init__(self):
     if self.coriolis_mode not in ('planetary_momentum', 'explicit'):
@@ -326,11 +330,19 @@ class SemiLagrangianShallowWaterEquations(
     )
 
   def departure_points(
-      self, velocities: tuple[Array, Array], dt: float
+      self,
+      velocities: tuple[Array, Array],
+      dt: float,
+      initial_guess: semi_lagrangian.DeparturePoints | None = None,
   ) -> semi_lagrangian.DeparturePoints:
     u, v = velocities
     return semi_lagrangian.horizontal_departure_points(
-        u, v, self.coords.horizontal, dt=dt
+        u,
+        v,
+        self.coords.horizontal,
+        dt=dt,
+        iterations=self.departure_iterations,
+        initial_guess=initial_guess,
     )
 
   def semi_lagrangian_transport(

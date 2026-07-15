@@ -1740,6 +1740,11 @@ class SemiLagrangianPrimitiveEquations(
       `monotone_tracers` their non-negativity is exact. They must be
       excluded from modal filters (`step_filter_excluding_nodal_tracers`)
       and cannot participate in the dynamics (`humidity_key`, `cloud_keys`).
+    departure_iterations: number of fixed-point iterations in the
+      departure-point solves (see `semi_lagrangian.departure_points_3d`).
+      The default 2 gives second-order departure points; warm-started
+      steppers (`warm_start_corrector`/`warm_start_departures`) reduce the
+      remaining fixed-point residual at no extra cost.
   """
 
   coriolis_mode: str = dataclasses.field(
@@ -1750,6 +1755,7 @@ class SemiLagrangianPrimitiveEquations(
       default=(), kw_only=True
   )
   nodal_tracers: tuple[str, ...] = dataclasses.field(default=(), kw_only=True)
+  departure_iterations: int = dataclasses.field(default=2, kw_only=True)
 
   def __post_init__(self):
     super().__post_init__()
@@ -1819,18 +1825,30 @@ class SemiLagrangianPrimitiveEquations(
 
   @jax.named_call
   def departure_points(
-      self, velocities: NodalVelocities, dt: float
+      self,
+      velocities: NodalVelocities,
+      dt: float,
+      initial_guess: dict[str, semi_lagrangian.DeparturePoints] | None = None,
   ) -> dict[str, semi_lagrangian.DeparturePoints]:
     """Solves for 3-D departure points and 2-D ones for `ln(pₛ)`."""
+    no_guess = initial_guess is None
     return {
         '3d': semi_lagrangian.departure_points_3d(
-            velocities.u, velocities.v, velocities.sigma_dot, self.coords, dt
+            velocities.u,
+            velocities.v,
+            velocities.sigma_dot,
+            self.coords,
+            dt,
+            iterations=self.departure_iterations,
+            initial_guess=None if no_guess else initial_guess['3d'],
         ),
         '2d': semi_lagrangian.horizontal_departure_points(
             velocities.u_mean,
             velocities.v_mean,
             self.coords.horizontal,
             dt,
+            iterations=self.departure_iterations,
+            initial_guess=None if no_guess else initial_guess['2d'],
         ),
     }
 
@@ -3319,6 +3337,7 @@ class SemiLagrangianPrimitiveEquationsHybrid(
       default=(), kw_only=True
   )
   nodal_tracers: tuple[str, ...] = dataclasses.field(default=(), kw_only=True)
+  departure_iterations: int = dataclasses.field(default=2, kw_only=True)
 
   def __post_init__(self):
     super().__post_init__()
@@ -3395,9 +3414,13 @@ class SemiLagrangianPrimitiveEquationsHybrid(
 
   @jax.named_call
   def departure_points(
-      self, velocities: NodalVelocities, dt: float
+      self,
+      velocities: NodalVelocities,
+      dt: float,
+      initial_guess: dict[str, semi_lagrangian.DeparturePoints] | None = None,
   ) -> dict[str, semi_lagrangian.DeparturePoints]:
     """Solves for 3-D departure points and 2-D ones for `ln(pₛ)`."""
+    no_guess = initial_guess is None
     return {
         '3d': semi_lagrangian.departure_points_3d(
             velocities.u,
@@ -3406,12 +3429,16 @@ class SemiLagrangianPrimitiveEquationsHybrid(
             self.coords,
             dt,
             vertical_nodes=self._vertical_nodes,
+            iterations=self.departure_iterations,
+            initial_guess=None if no_guess else initial_guess['3d'],
         ),
         '2d': semi_lagrangian.horizontal_departure_points(
             velocities.u_mean,
             velocities.v_mean,
             self.coords.horizontal,
             dt,
+            iterations=self.departure_iterations,
+            initial_guess=None if no_guess else initial_guess['2d'],
         ),
     }
 

@@ -1154,6 +1154,65 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
           field,
       )
 
+  def test_warm_started_corrector_is_consistent(self):
+    """Warm- and cold-started RK2 correctors give nearly the same step.
+
+    The corrector's warm start only changes the initial guess of a
+    convergent fixed-point iteration, so over a day of baroclinic-wave
+    steps the two solutions must agree to well within the discretization
+    error (the residual difference is O((dt·∇V)²) per solve).
+    """
+    equation, _, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True
+    )
+    grid = equation.coords.horizontal
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    finals = {}
+    for warm in (True, False):
+      step_fn = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(
+              equation, dt, warm_start_corrector=warm
+          )
+      )
+      finals[warm] = time_integration.repeated(step_fn, 48)(state0)
+    difference = self._l2(
+        grid,
+        finals[True].temperature_variation,
+        finals[False].temperature_variation,
+    )
+    # measured 2.5e-4: well below the case's ~1.1e-3 steady-state drift.
+    self.assertLess(difference, 1e-3)
+    self.assertGreater(difference, 0.0)  # the guess is actually used
+
+  def test_settls_warm_started_departures_are_consistent(self):
+    """SETTLS with and without carried departure points nearly agree."""
+    equation, _, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True
+    )
+    grid = equation.coords.horizontal
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    finals = {}
+    for warm in (True, False):
+      init_fn = time_integration.semi_lagrangian_settls_init(
+          equation, dt, warm_start_departures=warm
+      )
+      step_fn = jax.jit(
+          time_integration.semi_lagrangian_settls(
+              equation, dt, warm_start_departures=warm
+          )
+      )
+      carry = init_fn(state0)
+      self.assertLen(carry[1], 3 if warm else 2)
+      finals[warm], _ = time_integration.repeated(step_fn, 47)(carry)
+    difference = self._l2(
+        grid,
+        finals[True].temperature_variation,
+        finals[False].temperature_variation,
+    )
+    # measured 2.4e-4, same scale as the RK2 warm-start difference above.
+    self.assertLess(difference, 1e-3)
+    self.assertGreater(difference, 0.0)
+
   def test_settls_tracks_rk2_on_baroclinic_wave(self):
     """The SETTLS stepper matches the RK2 stepper at half the per-step cost.
 
