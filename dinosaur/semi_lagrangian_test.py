@@ -329,6 +329,102 @@ class InterpolatorTest(parameterized.TestCase):
     self.assertGreaterEqual(np.min(np.asarray(values)), 0.0)
 
 
+class NodalDiffusionFilterTest(parameterized.TestCase):
+
+  @parameterized.parameters(dict(order=1), dict(order=2))
+  def test_constant_field_is_invariant(self, order):
+    grid = spherical_harmonic.Grid.T21()
+    filter_fn = semi_lagrangian.nodal_diffusion_filter(
+        grid, dt=1.0, tau=1.0, order=order
+    )
+    field = 3.25 * jnp.ones((4,) + grid.nodal_shape)
+    np.testing.assert_allclose(filter_fn(field), field, atol=1e-6)
+
+  @parameterized.parameters(dict(order=1), dict(order=2))
+  def test_two_gridpoint_wave_damped_at_advertised_rate(self, order):
+    """The 2Δ zonal checkerboard is damped by exactly 1 - mu per step."""
+    grid = spherical_harmonic.Grid.T21()
+    dt, tau = 0.5, 2.0
+    mu = 1 - np.exp(-dt / tau)
+    filter_fn = semi_lagrangian.nodal_diffusion_filter(
+        grid, dt=dt, tau=tau, order=order
+    )
+    signs = (-1.0) ** np.arange(grid.longitude_nodes)
+    field = jnp.asarray(
+        np.broadcast_to(signs[:, np.newaxis], grid.nodal_shape)
+    )
+    # constant along latitude (halo rows are an even-offset antipodal roll,
+    # so the latitude pass sees a latitude-constant field and is a no-op).
+    np.testing.assert_allclose(
+        filter_fn(field), (1 - mu) * field, rtol=1e-5
+    )
+
+  def test_order_2_is_more_scale_selective(self):
+    """At equal tau, order=2 damps a smooth wave far less than order=1."""
+    grid = spherical_harmonic.Grid.T21()
+    dt, tau = 0.5, 2.0
+    mu = 1 - np.exp(-dt / tau)
+    m = 8  # zonal wavenumber; kΔ = 2πm / longitude_nodes
+    k_delta = 2 * np.pi * m / grid.longitude_nodes
+    lon, _ = grid.nodal_mesh
+    field = jnp.asarray(np.cos(m * lon))  # even m: latitude pass is a no-op
+    damping = {}
+    for order in (1, 2):
+      filter_fn = semi_lagrangian.nodal_diffusion_filter(
+          grid, dt=dt, tau=tau, order=order
+      )
+      damping[order] = np.max(np.abs(np.asarray(filter_fn(field)))) / np.max(
+          np.abs(np.asarray(field))
+      )
+    np.testing.assert_allclose(
+        damping[1], 1 - mu * np.sin(k_delta / 2) ** 2, rtol=1e-4
+    )
+    np.testing.assert_allclose(
+        damping[2], 1 - mu * np.sin(k_delta / 2) ** 4, rtol=1e-4
+    )
+    self.assertGreater(damping[2], damping[1])
+
+  @parameterized.parameters(dict(order=1), dict(order=2))
+  def test_positivity_and_no_new_extrema(self, order):
+    grid = spherical_harmonic.Grid.T21()
+    filter_fn = semi_lagrangian.nodal_diffusion_filter(
+        grid, dt=1.0, tau=1.0, order=order
+    )
+    rng = np.random.RandomState(0)
+    field = jnp.asarray(rng.uniform(0.0, 1.0, size=(3,) + grid.nodal_shape))
+    filtered = np.asarray(filter_fn(field))
+    self.assertGreaterEqual(filtered.min(), 0.0)
+    self.assertLessEqual(filtered.max(), float(np.max(field)) + 1e-6)
+    self.assertGreaterEqual(filtered.min(), float(np.min(field)) - 1e-6)
+
+  @parameterized.parameters(dict(order=1), dict(order=2))
+  def test_smooth_field_nearly_unchanged_including_poles(self, order):
+    """A band-limited field passes through, with exact cross-pole rows."""
+    grid = spherical_harmonic.Grid.T42()
+    lon_mesh, sin_lat_mesh = grid.nodal_mesh
+    x, y, z = semi_lagrangian.lon_lat_to_cartesian(lon_mesh, sin_lat_mesh)
+    field = jnp.asarray(1.0 + x + 2.0 * y * z + z**2 - 0.5 * x * y)
+    filter_fn = semi_lagrangian.nodal_diffusion_filter(
+        grid, dt=1.0, tau=1e-6, order=order  # mu ≈ 1: strongest smoothing
+    )
+    change = np.abs(np.asarray(filter_fn(field)) - np.asarray(field))
+    per_row = change.max(axis=0)
+    # Interior rows see only the field's (tiny) grid-scale content:
+    # measured 3.9e-3 (order 1) / 3.0e-5 (order 2) at mu ≈ 1 for this
+    # O(1)-range field. The two rings nearest each pole see one-sided
+    # extra smoothing from the over-pole spacing jump (measured 1.7e-2 /
+    # 1.1e-2) — the index-space caveat documented on the filter.
+    interior_limit = 8e-3 if order == 1 else 5e-4
+    self.assertLess(per_row[2:-2].max(), interior_limit)
+    self.assertLess(per_row.max(), 3e-2)
+
+  def test_rejects_unknown_order(self):
+    with self.assertRaisesRegex(ValueError, 'unsupported'):
+      semi_lagrangian.nodal_diffusion_filter(
+          spherical_harmonic.Grid.T21(), dt=1.0, tau=1.0, order=3
+      )
+
+
 class DifferentiabilityTest(parameterized.TestCase):
 
   def test_gradients_through_transport(self):
