@@ -473,8 +473,10 @@ class GridInterpolator:
 # jitting the per-field interpolation entry points means repeated call sites
 # with the same signature (e.g. the two stages of an RK2 step, or several
 # tracers with the same limiter) share a single lowered computation instead
-# of inlining a copy each, which substantially reduces lowering size and
-# XLA compile time. `grid` is hashable (frozen dataclass), following the
+# of inlining a copy each (~30% fewer lowered ops on a full step). Measured
+# GPU compile time is unchanged — XLA's cost is dominated elsewhere — so
+# this is a tracing/lowering cleanup, not a compile-time fix. `grid` is
+# hashable (frozen dataclass), following the
 # `spherical_harmonic.vor_div_to_uv_nodal` precedent.
 @functools.partial(jax.jit, static_argnames=('grid', 'order', 'limiter'))
 def _interpolate_horizontal_single(

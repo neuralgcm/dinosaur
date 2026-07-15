@@ -959,10 +959,14 @@ Issues encountered while implementing this plan, by milestone.
   with the same signature — the two RK2 stages, several tracers with the
   same limiter — share one lowered computation instead of inlining copies.
   On the T85/L32 3-tracer step this removes 30% of lowered ops (6442 →
-  4518; gathers 64 → 30) with runtime unchanged. The remaining lowering
-  bulk is embedded spectral-basis constants duplicated per
-  `to_modal`/`to_nodal` call site in shared `spherical_harmonic` code —
-  a candidate follow-up outside the semi-Lagrangian scope.
+  4518; gathers 64 → 30) with runtime unchanged — but an A100 A/B shows
+  GPU compile time is *unchanged* (55.0 → 55.2 s for the T170/L32 step),
+  so this is a tracing/lowering cleanup, not a compile-time fix. The GPU
+  compile cost is dominated by the ~58 MB of spectral-basis constants
+  embedded once per `to_modal`/`to_nodal` call site in shared
+  `spherical_harmonic` code (the SL step lowers to 59 MB of module text
+  vs 32 MB Eulerian); deduplicating those transforms is the identified
+  follow-up, outside the semi-Lagrangian scope.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
