@@ -984,6 +984,36 @@ Issues encountered while implementing this plan, by milestone.
   hybrid levels (l2 = 1.0e-3), and stepper-rejection coverage. Genuinely
   hybrid configurations inherit the Eulerian hybrid class's
   "not thoroughly verified" caveat.
+- **Warm-started departure iterations (IFS 48r1 follow-up).** After reading
+  Diamantakis & Váňa (2022; ECMWF Newsletter 173) — whose geocentric-
+  Cartesian trajectory solve matches the formulation here — their warm-start
+  refinement was implemented and measured: `initial_guess` on both
+  departure-point solvers, threaded through the equation interface and all
+  three SL equation classes (which also gain a `departure_iterations`
+  field), with two stepper hooks: `warm_start_corrector` on the RK2 stepper
+  (corrector seeded from the predictor's departure points, no multistep
+  memory) and `warm_start_departures` on SETTLS (departure points carried
+  in the step state, the direct IFS analogue). Warm-starting from a
+  k-iteration solve and iterating j more is *exactly* a (k+j)-iteration
+  solve (tested); on a spun-up T85L8 baroclinic wave at dt = 60 min the
+  previous step's solution is as good a guess as one cold iteration
+  (max departure-point residual 1.3e-4 vs 1.8e-4, displacement scale
+  2.0e-2), so one warm iteration ≈ two cold (2.6e-6 vs 3.2e-6). End-to-end
+  (12 h vs an 8-iteration reference, f64): cold-1 is unusable (T′ error
+  3.6e-3 at dt = 30 min, comparable to the discretization error), warm-1
+  is fine (1.1e-4 RK2, 1.5e-5 SETTLS), and SETTLS warm-2 compounds the
+  carried refinement to 1.2e-7 vs 3.9e-6 cold. A100 timings at T170/L32
+  f32: the 3-D solve alone is 4.75/8.99/4.80 ms for cold-1/cold-2/warm-1
+  (the warm start itself is free); full steps are RK2 35.2 (cold-2) /
+  37.9 (warm-2) / 28.8 (warm-1) ms and SETTLS 19.1 / 19.3 / 14.9 ms.
+  Defaults chosen from these numbers: SETTLS warm start on (cost-neutral,
+  residual 20-100✕ better); RK2 corrector warm start **off** at equal
+  iterations — it is slightly slower because a cold corrector's first
+  iteration interpolates at the constant arrival mesh, which XLA
+  constant-folds (visible on CPU and GPU alike) — and documented as the
+  enabler for `departure_iterations=1` (−18% RK2 / −22% SETTLS step time
+  at trajectory error still an order of magnitude below discretization
+  error at the 30-minute operating point).
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
