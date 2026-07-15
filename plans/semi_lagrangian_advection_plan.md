@@ -1022,6 +1022,32 @@ Issues encountered while implementing this plan, by milestone.
   diffusion partially offsets the smaller truncation terms — a
   well-known SL trade-off that also argues for the long-step operating
   points used here.
+- **Warm-started single iterations adopted as the default.** An A100
+  notebook study at the ERA5 operating point (T170/L32, dt = 30 min,
+  2-day forecast, notebook-faithful nodal + quasi-monotone tracers)
+  compared the warm-1 configuration against the then-default cold-2:
+  32.9 vs 39.5 ms/step (−17%; simulation cell 3.21 s vs 3.93 s), no
+  terrain anomaly (max T 305.8 K at 0.28 km elevation, versus the
+  +9/+34 K spikes of the dt = 45/60 min pathology), min cloud liquid
+  water exactly 0.0, and the same distance from the Eulerian dt = 5 min
+  reference (T′ rel-l2 9.4e-3 vs 9.1e-3; the two SL runs are 4✕ closer
+  to each other than either is to the reference). The day-2
+  warm-vs-cold differences (T 2.1e-3, pₛ 9.2e-4, humidity 9.9e-2) are
+  *smaller than the sensitivity of the converged scheme to a benign
+  30 → 20 min time-step change* (T 3.2e-3, pₛ 2.6e-3, humidity 1.26e-1
+  — sharp filamentary moisture fields diverge chaotically between any
+  two configurations at this horizon), so the warm start perturbs the
+  forecast less than a time-step tweak does. Defaults flipped
+  accordingly: `departure_iterations = 1` on the equation classes and
+  `warm_start_corrector = True` on the RK2 stepper; all three
+  semi-Lagrangian notebooks re-executed in this configuration
+  (Held–Suarez 1200-day cell 1 m 31 s → 1 m 14 s; baroclinic two-week
+  cell 9.33 → 5.93 s, now clearly ahead of the Eulerian core at T42
+  rather than at parity; ERA5 DFI cell 1 m 24 s → 1 m 12 s). The
+  extreme-Δt stress tests request `departure_iterations = 2` explicitly:
+  near the convergence margin dt·max‖∇V‖ < 1 (3 h steps, 8✕-Eulerian
+  shallow-water steps) a single warm-started iteration drifts ~5✕ more,
+  a caveat now documented on the equation classes.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
