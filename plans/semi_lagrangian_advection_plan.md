@@ -947,6 +947,12 @@ Issues encountered while implementing this plan, by milestone.
   helper spectrally transforms `state.tracers`. The SL ERA5 notebook drops
   tracers from the diagnostic call; the equation classes themselves already
   split nodal tracers internally.
+- PR curation: notebooks are grouped as `notebooks/eulerian/` and
+  `notebooks/semi_lagrangian/` (same file names, README links updated);
+  the portability fixes for NumPy 2.0 and current-main APIs apply to both
+  groups. The one-off gather microbenchmark script was dropped from the
+  PR — its measurements are recorded above and it remains available in
+  the branch history.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
