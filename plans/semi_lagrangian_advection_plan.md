@@ -741,9 +741,10 @@ implicit-Coriolis `coriolis_mode` (LIMPF-style per-`m` block-tridiagonal
 implicit solve; §11).
 
 **SLHD — flow-adaptive damping through the interpolator (design sketch).**
-The principled successor to the uniform `nodal_diffusion_filter` for
-tracer-noise control is the Semi-Lagrangian Horizontal Diffusion of Váňa
-et al. (2008): transport interpolates with a pointwise blend
+The principled form of tracer-noise control, compared with a uniform
+grid-space (Shapiro-type) filter, is the Semi-Lagrangian Horizontal
+Diffusion of Váňa et al. (2008): transport interpolates with a pointwise
+blend
 
     f(x_d) = (1 − κ)·f_cubic(x_d) + κ·f_linear(x_d),
 
@@ -760,14 +761,15 @@ time), the equation classes gain the κ diagnostic evaluated at arrival
 nodes, and `semi_lagrangian_transport` threads κ into the tracer
 interpolators; the blend is a convex combination of the limited cubic and
 the automatically-monotone linear interpolant, so quasi-monotone
-positivity guarantees survive unchanged. Known blind spot, and why the
-nodal filter should be retained as the weak supporting term (the
-operational configuration in ALADIN/ALARO does the same): SLHD dissipates
-only through the act of interpolation, whose damping vanishes as the local
-displacement approaches zero or an integer number of cells — stationary
-noise in weakly-deforming regions escapes it. Calibration surface is
-κ_max, d₀ and p, which warrant an ERA5 A/B like the one that validated the
-nodal filter.
+positivity guarantees survive unchanged. Known blind spot (the reason the
+operational ALADIN/ALARO configuration pairs SLHD with weak uniform
+supporting diffusion): SLHD dissipates only through the act of
+interpolation, whose damping vanishes as the local displacement
+approaches zero or an integer number of cells — stationary noise in
+weakly-deforming regions escapes it. Calibration surface is κ_max, d₀ and
+p, which warrant an ERA5 A/B like the one in §13's noise diagnosis. Note
+that diagnosis before building: the observed ERA5 wave trains are forced
+by the resolved dynamics, which SLHD cannot remove either.
 
 ## 13. Implementation updates
 
@@ -1102,13 +1104,16 @@ Issues encountered while implementing this plan, by milestone.
   which no tracer-side scheme (including SLHD, §12) can remove. The
   Eulerian notebook is smooth there only because its spectral tracer
   representation truncates (~3Δ at T170 on the quadratic grid) and
-  hyperdiffuses those scales, at the cost of Gibbs negatives. The filter
-  is kept as an opt-in library feature (the correct closure for the real
-  no-dissipation gap of nodal tracers in physics-free configurations) but
-  is not wired into the notebook; the indicated follow-ups for the wave
-  trains are dynamics-side — stronger or steeper tail hyperdiffusion,
-  smoother orography, or the Ritchie–Tanguay smoothed-terrain variable
-  already flagged by the large-Δt study.
+  hyperdiffuses those scales, at the cost of Gibbs negatives. Having
+  served its diagnostic purpose without fixing anything observable, the
+  filter was reverted rather than carried as speculative API (its design
+  — a separable index-space smoother with cross-pole halos, e-folding
+  parametrization matching the spectral filter, and a Shapiro-δ⁴ order
+  with a local-range clip — lives in the branch history should a
+  physics-free configuration need the closure); the indicated follow-ups
+  for the wave trains are dynamics-side — stronger or steeper tail
+  hyperdiffusion, smoother orography, or the Ritchie–Tanguay
+  smoothed-terrain variable already flagged by the large-Δt study.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
