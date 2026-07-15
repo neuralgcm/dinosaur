@@ -874,7 +874,11 @@ Issues encountered while implementing this plan, by milestone.
   implementation keeps it. Library-level on H100: `transport_scalar`
   0.41 / 2.55 / 37 ms and `departure_points_3d` 1.0 / 6.3 / 121 ms at
   T85/L32, T170/L48, T340/L64 — the departure solve, not the gather, is
-  the dominant SL cost on GPU. Synthetic gather payload bandwidth reaches
+  the dominant SL cost on GPU. Replacing the per-component
+  stack([...]) loops with `jax.vmap` over the three Cartesian wind
+  components (guaranteeing one stencil computation and one batched
+  gather) halved the H100 departure solve at T340/L64 (121 → 64 ms)
+  while remaining neutral at smaller sizes and on CPU. Synthetic gather payload bandwidth reaches
   ~560 GB/s (H100) at T85 and drops to ~160 GB/s at T340 with fully random
   indices (a pessimistic bound; real departure points are spatially
   coherent).
