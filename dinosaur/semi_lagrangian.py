@@ -465,10 +465,32 @@ class GridInterpolator:
       order: str,
       limiter: str | None,
   ) -> jnp.ndarray:
-    stencil = _horizontal_stencil(self.grid, lon, sin_lat, order)
-    return _interpolate_horizontal(field, self.grid, stencil, order, limiter)
+    return _interpolate_horizontal_single(
+        field, lon, sin_lat, grid=self.grid, order=order, limiter=limiter
+    )
 
 
+# jitting the per-field interpolation entry points means repeated call sites
+# with the same signature (e.g. the two stages of an RK2 step, or several
+# tracers with the same limiter) share a single lowered computation instead
+# of inlining a copy each, which substantially reduces lowering size and
+# XLA compile time. `grid` is hashable (frozen dataclass), following the
+# `spherical_harmonic.vor_div_to_uv_nodal` precedent.
+@functools.partial(jax.jit, static_argnames=('grid', 'order', 'limiter'))
+def _interpolate_horizontal_single(
+    field: Array,
+    lon: Array,
+    sin_lat: Array,
+    *,
+    grid: spherical_harmonic.Grid,
+    order: str,
+    limiter: str | None,
+) -> jnp.ndarray:
+  stencil = _horizontal_stencil(grid, lon, sin_lat, order)
+  return _interpolate_horizontal(field, grid, stencil, order, limiter)
+
+
+@functools.partial(jax.jit, static_argnames=('grid', 'order', 'limiter'))
 def interpolate_3d(
     field: Array,
     grid: spherical_harmonic.Grid,

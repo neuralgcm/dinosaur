@@ -953,6 +953,16 @@ Issues encountered while implementing this plan, by milestone.
   groups. The one-off gather microbenchmark script was dropped from the
   PR — its measurements are recorded above and it remains available in
   the branch history.
+- Compile-time audit: the per-field interpolation entry points
+  (`interpolate_3d` and the horizontal single-field path) are now wrapped
+  in `jax.jit` with static (grid, order, limiter), so repeated call sites
+  with the same signature — the two RK2 stages, several tracers with the
+  same limiter — share one lowered computation instead of inlining copies.
+  On the T85/L32 3-tracer step this removes 30% of lowered ops (6442 →
+  4518; gathers 64 → 30) with runtime unchanged. The remaining lowering
+  bulk is embedded spectral-basis constants duplicated per
+  `to_modal`/`to_nodal` call site in shared `spherical_harmonic` code —
+  a candidate follow-up outside the semi-Lagrangian scope.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
