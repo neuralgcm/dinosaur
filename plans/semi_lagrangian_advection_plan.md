@@ -1077,6 +1077,38 @@ Issues encountered while implementing this plan, by milestone.
   near the convergence margin dt·max‖∇V‖ < 1 (3 h steps, 8✕-Eulerian
   shallow-water steps) a single warm-started iteration drifts ~5✕ more,
   a caveat now documented on the equation classes.
+- **Nodal-tracer noise: diagnosis and a negative A/B result.** The
+  executed ERA5 SL notebook shows 2–6-gridpoint oscillations in humidity
+  near the Maritime Continent and the Amazon at day 1–2 (coherent
+  stationary wave trains plus fine stipple near sharp maxima); the same
+  regions in the Eulerian notebook are smooth. Spectral Gibbs in the
+  tracer is impossible by construction (nodal storage; min cloud water is
+  exactly 0.0), so the candidate mechanisms were (a) grid-scale variance
+  accumulating because nodal tracers receive no dissipation at all (no
+  spectral hyperdiffusion by design, no moist physics in this demo),
+  (b) cubic-interpolation overshoot terraced by the quasi-monotone clip,
+  and (c) noise imprinted by the resolved spectral dynamics near sharp
+  terrain. `semi_lagrangian.nodal_diffusion_filter` +
+  `primitive_equations.step_filter_for_nodal_tracers` were added to test
+  (a): a separable index-space smoother (periodic longitude, cross-pole
+  halo latitude; `mu = 1 − exp(−dt/tau)` at the 2Δ scale; order 2 is a
+  Shapiro-type δ⁴ kernel with the modal ∇⁴'s selectivity, clipped to the
+  local 3✕3 range so positivity and no-new-extrema survive exactly). The
+  A100 A/B at the dynamics' own tau left the wave trains essentially
+  unchanged (forecast cell 3.29 s vs 3.27 s — the filter is free — and
+  positivity intact): a filter that damps passive 2Δ content to ~1e-12
+  over the run barely touched them, so they are continuously forced,
+  stationary, ~4–6Δ patterns from the resolved dynamics — mechanism (c),
+  which no tracer-side scheme (including SLHD, §12) can remove. The
+  Eulerian notebook is smooth there only because its spectral tracer
+  representation truncates (~3Δ at T170 on the quadratic grid) and
+  hyperdiffuses those scales, at the cost of Gibbs negatives. The filter
+  is kept as an opt-in library feature (the correct closure for the real
+  no-dissipation gap of nodal tracers in physics-free configurations) but
+  is not wired into the notebook; the indicated follow-ups for the wave
+  trains are dynamics-side — stronger or steeper tail hyperdiffusion,
+  smoother orography, or the Ritchie–Tanguay smoothed-terrain variable
+  already flagged by the large-Δt study.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
