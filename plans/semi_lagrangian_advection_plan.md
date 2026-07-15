@@ -912,6 +912,41 @@ Issues encountered while implementing this plan, by milestone.
   off-centering exists to treat), so dt = 30 min (6✕ the Eulerian
   notebook, 3.9✕ wall-clock speedup at 1.8 s per simulated day) is the
   tuned operating point used in the semi-Lagrangian ERA5 notebook.
+- **Notebook study (Modal A100-80GB).** All three repo notebooks were
+  re-executed headless on A100 (portability fixes: `np.cast` removal,
+  `HybridCoordinates` module move, `get_geopotential`/
+  `compute_vertical_velocity` renames — the originals no longer ran against
+  main) and semi-Lagrangian copies were added alongside them. Measured
+  wall-clock for the simulation cells (same GPU, compiled runs):
+  ERA5 T170/L32 2-day forecast 14.3 s Eulerian (dt = 5 min) vs 3.9 s SL
+  (dt = 30 min, ~3.6-3.9✕); Held-Suarez T42/L24 1200-day climate run
+  2 min 16 s Eulerian (dt = 10 min) vs 1 min 32 s SL (dt = 60 min, 1.5✕);
+  baroclinic T42/L24 two-week wave at wall-clock parity (SL per-step gather
+  overhead offsets the 12✕ step reduction at this small size — the SL
+  advantage grows with resolution). The ERA5 SL notebook stores all three
+  moisture tracers nodally with the quasi-monotone limiter and runs DFI
+  with the semi-Lagrangian core; its executed verification cell shows
+  min cloud liquid water = 0.0 exactly (both DFI and unfiltered runs, and
+  strictly positive humidity), versus −1.1e-4 with negative humidity in
+  the Eulerian notebook — closing the negative-cloud-water caveat written
+  into the original notebook.
+- **Off-centering does not fix the large-Δt terrain artifact.** An ε-scan
+  on the 2-day ERA5 forecast (ε ∈ {0, 0.05, 0.1, 0.2} at dt = 45/60 min)
+  left the hot anomaly essentially unchanged (340 → 335/334/348 K at
+  60 min) while degrading the cold extreme (183 → 148 K at ε = 0.2), and
+  the anomaly localizes to the steepest terrain (Andes coast, Himalayan
+  foothills) rather than ridge tops. This rules out classical stationary
+  orographic resonance (which decentering damps) and implicates the
+  explicit terrain terms (`RT'∇ln pₛ` residual) at large Δt — the
+  Ritchie & Tanguay (1996) smoothed interpolated variable noted in §4 is
+  the indicated follow-up, and dt = 30 min remains the tuned operating
+  point.
+- One integration fix from the notebook runs: diagnostics that feed a full
+  state into `compute_diagnostic_state_sigma` (e.g. the notebooks'
+  vertical-velocity output) must strip nodal tracers first, since that
+  helper spectrally transforms `state.tracers`. The SL ERA5 notebook drops
+  tracers from the diagnostic call; the equation classes themselves already
+  split nodal tracers internally.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
