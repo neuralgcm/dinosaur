@@ -27,6 +27,7 @@ Nonlinear Zonal Geostrophic Flow." We plan to add additional test cases as we
 build out the feature set of the solver.
 """
 
+import dataclasses
 import unittest
 
 from absl.testing import absltest
@@ -433,6 +434,10 @@ class SemiLagrangianShallowWaterTest(parameterized.TestCase):
     """SL stays stable and accurate at time steps where the Eulerian core
     blows up."""
     equation, initial_state = self._steady_state_setup('planetary_momentum')
+    # 8x-Eulerian steps sit near the trajectory iteration's convergence
+    # margin; request converged (two-iteration) trajectories rather than
+    # the operating-point default of one warm-started iteration.
+    equation = dataclasses.replace(equation, departure_iterations=2)
     coords = equation.coords
     grid = coords.horizontal
     physics_specs = equation.physics_specs

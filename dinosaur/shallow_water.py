@@ -263,12 +263,14 @@ class SemiLagrangianShallowWaterEquations(
       ('cubic' or 'linear'); trajectories always use linear interpolation.
     departure_iterations: number of fixed-point iterations in the
       departure-point solve (see
-      `semi_lagrangian.horizontal_departure_points`).
+      `semi_lagrangian.horizontal_departure_points`). The default single
+      iteration relies on the steppers' default warm starts; use at least
+      2 if those are disabled.
   """
 
   coriolis_mode: str = 'planetary_momentum'
   interpolation_order: str = 'cubic'
-  departure_iterations: int = 2
+  departure_iterations: int = 1
 
   def __post_init__(self):
     if self.coriolis_mode not in ('planetary_momentum', 'explicit'):

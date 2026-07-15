@@ -233,7 +233,7 @@ def semi_lagrangian_crank_nicolson_rk2(
     equation: SemiLagrangianImplicitExplicitODE,
     time_step: float,
     off_centering: float = 0.0,
-    warm_start_corrector: bool = False,
+    warm_start_corrector: bool = True,
 ) -> TimeStepFn:
   """Semi-Lagrangian time stepping via Crank-Nicolson and Heun's method.
 
@@ -265,23 +265,24 @@ def semi_lagrangian_crank_nicolson_rk2(
       trapezoidal rule — the standard remedy for orographic resonance in
       semi-implicit semi-Lagrangian models. First-order accurate in the
       ε-weighted terms; ε = 0 (default) is fully centered and second order.
-    warm_start_corrector: if True, the corrector stage's departure-point
-      iteration starts from the predictor stage's departure points instead
-      of the arrival points (the analogue, within a single step, of the
-      warm-started iteration adopted in IFS Cycle 48r1; see
-      `semi_lagrangian.horizontal_departure_points`). At the default two
-      iterations this is measurably counterproductive — the trajectory
-      residual is already far below the scheme's discretization error, and
-      a cold corrector's first iteration interpolates at the (constant)
-      arrival mesh, which compiles to cheaper code — hence False by
-      default. Its use is enabling `departure_iterations=1` on the
-      equation: one warm-started iteration matches the residual of two
-      cold ones, saving ~18% of step time at T170/L32 on A100. The
+    warm_start_corrector: if True (default), the corrector stage's
+      departure-point iteration starts from the predictor stage's
+      departure points instead of the arrival points (the analogue, within
+      a single step, of the warm-started iteration adopted in IFS Cycle
+      48r1; see `semi_lagrangian.horizontal_departure_points`). Paired
+      with the equations' default `departure_iterations=1`, one
+      warm-started iteration matches the trajectory residual of two cold
+      ones at ~18% less step time (T170/L32 on A100); the
       trajectory-truncation error stays below — though within a factor of
       ~2 of — the converged scheme's own sensitivity to the time step
       (1.1e-4 vs 2.3e-4 relative l2 on T′ over a 12 h T85 baroclinic wave
-      at dt = 30 min, against 30 → 7.5 min refinement); a cold single
-      iteration (3.6e-3) is not accurate enough.
+      at dt = 30 min, against 30 → 7.5 min refinement). If disabled, raise
+      `departure_iterations` to at least 2: a cold single iteration
+      (3.6e-3) is not accurate enough. At two iterations the warm start is
+      measurably counterproductive (a cold corrector's first iteration
+      interpolates at the constant arrival mesh, which compiles to cheaper
+      code), so pair `warm_start_corrector=False` with
+      `departure_iterations=2` to reproduce pre-warm-start behavior.
 
   Returns:
     Function that performs a time step.

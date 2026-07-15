@@ -1034,7 +1034,14 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
 
   def test_time_step_extension(self):
     """SL remains stable at time steps where the Eulerian core blows up."""
-    equation, eulerian, state0 = self._setup(spherical_harmonic.Grid.T42())
+    # At this extreme step the trajectory iteration operates near its
+    # convergence margin (dt·max‖∇V‖ < 1, plan §5): the default
+    # single warm-started iteration is built for operating-point steps and
+    # drifts 5x more here, so converged (two-iteration) trajectories are
+    # requested explicitly.
+    equation, eulerian, state0 = self._setup(
+        spherical_harmonic.Grid.T42(), departure_iterations=2
+    )
     grid = equation.coords.horizontal
     dt = self._nondim_minutes(equation.physics_specs, 180)
     steps = 16  # two simulated days
@@ -1163,7 +1170,8 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
     error (the residual difference is O((dt·∇V)²) per solve).
     """
     equation, _, state0 = self._setup(
-        spherical_harmonic.Grid.T21(), perturbation=True
+        spherical_harmonic.Grid.T21(), perturbation=True,
+        departure_iterations=2,
     )
     grid = equation.coords.horizontal
     dt = self._nondim_minutes(equation.physics_specs, 30)
@@ -1187,7 +1195,8 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
   def test_settls_warm_started_departures_are_consistent(self):
     """SETTLS with and without carried departure points nearly agree."""
     equation, _, state0 = self._setup(
-        spherical_harmonic.Grid.T21(), perturbation=True
+        spherical_harmonic.Grid.T21(), perturbation=True,
+        departure_iterations=2,
     )
     grid = equation.coords.horizontal
     dt = self._nondim_minutes(equation.physics_specs, 30)

@@ -1742,9 +1742,15 @@ class SemiLagrangianPrimitiveEquations(
       and cannot participate in the dynamics (`humidity_key`, `cloud_keys`).
     departure_iterations: number of fixed-point iterations in the
       departure-point solves (see `semi_lagrangian.departure_points_3d`).
-      The default 2 gives second-order departure points; warm-started
-      steppers (`warm_start_corrector`/`warm_start_departures`) reduce the
-      remaining fixed-point residual at no extra cost.
+      The default single iteration relies on the warm-started trajectory
+      solves that the semi-Lagrangian steppers perform by default
+      (`warm_start_corrector`/`warm_start_departures`), which match the
+      accuracy of two cold iterations at lower cost; if those warm starts
+      are disabled, use at least 2 (a single cold iteration gives only
+      first-order departure points). Time steps far beyond the usual
+      operating points (approaching the convergence margin
+      dt·max‖∇V‖ < 1) also need at least 2: the warm start cannot rescue
+      a barely-contracting iteration.
   """
 
   coriolis_mode: str = dataclasses.field(
@@ -1755,7 +1761,7 @@ class SemiLagrangianPrimitiveEquations(
       default=(), kw_only=True
   )
   nodal_tracers: tuple[str, ...] = dataclasses.field(default=(), kw_only=True)
-  departure_iterations: int = dataclasses.field(default=2, kw_only=True)
+  departure_iterations: int = dataclasses.field(default=1, kw_only=True)
 
   def __post_init__(self):
     super().__post_init__()
@@ -3337,7 +3343,7 @@ class SemiLagrangianPrimitiveEquationsHybrid(
       default=(), kw_only=True
   )
   nodal_tracers: tuple[str, ...] = dataclasses.field(default=(), kw_only=True)
-  departure_iterations: int = dataclasses.field(default=2, kw_only=True)
+  departure_iterations: int = dataclasses.field(default=1, kw_only=True)
 
   def __post_init__(self):
     super().__post_init__()
