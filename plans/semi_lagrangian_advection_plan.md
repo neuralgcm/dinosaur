@@ -866,6 +866,18 @@ Issues encountered while implementing this plan, by milestone.
   breaking it; conservative fixers (Priestley/Bermejo–Conde) remain
   deliberately outside this interface, as global post-transport corrections
   at the equation level.
+- First GPU numbers (Modal, float32, `benchmarks/
+  semi_lagrangian_gather_benchmark.py`): the linearized 1-D take and
+  multi-array advanced indexing are equivalent on A100-80GB and H100
+  (within a few percent at T85/L32-T340/L64; e.g. H100 T170/L48: 1.73 vs
+  1.74 ms), while the linearized form is 1.3-2✕ faster on CPU — so the
+  implementation keeps it. Library-level on H100: `transport_scalar`
+  0.41 / 2.55 / 37 ms and `departure_points_3d` 1.0 / 6.3 / 121 ms at
+  T85/L32, T170/L48, T340/L64 — the departure solve, not the gather, is
+  the dominant SL cost on GPU. Synthetic gather payload bandwidth reaches
+  ~560 GB/s (H100) at T85 and drops to ~160 GB/s at T340 with fully random
+  indices (a pessimistic bound; real departure points are spatially
+  coherent).
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
