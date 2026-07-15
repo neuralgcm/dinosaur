@@ -740,6 +740,35 @@ hybrid-coordinate support; stage-consistent high-order SL-RK; the
 implicit-Coriolis `coriolis_mode` (LIMPF-style per-`m` block-tridiagonal
 implicit solve; §11).
 
+**SLHD — flow-adaptive damping through the interpolator (design sketch).**
+The principled successor to the uniform `nodal_diffusion_filter` for
+tracer-noise control is the Semi-Lagrangian Horizontal Diffusion of Váňa
+et al. (2008): transport interpolates with a pointwise blend
+
+    f(x_d) = (1 − κ)·f_cubic(x_d) + κ·f_linear(x_d),
+
+with κ ∈ [0, κ_max] diagnosed from the local resolved flow deformation
+(total strain |D| from the stretching and shearing components, computable
+from the modal state's spectral derivatives), e.g.
+κ = κ_max·(1 − exp(−(Δt·|D|/d₀)^p)). This is a Smagorinsky-style closure of
+the advective cascade: dissipation lands exactly where deformation
+generates grid-scale variance and at a rate tied to the local cascade
+rate, while coherently translating sharp features keep full cubic
+accuracy. Implementation shape in this codebase: `GridInterpolator` gains
+the blend (one extra 2✕2(✕2) gather on transported fields, ~+1–3% step
+time), the equation classes gain the κ diagnostic evaluated at arrival
+nodes, and `semi_lagrangian_transport` threads κ into the tracer
+interpolators; the blend is a convex combination of the limited cubic and
+the automatically-monotone linear interpolant, so quasi-monotone
+positivity guarantees survive unchanged. Known blind spot, and why the
+nodal filter should be retained as the weak supporting term (the
+operational configuration in ALADIN/ALARO does the same): SLHD dissipates
+only through the act of interpolation, whose damping vanishes as the local
+displacement approaches zero or an integer number of cells — stationary
+noise in weakly-deforming regions escapes it. Calibration surface is
+κ_max, d₀ and p, which warrant an ERA5 A/B like the one that validated the
+nodal filter.
+
 ## 13. Implementation updates
 
 Issues encountered while implementing this plan, by milestone.
