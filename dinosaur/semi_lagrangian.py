@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from typing import NamedTuple
 
 from dinosaur import coordinate_systems
 from dinosaur import sigma_coordinates
@@ -593,6 +594,25 @@ def interpolate_3d(
 #  =============================================================================
 
 
+class VerticalNodes(NamedTuple):
+  """Fixed vertical interpolation nodes for semi-Lagrangian transport.
+
+  Any vertical coordinate whose per-level node positions do not vary in
+  space or time works: σ layer centers/boundaries, or hybrid-coordinate
+  reference-σ nodes (the hybrid *level* coordinate is fixed even though the
+  pressure of each level depends on surface pressure). Provides the same
+  `.centers`/`.boundaries` attributes as `sigma_coordinates.SigmaCoordinates`
+  consumed by the transport functions.
+
+  Attributes:
+    centers: increasing node values at layer centers, shape [layers].
+    boundaries: increasing node values at layer boundaries, [layers + 1].
+  """
+
+  centers: np.ndarray
+  boundaries: np.ndarray
+
+
 @tree_math.struct
 class DeparturePoints:
   """Departure points of trajectories arriving at grid points.
@@ -678,6 +698,7 @@ def departure_points_3d(
     dt: float,
     *,
     iterations: int = 2,
+    vertical_nodes: VerticalNodes | None = None,
 ) -> DeparturePoints:
   """Solves for 3-D departure points of trajectories arriving at layer centers.
 
@@ -697,14 +718,21 @@ def departure_points_3d(
     coords: horizontal and vertical coordinate system.
     dt: time step. Trajectories are integrated backwards over `dt`.
     iterations: number of fixed-point iterations.
+    vertical_nodes: optional fixed vertical nodes to use instead of
+      `coords.vertical` (e.g. hybrid-coordinate reference-σ nodes, with
+      `sigma_dot` the rate of change of that node coordinate).
 
   Returns:
     DeparturePoints with fields of shape [layers, longitude_nodes,
     latitude_nodes], including departure σ coordinates.
   """
   grid = coords.horizontal
-  centers = coords.vertical.centers
-  boundaries = coords.vertical.boundaries
+  if vertical_nodes is None:
+    vertical_nodes = VerticalNodes(
+        centers=coords.vertical.centers, boundaries=coords.vertical.boundaries
+    )
+  centers = vertical_nodes.centers
+  boundaries = vertical_nodes.boundaries
   u = jnp.asarray(u)
 
   lon_mesh, sin_lat_mesh = grid.nodal_mesh
@@ -781,7 +809,9 @@ def transport_scalar(
     field: nodal values at layer centers, of shape [layers, longitude_nodes,
       latitude_nodes].
     departure: 3-D departure points (with σ coordinates).
-    vertical: vertical coordinates on which `field` lives.
+    vertical: vertical coordinates on which `field` lives: anything with
+      increasing `.centers` node values (`SigmaCoordinates` or
+      `VerticalNodes`).
     interpolator: interpolation rule (its grid, order and limiter settings
       are used).
 
@@ -879,7 +909,8 @@ def transport_wind(
       shape [layers, longitude_nodes, latitude_nodes].
     v: nodal meridional wind, same shape as `u`.
     departure: 3-D departure points (with σ coordinates).
-    vertical: vertical coordinates on which the winds live.
+    vertical: vertical coordinates on which the winds live (anything with
+      increasing `.centers` node values).
     interpolator: interpolation rule. Limiters are never applied to winds.
     rotate: whether to parallel-transport interpolated vectors from the
       departure to the arrival tangent plane.

@@ -2550,16 +2550,31 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
       self,
       aux_state: DiagnosticStateHybrid,
       nodal_surface_pressure: Array,
+      *,
+      include_vorticity_advection: bool = True,
+      include_coriolis: bool = True,
+      include_vertical_advection: bool = True,
+      include_pressure_gradient: bool = True,
   ) -> tuple[Array, Array]:
-    """Computes tendencies for vorticity ζ and divergence 𝛅."""
+    """Computes tendencies for vorticity ζ and divergence 𝛅.
+
+    The `include_*` arguments select term groups, mirroring the sigma-
+    coordinate class: semi-Lagrangian solvers handle the advective terms
+    (the `ζ` in `ζ + f`, and vertical advection) via trajectories, keeping
+    only the Coriolis and explicit pressure-gradient forcing.
+    """
     sec2_lat = self.nondim_coords.horizontal.sec2_lat
     u, v = aux_state.cos_lat_u
-    total_vorticity = aux_state.vorticity + self.coriolis_parameter
+    total_vorticity = 0
+    if include_vorticity_advection:
+      total_vorticity += aux_state.vorticity
+    if include_coriolis:
+      total_vorticity += self.coriolis_parameter
     nodal_vorticity_u = -v * total_vorticity * sec2_lat
     nodal_vorticity_v = u * total_vorticity * sec2_lat
     mass_flux = aux_state.mass_flux_full
     delta_p = aux_state.layer_pressure_thickness
-    if self.include_vertical_advection:
+    if include_vertical_advection and self.include_vertical_advection:
       sigma_dot_u = -self._vertical_tendency(
           mass_flux, u, pressure_thickness=delta_p
       )
@@ -2570,33 +2585,40 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
       sigma_dot_u = 0
       sigma_dot_v = 0
 
-    # Explicit part of PGF is the term associated with temperature.
-    # The implicit solver uses a linearized PGF coefficient based on p_s_ref.
-    # We must add the residual (full - linear) for the reference temperature
-    # to the explicit tendencies to correctly capture PGF over topography.
-    pgf_coeff = _get_pgf_lps_coefficient(
-        aux_state.temperature_variation + self.T_ref,
-        nodal_surface_pressure,
-        self.nondim_levels,
-        self.physics_specs.R,
-    )
-    pgf_coeff_ref_linear = _get_pgf_lps_coefficient_numpy(
-        self.reference_temperature,
-        self.p_s_ref,
-        self.nondim_levels,
-        self.physics_specs.R,
-    )
-    pgf_coeff_ref_linear = jnp.array(pgf_coeff_ref_linear)[
-        ..., np.newaxis, np.newaxis
-    ]
-    pgf_coeff = pgf_coeff * self._virtual_temperature_adjustment(aux_state)
+    if include_pressure_gradient:
+      # Explicit part of PGF is the term associated with temperature.
+      # The implicit solver uses a linearized PGF coefficient based on
+      # p_s_ref. We must add the residual (full - linear) for the reference
+      # temperature to the explicit tendencies to correctly capture PGF over
+      # topography.
+      pgf_coeff = _get_pgf_lps_coefficient(
+          aux_state.temperature_variation + self.T_ref,
+          nodal_surface_pressure,
+          self.nondim_levels,
+          self.physics_specs.R,
+      )
+      pgf_coeff_ref_linear = _get_pgf_lps_coefficient_numpy(
+          self.reference_temperature,
+          self.p_s_ref,
+          self.nondim_levels,
+          self.physics_specs.R,
+      )
+      pgf_coeff_ref_linear = jnp.array(pgf_coeff_ref_linear)[
+          ..., np.newaxis, np.newaxis
+      ]
+      pgf_coeff = pgf_coeff * self._virtual_temperature_adjustment(aux_state)
 
-    # We subtract the dry linear term because the implicit solver adds it
-    # (and does not account for moisture).
-    pgf_coeff -= pgf_coeff_ref_linear
-    grad_log_ps_u, grad_log_ps_v = aux_state.cos_lat_grad_log_sp
-    vertical_term_u = (sigma_dot_u + pgf_coeff * grad_log_ps_u) * sec2_lat
-    vertical_term_v = (sigma_dot_v + pgf_coeff * grad_log_ps_v) * sec2_lat
+      # We subtract the dry linear term because the implicit solver adds it
+      # (and does not account for moisture).
+      pgf_coeff -= pgf_coeff_ref_linear
+      grad_log_ps_u, grad_log_ps_v = aux_state.cos_lat_grad_log_sp
+      pgf_u = pgf_coeff * grad_log_ps_u
+      pgf_v = pgf_coeff * grad_log_ps_v
+    else:
+      pgf_u = 0
+      pgf_v = 0
+    vertical_term_u = (sigma_dot_u + pgf_u) * sec2_lat
+    vertical_term_v = (sigma_dot_v + pgf_v) * sec2_lat
     combined_u = self.coords.horizontal.to_modal(
         nodal_vorticity_u + vertical_term_u
     )
@@ -2615,19 +2637,28 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
   def nodal_temperature_vertical_tendency(
       self,
       aux_state: DiagnosticStateHybrid,
+      *,
+      include_advection: bool = True,
+      include_reference: bool = True,
   ) -> Array | float:
-    """Computes explicit vertical tendency of the temperature."""
+    """Computes explicit vertical tendency of the temperature.
+
+    The `include_*` arguments mirror the sigma-coordinate class: vertical
+    advection of T' is advective (handled via trajectories by
+    semi-Lagrangian solvers), while the reference-temperature source term
+    is not (T_ref is a fixed function of the level, not a transported
+    field).
+    """
     mass_flux_explicit = aux_state.mass_flux_explicit
     mass_flux_full = aux_state.mass_flux_full
     temperature_variation = aux_state.temperature_variation
     delta_p = aux_state.layer_pressure_thickness
-    if self.include_vertical_advection:
-      tendency = self._vertical_tendency(
+    tendency = 0
+    if include_advection and self.include_vertical_advection:
+      tendency += self._vertical_tendency(
           mass_flux_full, temperature_variation, pressure_thickness=delta_p
       )
-    else:
-      tendency = 0
-    if np.unique(self.T_ref.ravel()).size > 1:
+    if include_reference and np.unique(self.T_ref.ravel()).size > 1:
       tendency += self._vertical_tendency(
           mass_flux_explicit, self.T_ref, pressure_thickness=delta_p
       )
@@ -2715,9 +2746,23 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
 
   @jax.named_call
   def nodal_log_pressure_tendency(
-      self, aux_state: DiagnosticStateHybrid, nodal_surface_pressure: Array
+      self,
+      aux_state: DiagnosticStateHybrid,
+      nodal_surface_pressure: Array,
+      *,
+      include_advection: bool = True,
+      include_linearization_residual: bool = True,
   ) -> Array:
-    """Computes explicit tendency of the log_surface_pressure."""
+    """Computes explicit tendency of the log_surface_pressure.
+
+    Unlike the sigma-coordinate class (whose explicit ln(pₛ) tendency is
+    purely advective), the hybrid tendency has two parts selected by the
+    `include_*` arguments: the ΔB-weighted advection `-Σ(v·∇ln pₛ)ΔB`
+    (which semi-Lagrangian solvers replace with 2-D transport by the
+    ΔB-weighted mean wind, exact since ∇ln pₛ is level-independent and
+    ΣΔB = 1), and a non-advective linearization residual from treating the
+    ΔA divergence term implicitly at the reference surface pressure.
+    """
     levels = self.nondim_levels
     # Explicit tendency = Total tendency - Implicit tendency.
     # Total d(ln ps)/dt = - Σ [ (ΔA/ps + ΔB)div + ΔB*udg ]
@@ -2725,15 +2770,21 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
     # The explicit part is the difference.
     delta_a = levels.pressure_thickness[:, np.newaxis, np.newaxis]
     delta_b = levels.sigma_thickness[:, np.newaxis, np.newaxis]
-    # Linearization error from the divergence term is treated explicitly
-    div_a_term = jnp.sum(
-        aux_state.divergence
-        * delta_a
-        * (1 / nodal_surface_pressure - 1 / self.p_s_ref),
-        axis=0,
-    )
-    # Advective term is fully explicit.
-    udg_b_term = jnp.sum(aux_state.u_dot_grad_log_sp * delta_b, axis=0)
+    if include_linearization_residual:
+      # Linearization error from the divergence term is treated explicitly
+      div_a_term = jnp.sum(
+          aux_state.divergence
+          * delta_a
+          * (1 / nodal_surface_pressure - 1 / self.p_s_ref),
+          axis=0,
+      )
+    else:
+      div_a_term = 0
+    if include_advection:
+      # Advective term is fully explicit.
+      udg_b_term = jnp.sum(aux_state.u_dot_grad_log_sp * delta_b, axis=0)
+    else:
+      udg_b_term = 0
     return -(div_a_term + udg_b_term)
 
   @jax.named_call
@@ -2848,6 +2899,227 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
         sim_time=None if state.sim_time is None else 1.0,  # pyrefly: ignore[unexpected-keyword]
     )
     return self.coords.horizontal.clip_wavenumbers(tendency)
+
+  @jax.named_call
+  def explicit_advective_terms(self, state: State) -> State:
+    """Computes the advective part of the explicit tendencies.
+
+    Together with `explicit_nonadvective_terms`, this decomposes
+    `explicit_terms` by transport role, exactly as in
+    `PrimitiveEquationsSigma.explicit_advective_terms` (see its docstring
+    for the rationale); the reconstruction holds up to floating point
+    rounding. The hybrid-specific difference is in the
+    `log_surface_pressure` entry, whose advective part is the ΔB-weighted
+    `-Σ(v·∇ln pₛ)ΔB` term.
+
+    Args:
+      state: the (modal) state from which to compute tendencies.
+
+    Returns:
+      A `State` of advective explicit tendencies.
+    """
+    aux_state = compute_diagnostic_state_hybrid(state, self.nondim_coords)
+    nodal_surface_pressure = jnp.exp(
+        self.coords.horizontal.to_nodal(state.log_surface_pressure)
+    )
+    vorticity_dot, divergence_dot = self.curl_and_div_tendencies(
+        aux_state,
+        nodal_surface_pressure,
+        include_coriolis=False,
+        include_pressure_gradient=False,
+    )
+    kinetic_energy_tendency = self.kinetic_energy_tendency(aux_state)
+    horizontal_tendency_fn = functools.partial(
+        self.horizontal_scalar_advection, aux_state=aux_state
+    )
+    dT_dt_horizontal_nodal, dT_dt_horizontal_modal = horizontal_tendency_fn(
+        aux_state.temperature_variation
+    )
+    tracers_horizontal_nodal_and_modal = jax.tree_util.tree_map(
+        horizontal_tendency_fn, aux_state.tracers
+    )
+    dT_dt_vertical = self.nodal_temperature_vertical_tendency(
+        aux_state, include_reference=False
+    )
+    log_sp_tendency = self.nodal_log_pressure_tendency(
+        aux_state,
+        nodal_surface_pressure,
+        include_linearization_residual=False,
+    )
+    if self.include_vertical_advection:
+      vertical_tendency_fn = functools.partial(
+          self._vertical_tendency,
+          aux_state.mass_flux_full,
+          pressure_thickness=aux_state.layer_pressure_thickness,
+      )
+    else:
+      vertical_tendency_fn = lambda x: 0
+    tracers_vertical_nodal = jax.tree_util.tree_map(
+        vertical_tendency_fn, aux_state.tracers
+    )
+    to_modal_fn = self.coords.horizontal.to_modal
+    tendency = State(
+        vorticity=vorticity_dot,
+        divergence=divergence_dot + kinetic_energy_tendency,
+        temperature_variation=(
+            to_modal_fn(dT_dt_horizontal_nodal + dT_dt_vertical)
+            + dT_dt_horizontal_modal
+        ),
+        log_surface_pressure=to_modal_fn(log_sp_tendency)[jnp.newaxis, ...],
+        tracers=jax.tree_util.tree_map(
+            lambda x, y_z: to_modal_fn(x + y_z[0]) + y_z[1],
+            tracers_vertical_nodal,
+            tracers_horizontal_nodal_and_modal,
+        ),
+        sim_time=None if state.sim_time is None else 0.0,
+    )
+    return self.coords.horizontal.clip_wavenumbers(tendency)
+
+  @jax.named_call
+  def explicit_nonadvective_terms(
+      self, state: State, *, include_coriolis: bool = True
+  ) -> State:
+    """Computes the non-advective part of the explicit tendencies.
+
+    See `explicit_advective_terms` for the decomposition. Relative to the
+    sigma-coordinate class, the hybrid non-advective part additionally
+    includes the geopotential and pressure-gradient linearization residuals
+    (full minus reference-pressure-linearized, needed for hydrostatic
+    balance over topography) and the ΔA linearization residual in the
+    `log_surface_pressure` tendency.
+
+    Args:
+      state: the (modal) state from which to compute tendencies.
+      include_coriolis: whether to include the Coriolis term. Semi-Lagrangian
+        solvers in planetary-momentum mode absorb it into transport.
+
+    Returns:
+      A `State` of non-advective explicit tendencies.
+    """
+    aux_state = compute_diagnostic_state_hybrid(state, self.nondim_coords)
+    nodal_surface_pressure = jnp.exp(
+        self.coords.horizontal.to_nodal(state.log_surface_pressure)
+    )
+    vorticity_dot, divergence_dot = self.curl_and_div_tendencies(
+        aux_state,
+        nodal_surface_pressure,
+        include_vorticity_advection=False,
+        include_coriolis=include_coriolis,
+        include_vertical_advection=False,
+    )
+    orography_tendency = self.orography_tendency()
+    temperature = self.T_ref + aux_state.temperature_variation
+    adjustment = self._virtual_temperature_adjustment(aux_state)
+    geopotential_diff_full = get_geopotential_diff_hybrid(
+        temperature * adjustment,
+        self.nondim_levels,
+        self.physics_specs.R,
+        nodal_surface_pressure,
+        method='sparse',
+        sharding=self.coords.dycore_sharding,
+    )
+    geopotential_diff_linear = get_geopotential_diff_hybrid(
+        aux_state.temperature_variation,
+        self.nondim_levels,
+        self.physics_specs.R,
+        self.p_s_ref,
+        method='dense',
+        sharding=self.coords.dycore_sharding,
+    )
+    geopotential_tendency_residual = -self.coords.horizontal.laplacian(
+        self.coords.horizontal.to_modal(
+            geopotential_diff_full - geopotential_diff_linear
+        )
+    )
+    if self.humidity_key is not None:
+      vorticity_dot += self.vorticity_tendency_due_to_humidity(
+          state, aux_state
+      )
+      divergence_dot += self.divergence_tendency_due_to_humidity(
+          state, aux_state
+      )
+    dT_dt_reference = self.nodal_temperature_vertical_tendency(
+        aux_state, include_advection=False
+    )
+    dT_dt_adiabatic = self.nodal_temperature_adiabatic_tendency(
+        aux_state, nodal_surface_pressure
+    )
+    log_sp_residual = self.nodal_log_pressure_tendency(
+        aux_state, nodal_surface_pressure, include_advection=False
+    )
+    to_modal_fn = self.coords.horizontal.to_modal
+    tendency = State(
+        vorticity=vorticity_dot,
+        divergence=(
+            divergence_dot
+            + orography_tendency
+            + geopotential_tendency_residual
+        ),
+        temperature_variation=to_modal_fn(dT_dt_reference + dT_dt_adiabatic),
+        log_surface_pressure=to_modal_fn(log_sp_residual)[jnp.newaxis, ...],
+        tracers=jax.tree_util.tree_map(jnp.zeros_like, state.tracers),
+        sim_time=None if state.sim_time is None else 1.0,
+    )
+    return self.coords.horizontal.clip_wavenumbers(tendency)
+
+  @jax.named_call
+  def nodal_velocities(
+      self,
+      state: State,
+      aux_state: DiagnosticStateHybrid | None = None,
+  ) -> NodalVelocities:
+    """Computes nodal winds used for semi-Lagrangian trajectories.
+
+    The vertical coordinate for trajectories is the reference-σ level
+    coordinate `s = (A + B·pₛ_ref)/pₛ_ref`, whose per-level nodes are fixed
+    even though the pressure of each level varies with surface pressure.
+    Its rate of change at interior layer boundaries is diagnosed from the
+    interface mass flux `M = ṡ·∂p/∂s` as `ṡ = M·Δs/Δp`, with Δs and Δp
+    centered differences of layer-center values across each boundary.
+
+    Args:
+      state: the (modal) state from which to compute velocities.
+      aux_state: optional pre-computed diagnostic state.
+
+    Returns:
+      A `NodalVelocities` holding true horizontal winds at layer centers,
+      ds/dt at all layer boundaries, and the ΔB-weighted mean wind that
+      transports `log_surface_pressure`.
+    """
+    if aux_state is None:
+      aux_state = compute_diagnostic_state_hybrid(state, self.nondim_coords)
+    cos_lat = self.coords.horizontal.cos_lat
+    u = aux_state.cos_lat_u[0] / cos_lat
+    v = aux_state.cos_lat_u[1] / cos_lat
+    levels = self.nondim_levels
+    nodal_surface_pressure = jnp.exp(
+        self.coords.horizontal.to_nodal(state.log_surface_pressure)
+    )
+    a_centers = (levels.a_boundaries[1:] + levels.a_boundaries[:-1]) / 2
+    b_centers = (levels.b_boundaries[1:] + levels.b_boundaries[:-1]) / 2
+    pressure_centers = (
+        a_centers[:, np.newaxis, np.newaxis]
+        + b_centers[:, np.newaxis, np.newaxis] * nodal_surface_pressure
+    )
+    node_centers = (a_centers + b_centers * self.p_s_ref) / self.p_s_ref
+    delta_nodes = np.diff(node_centers)[:, np.newaxis, np.newaxis]
+    delta_pressure = pressure_centers[1:] - pressure_centers[:-1]
+    interior_rate = (
+        aux_state.mass_flux_full[1:-1] * delta_nodes / delta_pressure
+    )
+    sigma_dot = jnp.pad(interior_rate, [(1, 1), (0, 0), (0, 0)])
+    # ΔB weights sum to one, so this is the mean wind whose product with
+    # ∇ln pₛ reproduces the ΔB-weighted advection term exactly.
+    delta_b = levels.sigma_thickness
+    u_mean = einsum('h,hml->ml', delta_b, u)[jnp.newaxis, ...]
+    v_mean = einsum('h,hml->ml', delta_b, v)[jnp.newaxis, ...]
+    return NodalVelocities(
+        u=u,
+        v=v,
+        sigma_dot=sigma_dot,
+        u_mean=u_mean,
+        v_mean=v_mean,
+    )
 
   @jax.named_call
   def implicit_terms(self, state: State) -> State:
@@ -3007,6 +3279,216 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
     and must be added back explicitly.
     """
     return jnp.zeros_like(state.vorticity)
+
+
+@dataclasses.dataclass
+class SemiLagrangianPrimitiveEquationsHybrid(
+    PrimitiveEquationsHybrid,
+    time_integration.SemiLagrangianImplicitExplicitODE,
+):
+  """Primitive equations on hybrid coordinates in semi-Lagrangian form.
+
+  The semi-Lagrangian counterpart of `PrimitiveEquationsHybrid`, structured
+  exactly like `SemiLagrangianPrimitiveEquations` (see its docstring for the
+  transport layout, Coriolis modes and tracer options). `explicit_terms`
+  raises TypeError so that Eulerian steppers are rejected. Hybrid-coordinate
+  specifics:
+
+  - the vertical trajectory coordinate is the fixed reference-σ level
+    coordinate `s = (A + B·pₛ_ref)/pₛ_ref` (see `nodal_velocities`), so the
+    gather-based interpolation machinery applies unchanged even though the
+    pressure of each level varies with surface pressure;
+  - log surface pressure is transported along horizontal trajectories of
+    the ΔB-weighted mean wind, which reproduces the ΔB-weighted advection
+    term exactly (∇ln pₛ is level-independent and ΣΔB = 1);
+  - the non-advective forcing additionally includes the geopotential and
+    pressure-gradient linearization residuals and the ΔA residual in the
+    `log_surface_pressure` tendency (see `explicit_nonadvective_terms`).
+
+  Note: as with the Eulerian `PrimitiveEquationsHybrid`, this class is less
+  thoroughly validated than its sigma-coordinate counterpart; it is pinned
+  to `SemiLagrangianPrimitiveEquations` in the sigma-like (A = 0)
+  configuration, but genuinely hybrid behavior has only smoke coverage.
+  """
+
+  coriolis_mode: str = dataclasses.field(
+      default='planetary_momentum', kw_only=True
+  )
+  interpolation_order: str = dataclasses.field(default='cubic', kw_only=True)
+  monotone_tracers: tuple[str, ...] = dataclasses.field(
+      default=(), kw_only=True
+  )
+  nodal_tracers: tuple[str, ...] = dataclasses.field(default=(), kw_only=True)
+
+  def __post_init__(self):
+    super().__post_init__()
+    if self.coriolis_mode not in ('planetary_momentum', 'explicit'):
+      raise ValueError(f'unknown {self.coriolis_mode=}')
+    dynamics_keys = {self.humidity_key, *(self.cloud_keys or ())}
+    if set(self.nodal_tracers) & dynamics_keys:
+      raise ValueError(
+          'tracers that enter the dynamics (humidity_key, cloud_keys) cannot '
+          f'be stored nodally: {self.nodal_tracers=}'
+      )
+
+  @property
+  def _planetary_rotation_rate(self) -> float | None:
+    if self.coriolis_mode == 'planetary_momentum':
+      return self.physics_specs.angular_velocity
+    return None
+
+  @property
+  def _vertical_nodes(self) -> semi_lagrangian.VerticalNodes:
+    """Fixed reference-σ nodes of the hybrid levels."""
+    levels = self.nondim_levels
+    boundaries = (
+        levels.a_boundaries + levels.b_boundaries * self.p_s_ref
+    ) / self.p_s_ref
+    centers = (boundaries[1:] + boundaries[:-1]) / 2
+    return semi_lagrangian.VerticalNodes(
+        centers=centers, boundaries=boundaries
+    )
+
+  def _split_nodal_tracers(
+      self, state: State
+  ) -> tuple[State, Mapping[str, Array]]:
+    """Splits `state` into a modal-only state and the nodal tracers.
+
+    See `SemiLagrangianPrimitiveEquations._split_nodal_tracers`.
+    """
+    modal = {
+        k: v for k, v in state.tracers.items() if k not in self.nodal_tracers
+    }
+    nodal = {
+        k: v for k, v in state.tracers.items() if k in self.nodal_tracers
+    }
+    return state.replace(tracers=modal), nodal
+
+  # Reject Eulerian-stepper misuse (see the class docstring): the inherited
+  # PrimitiveEquationsHybrid.explicit_terms would otherwise take precedence
+  # over the interface's raising version in the MRO.
+  explicit_terms = (
+      time_integration.SemiLagrangianImplicitExplicitODE.explicit_terms
+  )
+
+  @jax.named_call
+  def nonadvective_terms(self, state: State) -> State:
+    """Computes non-advective explicit tendencies ("N")."""
+    modal_state, nodal_tracers = self._split_nodal_tracers(state)
+    tendency = self.explicit_nonadvective_terms(
+        modal_state, include_coriolis=self.coriolis_mode == 'explicit'
+    )
+    if not nodal_tracers:
+      return tendency
+    tracers = dict(tendency.tracers)
+    tracers.update(jax.tree_util.tree_map(jnp.zeros_like, nodal_tracers))
+    return tendency.replace(tracers=tracers)
+
+  @jax.named_call
+  def nodal_velocities(
+      self,
+      state: State,
+      aux_state: DiagnosticStateHybrid | None = None,
+  ) -> NodalVelocities:
+    modal_state, _ = self._split_nodal_tracers(state)
+    return super().nodal_velocities(modal_state, aux_state)
+
+  @jax.named_call
+  def departure_points(
+      self, velocities: NodalVelocities, dt: float
+  ) -> dict[str, semi_lagrangian.DeparturePoints]:
+    """Solves for 3-D departure points and 2-D ones for `ln(pₛ)`."""
+    return {
+        '3d': semi_lagrangian.departure_points_3d(
+            velocities.u,
+            velocities.v,
+            velocities.sigma_dot,
+            self.coords,
+            dt,
+            vertical_nodes=self._vertical_nodes,
+        ),
+        '2d': semi_lagrangian.horizontal_departure_points(
+            velocities.u_mean,
+            velocities.v_mean,
+            self.coords.horizontal,
+            dt,
+        ),
+    }
+
+  @jax.named_call
+  def semi_lagrangian_transport(
+      self,
+      bracket: State,
+      departure: dict[str, semi_lagrangian.DeparturePoints],
+  ) -> State:
+    """Remaps the advected representation of a modal state-like pytree."""
+    grid = self.coords.horizontal
+    vertical = self._vertical_nodes
+    interpolator = semi_lagrangian.GridInterpolator(
+        grid, self.interpolation_order
+    )
+    u, v = spherical_harmonic.vor_div_to_uv_nodal(
+        grid, bracket.vorticity, bracket.divergence, clip=False
+    )
+    u, v = semi_lagrangian.transport_wind(
+        u,
+        v,
+        departure['3d'],
+        vertical,
+        interpolator,
+        planetary_rotation_rate=self._planetary_rotation_rate,
+    )
+    vorticity, divergence = spherical_harmonic.uv_nodal_to_vor_div_modal(
+        grid, u, v, clip=False
+    )
+    temperature_variation = semi_lagrangian.transport_scalar(
+        grid.to_nodal(bracket.temperature_variation),
+        departure['3d'],
+        vertical,
+        interpolator,
+    )
+    log_surface_pressure = semi_lagrangian.transport_scalar_2d(
+        grid.to_nodal(bracket.log_surface_pressure),
+        departure['2d'],
+        interpolator,
+    )
+    modal_tracers = {}
+    nodal_tracers = {}
+    for name, value in bracket.tracers.items():
+      tracer_interpolator = semi_lagrangian.GridInterpolator(
+          grid,
+          self.interpolation_order,
+          limiter='quasi_monotone' if name in self.monotone_tracers else None,
+      )
+      if name in self.nodal_tracers:
+        # nodal tracers never touch the spectral basis: transport their grid
+        # values directly (no modal round trip, no wavenumber clipping).
+        nodal_tracers[name] = semi_lagrangian.transport_scalar(
+            value, departure['3d'], vertical, tracer_interpolator
+        )
+      else:
+        modal_tracers[name] = grid.to_modal(
+            semi_lagrangian.transport_scalar(
+                grid.to_nodal(value),
+                departure['3d'],
+                vertical,
+                tracer_interpolator,
+            )
+        )
+    transported = State(
+        vorticity=vorticity,
+        divergence=divergence,
+        temperature_variation=grid.to_modal(temperature_variation),
+        log_surface_pressure=grid.to_modal(log_surface_pressure),
+        tracers=modal_tracers,
+        sim_time=bracket.sim_time,
+    )
+    transported = grid.clip_wavenumbers(transported)
+    if not nodal_tracers:
+      return transported
+    tracers = dict(transported.tracers)
+    tracers.update(nodal_tracers)
+    return transported.replace(tracers=tracers)
 
 
 ###############################################################################

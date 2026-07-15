@@ -967,6 +967,23 @@ Issues encountered while implementing this plan, by milestone.
   `spherical_harmonic` code (the SL step lowers to 59 MB of module text
   vs 32 MB Eulerian); deduplicating those transforms is the identified
   follow-up, outside the semi-Lagrangian scope.
+- Hybrid-coordinate support (originally deferred in the non-goals) was
+  added after all: the hybrid *level* coordinate has fixed per-level nodes
+  (`s = (A + B·pₛ_ref)/pₛ_ref`), so the transport machinery applies
+  unchanged via a small `VerticalNodes` generalization; ṡ is diagnosed from
+  the interface mass fluxes, and the ΔB-weighted mean wind makes the 2-D
+  ln pₛ trajectory replacement exact (ΣΔB = 1). The hybrid class gains the
+  same advective/non-advective split (with two extra non-advective
+  linearization-residual terms) and `SemiLagrangianPrimitiveEquationsHybrid`
+  mirrors the sigma class. Validation is deliberately minimal: the A = 0
+  configuration is pinned to the sigma semi-Lagrangian class (nodal
+  velocities to 2e-6; 12-step runs to 4e-3, the accumulated
+  Simmons–Burridge-vs-sigma vertical discretization difference also carried
+  by the Eulerian equivalence tests), plus reconstruction, a one-day
+  baroclinic consistency check against the Eulerian hybrid core on genuinely
+  hybrid levels (l2 = 1.0e-3), and stepper-rejection coverage. Genuinely
+  hybrid configurations inherit the Eulerian hybrid class's
+  "not thoroughly verified" caveat.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 

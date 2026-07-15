@@ -1528,6 +1528,195 @@ class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
     self.assertLess(temperature.max(), 350.0)
 
 
+class SemiLagrangianHybridTest(parameterized.TestCase):
+  """Minimal validation of the hybrid-coordinate semi-Lagrangian equations.
+
+  The load-bearing test pins the hybrid class to the (well-validated) sigma
+  class in the sigma-like configuration (A = 0); genuinely hybrid levels get
+  reconstruction, consistency-with-Eulerian and rejection coverage.
+  """
+
+  def setUp(self):
+    super().setUp()
+    self._x64_was_enabled = jax.config.jax_enable_x64
+    jax.config.update('jax_enable_x64', False)
+
+  def tearDown(self):
+    jax.config.update('jax_enable_x64', self._x64_was_enabled)
+    super().tearDown()
+
+  def _l2(self, grid, x, y):
+    x, y = grid.to_nodal(x), grid.to_nodal(y)
+    return float(np.sqrt(np.square(x - y).sum() / np.square(y).sum()))
+
+  def _nondim_minutes(self, physics_specs, minutes):
+    return float(physics_specs.nondimensionalize(minutes * 60 * s_units.s))
+
+  def _hybrid_setup(self, hybrid_levels, layers=8, **kwargs):
+    physics_specs = units.SimUnits.from_si()
+    grid = spherical_harmonic.Grid.T21()
+    coords = coordinate_systems.CoordinateSystem(grid, hybrid_levels)
+    init_fn, aux_features = primitive_equations_states.steady_state_jw(
+        coords, physics_specs
+    )
+    state = init_fn()
+    state = state + primitive_equations_states.baroclinic_perturbation_jw(
+        coords, physics_specs
+    )
+    orography = primitive_equations.truncated_modal_orography(
+        aux_features[xarray_utils.OROGRAPHY], coords
+    )
+    ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
+    equation = primitive_equations.SemiLagrangianPrimitiveEquationsHybrid(
+        ref_temps, orography, coords, physics_specs, **kwargs
+    )
+    return equation, state, ref_temps, orography
+
+  def test_explicit_terms_split_reconstruction(self):
+    """Advective + non-advective terms reconstruct hybrid explicit_terms."""
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        8, sigma_exponent=1.5, stretch_exponent=0.5
+    )
+    equation, state, ref_temps, orography = self._hybrid_setup(hybrid_levels)
+    # the SL class disables explicit_terms; reconstruct against the Eulerian
+    # hybrid class, whose split methods the SL class inherits.
+    eulerian = primitive_equations.PrimitiveEquationsHybrid(
+        ref_temps, orography, equation.coords, equation.physics_specs
+    )
+    full = eulerian.explicit_terms(state)
+    advective = eulerian.explicit_advective_terms(state)
+    nonadvective = eulerian.explicit_nonadvective_terms(state)
+    reconstructed = jax.tree.map(lambda x, y: x + y, advective, nonadvective)
+    assert_states_close(full, reconstructed, rtol=1e-4, atol=1e-6)
+
+  def test_sigma_like_matches_sigma_semi_lagrangian(self):
+    """With A = 0 levels, the hybrid SL class matches the sigma SL class."""
+    layers = 8
+    physics_specs = units.SimUnits.from_si()
+    grid = spherical_harmonic.Grid.T21()
+    sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(layers)
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.from_sigma_levels(
+        sigma_levels
+    )
+    coords_sigma = coordinate_systems.CoordinateSystem(grid, sigma_levels)
+    coords_hybrid = coordinate_systems.CoordinateSystem(grid, hybrid_levels)
+    init_fn, aux_features = primitive_equations_states.steady_state_jw(
+        coords_sigma, physics_specs
+    )
+    state = init_fn()
+    state = state + primitive_equations_states.baroclinic_perturbation_jw(
+        coords_sigma, physics_specs
+    )
+    orography = primitive_equations.truncated_modal_orography(
+        aux_features[xarray_utils.OROGRAPHY], coords_sigma
+    )
+    ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
+    sl_sigma = primitive_equations.SemiLagrangianPrimitiveEquations(
+        ref_temps, orography, coords_sigma, physics_specs
+    )
+    sl_hybrid = primitive_equations.SemiLagrangianPrimitiveEquationsHybrid(
+        ref_temps, orography, coords_hybrid, physics_specs
+    )
+    with self.subTest('vertical nodes match sigma levels'):
+      np.testing.assert_allclose(
+          sl_hybrid._vertical_nodes.centers, sigma_levels.centers, atol=1e-6
+      )
+    with self.subTest('nodal velocities match'):
+      v_sigma = sl_sigma.nodal_velocities(state)
+      v_hybrid = sl_hybrid.nodal_velocities(state)
+      for name in ['u', 'v', 'sigma_dot', 'u_mean', 'v_mean']:
+        np.testing.assert_allclose(
+            getattr(v_hybrid, name),
+            getattr(v_sigma, name),
+            atol=2e-6,
+            err_msg=name,
+        )
+    with self.subTest('non-advective terms match'):
+      # divergence agrees tightly; the temperature entry carries the known
+      # Simmons-Burridge vs sigma vertical-discretization difference in the
+      # adiabatic term (the Eulerian sigma-like equivalence test absorbs the
+      # same gap with atol=1e-3 on nondimensional tendencies).
+      n_sigma = sl_sigma.nonadvective_terms(state)
+      n_hybrid = sl_hybrid.nonadvective_terms(state)
+      for field, tol in [('divergence', 1e-3), ('temperature_variation', 0.1)]:
+        self.assertLess(
+            self._l2(grid, getattr(n_hybrid, field), getattr(n_sigma, field)),
+            tol,
+            field,
+        )
+    with self.subTest('stepped run matches'):
+      dt = self._nondim_minutes(physics_specs, 30)
+      step_sigma = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(sl_sigma, dt)
+      )
+      step_hybrid = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(sl_hybrid, dt)
+      )
+      out_sigma = time_integration.repeated(step_sigma, 12)(state)
+      out_hybrid = time_integration.repeated(step_hybrid, 12)(state)
+      # measured 4.0e-3: the accumulated Simmons-Burridge vs sigma vertical
+      # discretization difference (mostly the adiabatic term), matching the
+      # Eulerian classes' behavior in the same configuration.
+      self.assertLess(
+          self._l2(
+              grid,
+              out_hybrid.temperature_variation,
+              out_sigma.temperature_variation,
+          ),
+          8e-3,
+      )
+
+  def test_baroclinic_wave_consistent_with_eulerian_hybrid(self):
+    """On genuinely hybrid levels, SL tracks the Eulerian hybrid core."""
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        8, sigma_exponent=1.5, stretch_exponent=0.5
+    )
+    sl_equation, state, ref_temps, orography = self._hybrid_setup(
+        hybrid_levels
+    )
+    physics_specs = sl_equation.physics_specs
+    grid = sl_equation.coords.horizontal
+    eulerian = primitive_equations.PrimitiveEquationsHybrid(
+        ref_temps, orography, sl_equation.coords, physics_specs
+    )
+    sl_final = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(
+                sl_equation, self._nondim_minutes(physics_specs, 30)
+            )
+        ),
+        24,
+    )(state)
+    eulerian_final = time_integration.repeated(
+        jax.jit(
+            time_integration.imex_rk_sil3(
+                eulerian, self._nondim_minutes(physics_specs, 10)
+            )
+        ),
+        72,
+    )(state)
+    self.assertTrue(
+        np.isfinite(grid.to_nodal(sl_final.temperature_variation)).all()
+    )
+    # measured 1.0e-3 (24 SL steps at dt=30 min vs 72 Eulerian at 10 min).
+    self.assertLess(
+        self._l2(
+            grid,
+            sl_final.temperature_variation,
+            eulerian_final.temperature_variation,
+        ),
+        3e-3,
+    )
+
+  def test_eulerian_stepper_use_is_rejected(self):
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        8, sigma_exponent=1.5, stretch_exponent=0.5
+    )
+    equation, state, _, _ = self._hybrid_setup(hybrid_levels)
+    with self.assertRaisesRegex(TypeError, 'semi-Lagrangian'):
+      equation.explicit_terms(state)
+
+
 def interpolate_state_hybrid_to_sigma(
     state_hybrid: primitive_equations.State,
     coords_hybrid: coordinate_systems.CoordinateSystem,
