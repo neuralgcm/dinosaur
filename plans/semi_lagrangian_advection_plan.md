@@ -850,7 +850,13 @@ Issues encountered while implementing this plan, by milestone.
   advection-free dynamics). The prohibition is now encoded in the data
   model: the interface exposes N as `nonadvective_terms`, and
   `explicit_terms` on semi-Lagrangian equations raises TypeError with
-  guidance (tested for both equation classes). The advective/non-advective
+  guidance (tested for both equation classes), and the interface was
+  subsequently made a standalone class — `ImplicitExplicitODE` is
+  deliberately not a base, since a semi-Lagrangian equation is not usable
+  where an Eulerian one is expected. The raising `explicit_terms` remains
+  necessary regardless: Eulerian steppers duck-type, and the concrete
+  classes stay isinstance-compatible through their Eulerian equation
+  parents. The advective/non-advective
   split methods on the Eulerian class remain distinct from `explicit_terms`
   by design: the fused Eulerian path sums nodal terms before a single
   spectral transform per equation, which is cheaper than adding the two

@@ -114,7 +114,7 @@ class ImplicitExplicitODE:
     return explicit_implicit_ode
 
 
-class SemiLagrangianImplicitExplicitODE(ImplicitExplicitODE):
+class SemiLagrangianImplicitExplicitODE:
   """Describes a set of ODEs solved along semi-Lagrangian trajectories.
 
   The structure of the equation is assumed to be:
@@ -126,11 +126,16 @@ class SemiLagrangianImplicitExplicitODE(ImplicitExplicitODE):
   remapping fields along trajectories (`semi_lagrangian_transport`), and
   the non-advective explicit forcing ("N" in the semi-Lagrangian
   literature) is exposed as `nonadvective_terms`. `implicit_terms` and
-  `implicit_inverse` are unchanged from the Eulerian equations.
+  `implicit_inverse` have the same meaning as on `ImplicitExplicitODE`,
+  which is deliberately *not* a base class: a semi-Lagrangian equation is
+  not usable where an Eulerian one is expected.
 
-  `explicit_terms` raises TypeError: an Eulerian time stepper handed a
-  semi-Lagrangian equation would silently integrate advection-free
-  dynamics, so the misuse is rejected instead of inherited.
+  `explicit_terms` raises TypeError rather than being left undefined:
+  Eulerian steppers duck-type, and concrete equations also inherit an
+  Eulerian `explicit_terms` from their equation base class (e.g.
+  `PrimitiveEquationsSigma`), so without the explicit rejection an Eulerian
+  stepper handed a semi-Lagrangian equation would silently integrate
+  advection-free (or advection-doubled) dynamics.
 
   Any `sim_time` field passes through transport untouched and keeps its
   existing convention (`nonadvective_terms` contributes rate 1.0).
@@ -138,6 +143,16 @@ class SemiLagrangianImplicitExplicitODE(ImplicitExplicitODE):
 
   def nonadvective_terms(self, state: PyTreeState) -> PyTreeState:
     """Evaluates the non-advective explicit tendencies ("N")."""
+    raise NotImplementedError
+
+  def implicit_terms(self, state: PyTreeState) -> PyTreeState:
+    """Evaluates implicit terms in the ODE."""
+    raise NotImplementedError
+
+  def implicit_inverse(
+      self, state: PyTreeState, step_size: float,
+  ) -> PyTreeState:
+    """Applies `(1 - step_size * implicit_terms)⁻¹` to `state`."""
     raise NotImplementedError
 
   def explicit_terms(self, state: PyTreeState) -> PyTreeState:
@@ -420,8 +435,11 @@ class TimeReversedImExODE(ImplicitExplicitODE):
 
 
 def compose_equations(
-    equations: Sequence[Union[ImplicitExplicitODE, ExplicitODE]],
-) -> ImplicitExplicitODE:
+    equations: Sequence[
+        Union[ImplicitExplicitODE, SemiLagrangianImplicitExplicitODE,
+              ExplicitODE]
+    ],
+) -> Union[ImplicitExplicitODE, SemiLagrangianImplicitExplicitODE]:
   """Combines a `equations` with at-most one ImplicitExplicitODE instance.
 
   If the ImplicitExplicitODE instance is a SemiLagrangianImplicitExplicitODE,
@@ -434,13 +452,17 @@ def compose_equations(
   `HeldSuarezForcingSigma`) fail loudly when composed over states carrying
   tracers.
   """
-  implicit_explicit_eqs = list(
-      filter(lambda x: isinstance(x, ImplicitExplicitODE), equations))
+  implicit_explicit_eqs = [
+      x
+      for x in equations
+      if isinstance(
+          x, (ImplicitExplicitODE, SemiLagrangianImplicitExplicitODE)
+      )
+  ]
   if len(implicit_explicit_eqs) != 1:
     raise ValueError('compose_equations supports at most 1 ImplicitExplicitODE '
                      f'got {len(implicit_explicit_eqs)}')
   (implicit_explicit_equation,) = implicit_explicit_eqs
-  assert isinstance(implicit_explicit_equation, ImplicitExplicitODE)
 
   def explicit_fn(x: PyTreeState) -> PyTreeState:
     explicit_tendencies = [fn.explicit_terms(x) for fn in equations]
