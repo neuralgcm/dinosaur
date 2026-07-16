@@ -1239,6 +1239,23 @@ Issues encountered while implementing this plan, by milestone.
   of the ε-terrain interaction seen at large Δt, judged acceptable for
   the notebook (plausible pre-monsoon magnitude, global error improved)
   and worth remembering if ε is ever raised.
+- **Quasi-monotone dynamics option (audit item), measured.**
+  `monotone_dynamics` transports winds (Cartesian components of the
+  relative wind, clipped before parallel transport and before the
+  planetary-momentum term), T′ and `ln pₛ` (the smoothed variable) with
+  the quasi-monotone limiter — IFS operational practice. ERA5 A100 probe
+  in the shipped configuration: at dt = 30 min it is *free* (26.6 vs
+  26.7 ms/step; reference distance 8.167e-3 vs 8.177e-3 — marginally
+  better) and it clips the ε-induced foothills warm spot from 312.1 K to
+  308.8 K (reference max 307.9 K) — i.e. that disclosed side effect was
+  largely interpolation overshoot, which the limiter removes. At
+  dt = 60 min on standard orography it tames the terrain anomaly from
+  334.7 K to 315.6 K at unchanged reference distance — a third
+  independent terrain remedy stacking with the smoothed variable and
+  orography filtering. Off by default in the library (it is diffusion on
+  the dynamics near sharp features, and our full-3-D-cell clip is
+  slightly stronger than IFS's horizontal-only prescription for T and
+  momentum); the measurements make it the indicated notebook setting.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
