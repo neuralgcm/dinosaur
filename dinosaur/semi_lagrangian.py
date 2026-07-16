@@ -214,6 +214,32 @@ def _lagrange_weights(x: Array, nodes: Array) -> jnp.ndarray:
   return jnp.prod(num / den, axis=-1)
 
 
+def _contract_stencil(values: Array, *weights: Array) -> jnp.ndarray:
+  """Contracts gathered stencil values with per-dimension weights.
+
+  `values` has one trailing axis per weight vector (the tensor-product
+  stencil); each `weights[k]` has shape [..., stencil_size_k]. Production
+  SL codes evaluate this contraction as a cascade of 1-D interpolations so
+  the full stencil tensor never exists in memory; the XLA equivalent is
+  fusion. An einsum lowers to dot_general, whose operands must be
+  materialized — the gathered stencil tensor is written to memory — which
+  is the fastest form on CPU (0.55✕ the fused form) but measurably slower
+  on GPU, where a broadcast-multiply + reduce fuses with the producing
+  gather and skips the materialization (1.15–1.20✕ on A100 at T170/L32).
+  The backend is known at trace time, so pick per platform.
+  """
+  n = len(weights)
+  if jax.default_backend() == 'cpu':
+    letters = 'ijkl'[:n]
+    operands = ','.join(f'...{c}' for c in letters)
+    return einsum(f'{operands},...{letters}->...', *weights, values)
+  result = values
+  for axis, w in enumerate(weights):
+    shape = w.shape + (1,) * (n - 1 - axis)
+    result = result * w.reshape(shape)
+  return result.sum(axis=tuple(range(-n, 0)))
+
+
 _HALO_WIDTH = 2  # supports stencils up to 4 points wide in latitude.
 
 
@@ -392,8 +418,8 @@ def _interpolate_horizontal(
 ) -> jnp.ndarray:
   """Interpolates a single [lon, lat] field with a precomputed stencil."""
   values = _gather_2d(_extend_with_pole_halo(field, grid), stencil)
-  result = einsum(
-      '...i,...j,...ij->...', stencil.lon_weights, stencil.lat_weights, values
+  result = _contract_stencil(
+      values, stencil.lon_weights, stencil.lat_weights
   )
   if limiter == 'quasi_monotone':
     cell = _linear_cell_slice(order)
@@ -627,12 +653,8 @@ def interpolate_3d(
       ..., jnp.newaxis, jnp.newaxis, :
   ]
   values = jnp.take(extended.ravel(), flat_index, mode='clip')
-  result = einsum(
-      '...v,...i,...j,...vij->...',
-      level_weights,
-      stencil.lon_weights,
-      stencil.lat_weights,
-      values,
+  result = _contract_stencil(
+      values, level_weights, stencil.lon_weights, stencil.lat_weights
   )
   if limiter == 'quasi_monotone':
     cell = _linear_cell_slice(order)
