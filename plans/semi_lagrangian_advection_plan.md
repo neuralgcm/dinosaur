@@ -1285,6 +1285,29 @@ Issues encountered while implementing this plan, by milestone.
   §3.1.6(c) extends the same idea to temperature (advecting `T − T_b`
   with a hydrostatically implied terrain-locked `T_b`) — a natural
   future extension noted in the smoothed-variable discussion.
+- **Monotonicity interface finalized: two booleans.** After a design
+  exploration that considered a per-field spec map, a limiter
+  protocol/registry, and a whole-state filter (rejected in turn: the
+  Bermejo–Staniforth bound is a property of one interpolation, needing
+  the departure points, the source field, and pre-rotation wind
+  components, so it cannot leave the interpolation kernel without extra
+  gathers and ill-defined wind bounds; and the honest inventory of
+  post-clip limiters that fit the corners interface is too thin to
+  justify a protocol), the equation-level configuration settles on
+  `monotone_tracers: bool` (was a per-name tuple; all-tracers is the only
+  exercised use, and the old tuple form is rejected loudly) and
+  `monotone_dynamics: bool`. One substantive semantic upgrade rode along:
+  under `monotone_dynamics`, the temperature bound is expressed in *full
+  temperature* via a per-level shift of the clip interval
+  (`limiter_bound_reference` on `interpolate_3d`; interpolation itself
+  unchanged, constant profiles provably a no-op) — a bound on T′ across
+  levels with different `T_ref` would be gauge-dependent, and IFS never
+  faces the question because its per-stage clip exempts the vertical for
+  T and momentum. Finer per-field policies remain expressible by
+  subclassing `semi_lagrangian_transport` or calling the transport
+  functions (which retain per-call `limiter` arguments) directly. The
+  ERA5 notebook adopts both booleans (the dynamics limiter measured free
+  and clips the ε-induced foothills warm spot).
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
