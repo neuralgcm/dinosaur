@@ -1740,6 +1740,19 @@ class SemiLagrangianPrimitiveEquations(
       `monotone_tracers` their non-negativity is exact. They must be
       excluded from modal filters (`step_filter_excluding_nodal_tracers`)
       and cannot participate in the dynamics (`humidity_key`, `cloud_keys`).
+    terrain_smoothed_log_sp: if True, transport interpolates the smoothed
+      variable `ln pₛ + Φₛ/(R·T̄)` instead of `ln pₛ`, and the static
+      field's advection `v̄·∇(Φₛ/(R·T̄))` joins the explicit forcing,
+      following Ritchie & Tanguay (1996, Mon. Wea. Rev. 124). Over steep
+      terrain `ln pₛ` is dominated by a static, hydrostatically implied
+      imprint of the orography (O(0.5) for 4 km terrain, vs O(0.03)
+      synoptic signals) that is rough at the grid scale wherever terrain
+      is sharp relative to the truncation; interpolating it pointwise at
+      departure points re-injects that roughness every step — noise an
+      Eulerian spectral core never sees, because its advection products
+      are formed spectrally and truncated. The smoothed variable removes
+      the rough component from interpolation and evaluates the mountain
+      term spectrally instead.
     departure_iterations: number of fixed-point iterations in the
       departure-point solves (see `semi_lagrangian.departure_points_3d`).
       The default single iteration relies on the warm-started trajectory
@@ -1762,6 +1775,9 @@ class SemiLagrangianPrimitiveEquations(
   )
   nodal_tracers: tuple[str, ...] = dataclasses.field(default=(), kw_only=True)
   departure_iterations: int = dataclasses.field(default=1, kw_only=True)
+  terrain_smoothed_log_sp: bool = dataclasses.field(
+      default=False, kw_only=True
+  )
 
   def __post_init__(self):
     super().__post_init__()
@@ -1807,6 +1823,61 @@ class SemiLagrangianPrimitiveEquations(
       time_integration.SemiLagrangianImplicitExplicitODE.explicit_terms
   )
 
+  @property
+  def _log_sp_terrain_correction_modal(self) -> Array:
+    """Modal static terrain correction `C = Φₛ/(R·T̄)` (Ritchie & Tanguay).
+
+    T̄ is the lowest-layer reference temperature; the choice only needs the
+    right magnitude — the correction cancels the bulk of the terrain-locked,
+    hydrostatically implied part of `ln pₛ` (`ln pₛ ≈ const − Φₛ/(R·T̄)`)
+    before interpolation, and the smooth residual from `T ≠ T̄` is harmless.
+    """
+    t_ref = self.reference_temperature[-1]
+    return (
+        self.physics_specs.g / (self.physics_specs.R * t_ref) * self.orography
+    )
+
+  @property
+  def _log_sp_terrain_correction(self) -> jnp.ndarray:
+    """Nodal values of `_log_sp_terrain_correction_modal`."""
+    return self.coords.horizontal.to_nodal(
+        self._log_sp_terrain_correction_modal
+    )
+
+  def _terrain_advection_tendency(self, state: State) -> jnp.ndarray:
+    """Modal `v̄·∇C` compensating the smoothed-variable transport.
+
+    With `terrain_smoothed_log_sp`, transport interpolates the smoothed
+    variable `ψ = ln pₛ + C` (`C` static), whose material derivative along
+    the 2-D trajectories exceeds that of `ln pₛ` by `v̄·∇C`; this supplies
+    the difference as explicit forcing, evaluated spectrally — the
+    Eulerian-style spatial averaging of the mountain term (Ritchie &
+    Tanguay 1996). The Δσ vertical weights match the trajectory wind, so
+    `∫u·∇C dσ = v̄·∇C` holds exactly (`C` is independent of σ).
+    """
+    grid = self.coords.horizontal
+    nodal_cos_lat_u = jax.tree_util.tree_map(
+        grid.to_nodal,
+        spherical_harmonic.get_cos_lat_vector(
+            state.vorticity, state.divergence, grid, clip=False
+        ),
+    )
+    nodal_cos_lat_grad = jax.tree_util.tree_map(
+        grid.to_nodal,
+        grid.cos_lat_grad(self._log_sp_terrain_correction_modal, clip=False),
+    )
+    u_dot_grad = sum(
+        jax.tree_util.tree_map(
+            lambda u, g: u * g * grid.sec2_lat,
+            nodal_cos_lat_u,
+            nodal_cos_lat_grad,
+        )
+    )
+    integral = sigma_coordinates.sigma_integral(
+        u_dot_grad, self.coords.vertical
+    )
+    return grid.clip_wavenumbers(grid.to_modal(integral))
+
   @jax.named_call
   def nonadvective_terms(self, state: State) -> State:
     """Computes non-advective explicit tendencies ("N")."""
@@ -1814,6 +1885,13 @@ class SemiLagrangianPrimitiveEquations(
     tendency = self.explicit_nonadvective_terms(
         modal_state, include_coriolis=self.coriolis_mode == 'explicit'
     )
+    if self.terrain_smoothed_log_sp:
+      tendency = tendency.replace(
+          log_surface_pressure=(
+              tendency.log_surface_pressure
+              + self._terrain_advection_tendency(modal_state)
+          )
+      )
     if not nodal_tracers:
       return tendency
     tracers = dict(tendency.tracers)
@@ -1890,11 +1968,21 @@ class SemiLagrangianPrimitiveEquations(
         vertical,
         interpolator,
     )
+    log_sp_nodal = grid.to_nodal(bracket.log_surface_pressure)
+    if self.terrain_smoothed_log_sp:
+      # interpolate the smoothed variable ψ = ln pₛ + C: the terrain-locked
+      # parts cancel before interpolation; C is static, so it is removed
+      # exactly at the arrival nodes (its advection is in the forcing).
+      log_sp_nodal = log_sp_nodal + self._log_sp_terrain_correction
     log_surface_pressure = semi_lagrangian.transport_scalar_2d(
-        grid.to_nodal(bracket.log_surface_pressure),
+        log_sp_nodal,
         departure['2d'],
         interpolator,
     )
+    if self.terrain_smoothed_log_sp:
+      log_surface_pressure = (
+          log_surface_pressure - self._log_sp_terrain_correction
+      )
     modal_tracers = {}
     nodal_tracers = {}
     for name, value in bracket.tracers.items():
@@ -3344,6 +3432,9 @@ class SemiLagrangianPrimitiveEquationsHybrid(
   )
   nodal_tracers: tuple[str, ...] = dataclasses.field(default=(), kw_only=True)
   departure_iterations: int = dataclasses.field(default=1, kw_only=True)
+  terrain_smoothed_log_sp: bool = dataclasses.field(
+      default=False, kw_only=True
+  )
 
   def __post_init__(self):
     super().__post_init__()
@@ -3396,6 +3487,57 @@ class SemiLagrangianPrimitiveEquationsHybrid(
       time_integration.SemiLagrangianImplicitExplicitODE.explicit_terms
   )
 
+  @property
+  def _log_sp_terrain_correction_modal(self) -> Array:
+    """Modal static terrain correction `C = Φₛ/(R·T̄)` (Ritchie & Tanguay).
+
+    T̄ is the lowest-layer reference temperature; the choice only needs the
+    right magnitude — the correction cancels the bulk of the terrain-locked,
+    hydrostatically implied part of `ln pₛ` (`ln pₛ ≈ const − Φₛ/(R·T̄)`)
+    before interpolation, and the smooth residual from `T ≠ T̄` is harmless.
+    """
+    t_ref = self.reference_temperature[-1]
+    return (
+        self.physics_specs.g / (self.physics_specs.R * t_ref) * self.orography
+    )
+
+  @property
+  def _log_sp_terrain_correction(self) -> jnp.ndarray:
+    """Nodal values of `_log_sp_terrain_correction_modal`."""
+    return self.coords.horizontal.to_nodal(
+        self._log_sp_terrain_correction_modal
+    )
+
+  def _terrain_advection_tendency(self, state: State) -> jnp.ndarray:
+    """Modal `v̄·∇C` compensating the smoothed-variable transport.
+
+    The hybrid analogue of the sigma-class term (see
+    `SemiLagrangianPrimitiveEquations._terrain_advection_tendency`): the
+    weights are ΔB (which sum to one), matching the ΔB-weighted mean wind
+    that transports `ln pₛ` here.
+    """
+    grid = self.coords.horizontal
+    nodal_cos_lat_u = jax.tree_util.tree_map(
+        grid.to_nodal,
+        spherical_harmonic.get_cos_lat_vector(
+            state.vorticity, state.divergence, grid, clip=False
+        ),
+    )
+    nodal_cos_lat_grad = jax.tree_util.tree_map(
+        grid.to_nodal,
+        grid.cos_lat_grad(self._log_sp_terrain_correction_modal, clip=False),
+    )
+    u_dot_grad = sum(
+        jax.tree_util.tree_map(
+            lambda u, g: u * g * grid.sec2_lat,
+            nodal_cos_lat_u,
+            nodal_cos_lat_grad,
+        )
+    )
+    delta_b = self.nondim_levels.sigma_thickness
+    weighted = einsum('h,hml->ml', delta_b, u_dot_grad)[jnp.newaxis, ...]
+    return grid.clip_wavenumbers(grid.to_modal(weighted))
+
   @jax.named_call
   def nonadvective_terms(self, state: State) -> State:
     """Computes non-advective explicit tendencies ("N")."""
@@ -3403,6 +3545,13 @@ class SemiLagrangianPrimitiveEquationsHybrid(
     tendency = self.explicit_nonadvective_terms(
         modal_state, include_coriolis=self.coriolis_mode == 'explicit'
     )
+    if self.terrain_smoothed_log_sp:
+      tendency = tendency.replace(
+          log_surface_pressure=(
+              tendency.log_surface_pressure
+              + self._terrain_advection_tendency(modal_state)
+          )
+      )
     if not nodal_tracers:
       return tendency
     tracers = dict(tendency.tracers)
@@ -3480,11 +3629,21 @@ class SemiLagrangianPrimitiveEquationsHybrid(
         vertical,
         interpolator,
     )
+    log_sp_nodal = grid.to_nodal(bracket.log_surface_pressure)
+    if self.terrain_smoothed_log_sp:
+      # interpolate the smoothed variable ψ = ln pₛ + C: the terrain-locked
+      # parts cancel before interpolation; C is static, so it is removed
+      # exactly at the arrival nodes (its advection is in the forcing).
+      log_sp_nodal = log_sp_nodal + self._log_sp_terrain_correction
     log_surface_pressure = semi_lagrangian.transport_scalar_2d(
-        grid.to_nodal(bracket.log_surface_pressure),
+        log_sp_nodal,
         departure['2d'],
         interpolator,
     )
+    if self.terrain_smoothed_log_sp:
+      log_surface_pressure = (
+          log_surface_pressure - self._log_sp_terrain_correction
+      )
     modal_tracers = {}
     nodal_tracers = {}
     for name, value in bracket.tracers.items():

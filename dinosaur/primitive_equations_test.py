@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 import functools
 
 from absl.testing import absltest
@@ -1031,6 +1032,124 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
         ),
         1e-4,
     )
+
+  def _steep_mountain_setup(self):
+    """JW jet blowing over a 4 km mountain that is rough at truncation.
+
+    Returns (ref_temps, orography, coords, physics_specs, state0) with the
+    initial `ln pₛ` hydrostatically adjusted for the added mountain.
+    """
+    equation, _, state0 = self._setup(spherical_harmonic.Grid.T42())
+    coords = equation.coords
+    grid = coords.horizontal
+    physics_specs = equation.physics_specs
+    ref_temps = equation.reference_temperature
+    lon_mesh, sin_lat_mesh = grid.nodal_mesh
+    lat_mesh = np.arcsin(sin_lat_mesh)
+    lon0, lat0 = np.deg2rad(90.0), np.deg2rad(45.0)
+    angular_dist2 = (lon_mesh - lon0) ** 2 * np.cos(lat0) ** 2 + (
+        lat_mesh - lat0
+    ) ** 2
+    height = physics_specs.nondimensionalize(4000 * s_units.m)
+    # ~4 degree half-width vs ~2.8 degree grid spacing: strong power at
+    # the truncation scale, i.e. rough for the spectral representation.
+    bump_modal = grid.to_modal(
+        jnp.asarray(height * np.exp(-angular_dist2 / np.deg2rad(4.0) ** 2))
+    )
+    orography = equation.orography + bump_modal
+    lnps_adjustment = -(
+        physics_specs.g / (physics_specs.R * ref_temps[-1])
+    ) * grid.to_nodal(bump_modal)
+    state0.log_surface_pressure = grid.to_modal(
+        grid.to_nodal(state0.log_surface_pressure) + lnps_adjustment
+    )
+    return ref_temps, orography, coords, physics_specs, state0
+
+  @staticmethod
+  def _index_roughness(nodal):
+    """RMS second index-difference: grid-scale content of a nodal field."""
+    f = np.asarray(nodal).squeeze()
+    d2_lon = f - 0.5 * (np.roll(f, 1, 0) + np.roll(f, -1, 0))
+    d2_lat = f[:, 1:-1] - 0.5 * (f[:, 2:] + f[:, :-2])
+    return float(np.sqrt(np.mean(d2_lon[:, 1:-1] ** 2 + d2_lat**2)))
+
+  def test_terrain_smoothing_is_noop_over_flat_terrain(self):
+    """With zero orography the smoothed-variable path adds exact zeros."""
+    equation, _, state0 = self._setup(spherical_harmonic.Grid.T21())
+    flat = jnp.zeros_like(equation.orography)
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    finals = {}
+    for smoothed in (False, True):
+      eq = dataclasses.replace(
+          equation, orography=flat, terrain_smoothed_log_sp=smoothed
+      )
+      step = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(eq, dt)
+      )
+      finals[smoothed] = step(state0)
+    jax.tree.map(
+        lambda x, y: np.testing.assert_allclose(x, y, atol=1e-12),
+        finals[True],
+        finals[False],
+    )
+
+  def test_terrain_smoothed_variable_is_smooth(self):
+    """The interpolated variable ψ = ln pₛ + C carries no terrain signal.
+
+    This is the premise of the Ritchie & Tanguay treatment: the static
+    correction cancels the hydrostatically implied, grid-scale-rough
+    mountain part of `ln pₛ` before any interpolation.
+    """
+    ref_temps, orography, coords, physics_specs, state0 = (
+        self._steep_mountain_setup()
+    )
+    grid = coords.horizontal
+    eq = primitive_equations.SemiLagrangianPrimitiveEquations(
+        ref_temps, orography, coords, physics_specs,
+        terrain_smoothed_log_sp=True,
+    )
+    lnps_nodal = grid.to_nodal(state0.log_surface_pressure)
+    psi = lnps_nodal + eq._log_sp_terrain_correction
+    # measured: 4.3e-3 raw vs 1.3e-4 smoothed (33x) for the 4 km mountain.
+    self.assertLess(
+        self._index_roughness(psi),
+        0.1 * self._index_roughness(lnps_nodal),
+    )
+
+  def test_terrain_smoothing_consistency_on_steep_terrain(self):
+    """Smoothed and raw transport agree over a day of steep-terrain steps.
+
+    Both are consistent discretizations of the same equations; at T42 the
+    truncated mountain response dominates and the two solutions must stay
+    close (measured T′ l2 = 3.2e-3 over two days at dt = 60 min).
+    """
+    ref_temps, orography, coords, physics_specs, state0 = (
+        self._steep_mountain_setup()
+    )
+    grid = coords.horizontal
+    dt = self._nondim_minutes(physics_specs, 60)
+    finals = {}
+    for smoothed in (False, True):
+      eq = primitive_equations.SemiLagrangianPrimitiveEquations(
+          ref_temps, orography, coords, physics_specs,
+          departure_iterations=2,
+          terrain_smoothed_log_sp=smoothed,
+      )
+      step = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(eq, dt)
+      )
+      finals[smoothed] = time_integration.repeated(step, 48)(state0)
+    for final in finals.values():
+      self.assertTrue(
+          np.isfinite(grid.to_nodal(final.temperature_variation)).all()
+      )
+    difference = self._l2(
+        grid,
+        finals[True].temperature_variation,
+        finals[False].temperature_variation,
+    )
+    self.assertLess(difference, 2e-2)
+    self.assertGreater(difference, 0.0)  # the flag changes the scheme
 
   def test_time_step_extension(self):
     """SL remains stable at time steps where the Eulerian core blows up."""
