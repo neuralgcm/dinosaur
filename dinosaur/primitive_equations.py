@@ -1765,6 +1765,17 @@ class SemiLagrangianPrimitiveEquations(
       (≥6Δx-retaining) orography filtering it restores the healthy
       306.9 K — orography smoothness matters independently, cf. GEM's
       operational ≥6Δx rule).
+    monotone_dynamics: if True, the dynamical fields (winds as Cartesian
+      components of the relative wind, T′, and `ln pₛ` — the smoothed
+      variable when `terrain_smoothed_log_sp` is on) are also transported
+      with the quasi-monotone limiter, matching IFS operational practice
+      ("all the cubic interpolations, except the vertical interpolations
+      in the thermodynamic and momentum equations, are quasi-monotone").
+      Note our limiter clips the full 3-D interpolant against the
+      bracketing cell in all three dimensions, so for T′ and momentum it
+      is slightly stronger than the IFS horizontal-only prescription.
+      Off by default: it adds diffusion on the dynamics near sharp
+      features.
     departure_iterations: number of fixed-point iterations in the
       departure-point solves (see `semi_lagrangian.departure_points_3d`).
       The default single iteration relies on the warm-started trajectory
@@ -1793,6 +1804,7 @@ class SemiLagrangianPrimitiveEquations(
   vertical_interpolation_order: str = dataclasses.field(
       default='linear', kw_only=True
   )
+  monotone_dynamics: bool = dataclasses.field(default=False, kw_only=True)
 
   def __post_init__(self):
     super().__post_init__()
@@ -1962,8 +1974,9 @@ class SemiLagrangianPrimitiveEquations(
     """Remaps the advected representation of a modal state-like pytree."""
     grid = self.coords.horizontal
     vertical = self.coords.vertical
+    dynamics_limiter = 'quasi_monotone' if self.monotone_dynamics else None
     interpolator = semi_lagrangian.GridInterpolator(
-        grid, self.interpolation_order
+        grid, self.interpolation_order, dynamics_limiter
     )
     u, v = spherical_harmonic.vor_div_to_uv_nodal(
         grid, bracket.vorticity, bracket.divergence, clip=False
@@ -1976,6 +1989,7 @@ class SemiLagrangianPrimitiveEquations(
         interpolator,
         planetary_rotation_rate=self._planetary_rotation_rate,
         vertical_order=self.vertical_interpolation_order,
+        limiter=dynamics_limiter,
     )
     vorticity, divergence = spherical_harmonic.uv_nodal_to_vor_div_modal(
         grid, u, v, clip=False
@@ -3462,6 +3476,7 @@ class SemiLagrangianPrimitiveEquationsHybrid(
   vertical_interpolation_order: str = dataclasses.field(
       default='linear', kw_only=True
   )
+  monotone_dynamics: bool = dataclasses.field(default=False, kw_only=True)
 
   def __post_init__(self):
     super().__post_init__()
@@ -3635,8 +3650,9 @@ class SemiLagrangianPrimitiveEquationsHybrid(
     """Remaps the advected representation of a modal state-like pytree."""
     grid = self.coords.horizontal
     vertical = self._vertical_nodes
+    dynamics_limiter = 'quasi_monotone' if self.monotone_dynamics else None
     interpolator = semi_lagrangian.GridInterpolator(
-        grid, self.interpolation_order
+        grid, self.interpolation_order, dynamics_limiter
     )
     u, v = spherical_harmonic.vor_div_to_uv_nodal(
         grid, bracket.vorticity, bracket.divergence, clip=False
@@ -3649,6 +3665,7 @@ class SemiLagrangianPrimitiveEquationsHybrid(
         interpolator,
         planetary_rotation_rate=self._planetary_rotation_rate,
         vertical_order=self.vertical_interpolation_order,
+        limiter=dynamics_limiter,
     )
     vorticity, divergence = spherical_harmonic.uv_nodal_to_vor_div_modal(
         grid, u, v, clip=False

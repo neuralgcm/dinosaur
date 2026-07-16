@@ -1073,6 +1073,37 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
     d2_lat = f[:, 1:-1] - 0.5 * (f[:, 2:] + f[:, :-2])
     return float(np.sqrt(np.mean(d2_lon[:, 1:-1] ** 2 + d2_lat**2)))
 
+  def test_monotone_dynamics_consistency(self):
+    """Limited and unlimited dynamics agree on the baroclinic wave.
+
+    The quasi-monotone clip on winds, T′ and ln pₛ only engages near
+    sharp features, so at T21 the two configurations must stay close.
+    """
+    equation, _, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True
+    )
+    grid = equation.coords.horizontal
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    finals = {}
+    for monotone in (False, True):
+      eq = dataclasses.replace(equation, monotone_dynamics=monotone)
+      step = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(eq, dt)
+      )
+      finals[monotone] = time_integration.repeated(step, 24)(state0)
+      self.assertTrue(
+          np.isfinite(
+              grid.to_nodal(finals[monotone].temperature_variation)
+          ).all()
+      )
+    difference = self._l2(
+        grid,
+        finals[True].temperature_variation,
+        finals[False].temperature_variation,
+    )
+    self.assertLess(difference, 2e-2)
+    self.assertGreater(difference, 0.0)  # the limiter engages somewhere
+
   def test_cubic_vertical_interpolation_consistency(self):
     """Cubic and linear vertical transport agree on the baroclinic wave.
 

@@ -409,6 +409,59 @@ class InterpolatorTest(parameterized.TestCase):
     self.assertGreaterEqual(np.min(np.asarray(values)), 0.0)
 
 
+class MonotoneWindTransportTest(parameterized.TestCase):
+
+  def _solid_body(self, grid):
+    lon_mesh, sin_lat_mesh = grid.nodal_mesh
+    cos_lat = np.sqrt(1 - sin_lat_mesh**2)
+    u = jnp.asarray(np.broadcast_to(cos_lat, grid.nodal_shape))
+    v = jnp.zeros(grid.nodal_shape)
+    return u, v
+
+  def test_limiter_is_inert_for_smooth_winds(self):
+    """Solid-body winds are within every bracketing cell's range."""
+    grid = spherical_harmonic.Grid.T21()
+    u, v = self._solid_body(grid)
+    departure = semi_lagrangian.horizontal_departure_points(
+        u, v, grid, dt=0.1
+    )
+    interpolator = semi_lagrangian.GridInterpolator(grid, 'cubic')
+    results = {}
+    for limiter in (None, 'quasi_monotone'):
+      results[limiter] = semi_lagrangian.transport_wind_2d(
+          u, v, departure, interpolator, limiter=limiter
+      )
+    for a, b in zip(results[None], results['quasi_monotone']):
+      np.testing.assert_allclose(a, b, atol=1e-6)
+
+  def test_limiter_acts_on_rough_winds(self):
+    """A grid-scale wind field engages the clip (results differ)."""
+    grid = spherical_harmonic.Grid.T21()
+    u_smooth, v_smooth = self._solid_body(grid)
+    rng = np.random.RandomState(0)
+    u = u_smooth + 0.3 * jnp.asarray(
+        rng.standard_normal(grid.nodal_shape)
+    )
+    v = v_smooth + 0.3 * jnp.asarray(
+        rng.standard_normal(grid.nodal_shape)
+    )
+    departure = semi_lagrangian.horizontal_departure_points(
+        u_smooth, v_smooth, grid, dt=0.3
+    )
+    interpolator = semi_lagrangian.GridInterpolator(grid, 'cubic')
+    unlimited = semi_lagrangian.transport_wind_2d(
+        u, v, departure, interpolator, limiter=None
+    )
+    limited = semi_lagrangian.transport_wind_2d(
+        u, v, departure, interpolator, limiter='quasi_monotone'
+    )
+    difference = max(
+        float(np.abs(np.asarray(a) - np.asarray(b)).max())
+        for a, b in zip(unlimited, limited)
+    )
+    self.assertGreater(difference, 1e-4)
+
+
 class ContractStencilTest(parameterized.TestCase):
 
   @parameterized.parameters(dict(n=2), dict(n=3))

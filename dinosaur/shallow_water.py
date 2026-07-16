@@ -266,11 +266,16 @@ class SemiLagrangianShallowWaterEquations(
       `semi_lagrangian.horizontal_departure_points`). The default single
       iteration relies on the steppers' default warm starts; use at least
       2 if those are disabled.
+    monotone_dynamics: if True, the potential and the wind Cartesian
+      components are transported with the quasi-monotone limiter (IFS
+      applies quasi-monotone interpolation to its dynamical variables);
+      off by default, since it adds diffusion near sharp features.
   """
 
   coriolis_mode: str = 'planetary_momentum'
   interpolation_order: str = 'cubic'
   departure_iterations: int = 1
+  monotone_dynamics: bool = False
 
   def __post_init__(self):
     if self.coriolis_mode not in ('planetary_momentum', 'explicit'):
@@ -278,8 +283,9 @@ class SemiLagrangianShallowWaterEquations(
 
   @property
   def _interpolator(self) -> semi_lagrangian.GridInterpolator:
+    limiter = 'quasi_monotone' if self.monotone_dynamics else None
     return semi_lagrangian.GridInterpolator(
-        self.coords.horizontal, self.interpolation_order
+        self.coords.horizontal, self.interpolation_order, limiter
     )
 
   @property
@@ -361,6 +367,7 @@ class SemiLagrangianShallowWaterEquations(
         departure,
         interpolator,
         planetary_rotation_rate=self._planetary_rotation_rate,
+        limiter=interpolator.limiter,
     )
     nodal_potential = grid.to_nodal(bracket.potential)
     transported_potential = semi_lagrangian.transport_scalar_2d(
