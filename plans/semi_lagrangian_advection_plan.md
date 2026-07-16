@@ -1153,8 +1153,14 @@ Issues encountered while implementing this plan, by milestone.
   dynamics — cheap A/B). Medium tier: arrival-only physics-tendency slot
   (Wedi/SLAVEPP: vertical diffusion must not be trapezoided along the
   trajectory), COMAD weights, single-precision dry-mass fixer (IFS needed
-  one at cy47r2 — relevant to float32 climate runs), per-step
-  stencil/weight reuse across advected fields. Also flagged: IFS runs
+  one at cy47r2 — relevant to float32 climate runs). The suggested
+  per-step stencil/weight reuse across advected fields was measured and
+  closed without code: XLA's common-subexpression elimination already
+  deduplicates the stencil arithmetic across per-field interpolation
+  calls — six fields at shared departure points cost 8.05 ms on A100
+  (166 ms CPU) vs 8.12 ms (167 ms) with explicit single-stencil sharing
+  and 19.8 ms (391 ms) if unshared, ratio ~1.0 even with the real
+  mixed-limiter call pattern. Also flagged: IFS runs
   warm+2 departure iterations even after the 48r1 warm start (Diamantakis
   & Magnusson 2016) — consistent with our stress tests; warm+1 stands
   validated at T170/dt=30 only.
@@ -1165,8 +1171,15 @@ Issues encountered while implementing this plan, by milestone.
   against the two bracketing levels only), exposed as
   `vertical_interpolation_order` on both SL equation classes. Exact for
   cubic σ-profiles away from boundaries; equals linear in boundary cells
-  bit-for-bit; default remains 'linear' pending GPU validation (A/B in
-  flight).
+  bit-for-bit. A100 A/B at the ERA5 operating point: behaviorally sound
+  (cloud water still exactly 0.0; T changes rel-l2 6.2e-3 with a 19 K
+  colder global minimum, consistent with removing vertical interpolation
+  diffusion near the tropopause — the sharpening IFS pairs with its SLVF
+  vertical smoother) but +82% step time (32.0 → 58.4 ms: the gathered
+  tensor doubles to 64 points per field). Default stays 'linear'; the
+  quasi-cubic structure (cubic only on the two inner rows, 64 → 32
+  points, §12) is the identified path to cubic vertical at production
+  cost.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
