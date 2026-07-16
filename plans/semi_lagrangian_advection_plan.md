@@ -1256,6 +1256,26 @@ Issues encountered while implementing this plan, by milestone.
   the dynamics near sharp features, and our full-3-D-cell clip is
   slightly stronger than IFS's horizontal-only prescription for T and
   momentum); the measurements make it the indicated notebook setting.
+  Verified against IFS documentation Cy48r1 Part III (read directly):
+  §3.1.1 states the QM rule verbatim ("all the cubic interpolations,
+  except for the vertical interpolations in the thermodynamic and the
+  momentum equations, are quasi-monotone... the interpolated value is
+  compared with the values of the interpolated function at the two
+  closest points used in the interpolation [and] restricted to stay
+  within the interval defined by [them]") — i.e. a per-1-D-stage clip
+  against each stage's two bracketing values inside the cascaded
+  quasi-cubic. Dinosaur's single final-value clip against the
+  bracketing-cell corners carries the same Bermejo–Staniforth
+  no-new-extrema guarantee, engages strictly less often per
+  interpolation, and additionally bounds the vertical for all limited
+  fields. The same chapter confirms two more of this branch's choices as
+  IFS operational practice: §3.1.6(b) is exactly the smoothed-terrain
+  `ln pₛ` variable adopted here (their `l* = −Φₛ/(R_dry T̄)`, with the
+  compensating term "computed in an Eulerian manner", motivated by
+  Rivest et al. 1994 resonance and Ritchie & Tanguay 1996), and
+  §3.1.6(c) extends the same idea to temperature (advecting `T − T_b`
+  with a hydrostatically implied terrain-locked `T_b`) — a natural
+  future extension noted in the smoothed-variable discussion.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 

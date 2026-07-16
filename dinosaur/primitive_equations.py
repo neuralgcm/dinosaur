@@ -1768,14 +1768,19 @@ class SemiLagrangianPrimitiveEquations(
     monotone_dynamics: if True, the dynamical fields (winds as Cartesian
       components of the relative wind, T′, and `ln pₛ` — the smoothed
       variable when `terrain_smoothed_log_sp` is on) are also transported
-      with the quasi-monotone limiter, matching IFS operational practice
-      ("all the cubic interpolations, except the vertical interpolations
-      in the thermodynamic and momentum equations, are quasi-monotone").
-      Note our limiter clips the full 3-D interpolant against the
-      bracketing cell in all three dimensions, so for T′ and momentum it
-      is slightly stronger than the IFS horizontal-only prescription.
-      Off by default: it adds diffusion on the dynamics near sharp
-      features.
+      with the quasi-monotone limiter, matching IFS operational practice:
+      "all the cubic interpolations, except for the vertical
+      interpolations in the thermodynamic and the momentum equations, are
+      quasi-monotone" (IFS documentation Cy48r1, Part III §3.1.1). The
+      variants differ in mechanism but not guarantee: the IFS clips each
+      1-D cubic stage of its cascaded interpolation against that stage's
+      two bracketing values (exempting the vertical stage for T and
+      momentum), while ours clips the final 3-D interpolant once against
+      the 2✕2✕2 bracketing-cell corners — the same Bermejo & Staniforth
+      no-new-extrema bound, engaging strictly less often per
+      interpolation but also bounding the vertical for all limited
+      fields. Off by default: it adds diffusion on the dynamics near
+      sharp features.
     departure_iterations: number of fixed-point iterations in the
       departure-point solves (see `semi_lagrangian.departure_points_3d`).
       The default single iteration relies on the warm-started trajectory
