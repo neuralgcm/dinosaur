@@ -225,8 +225,11 @@ def _contract_stencil(values: Array, *weights: Array) -> jnp.ndarray:
   materialized — the gathered stencil tensor is written to memory — which
   is the fastest form on CPU (0.55✕ the fused form) but measurably slower
   on GPU, where a broadcast-multiply + reduce fuses with the producing
-  gather and skips the materialization (1.15–1.20✕ on A100 at T170/L32).
-  The backend is known at trace time, so pick per platform.
+  gather and skips the materialization (1.15–1.20✕ isolated on A100 at
+  T170/L32, and considerably more in a full model step, where the skipped
+  materializations compound: 32.0 → 26.3 ms/step with linear vertical and
+  58.4 → 33.3 ms/step with cubic on the 2-day ERA5 benchmark). The
+  backend is known at trace time, so pick per platform.
   """
   if jax.default_backend() == 'cpu':
     n = len(weights)

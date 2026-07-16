@@ -1160,7 +1160,19 @@ Issues encountered while implementing this plan, by milestone.
   calls — six fields at shared departure points cost 8.05 ms on A100
   (166 ms CPU) vs 8.12 ms (167 ms) with explicit single-stencil sharing
   and 19.8 ms (391 ms) if unshared, ratio ~1.0 even with the real
-  mixed-limiter call pattern. Also flagged: IFS runs
+  mixed-limiter call pattern. The *contraction form*, however, was worth
+  changing: production codes evaluate the tensor-product interpolation as
+  a cascade of 1-D interpolations so the gathered stencil tensor never
+  exists in memory, and the XLA analogue is gather→multiply→reduce
+  fusion, which the einsum contraction forecloses by lowering to
+  dot_general (materialized operands). `_contract_stencil` now picks per
+  backend (einsum on CPU, where it is 1.8✕ faster; the fused form on
+  accelerators): 26.3 vs 32.0 ms/step with linear vertical and 33.3 vs
+  58.4 ms/step with cubic on the ERA5 benchmark — the in-context
+  materialization penalty far exceeds the isolated-call 1.15–1.20✕.
+  Cumulative software gains at the ERA5 operating point: 39.5 (original)
+  → 32.9 (warm-started single iteration) → 26.3 ms/step (fused
+  contraction), 1.5✕ total. Also flagged: IFS runs
   warm+2 departure iterations even after the 48r1 warm start (Diamantakis
   & Magnusson 2016) — consistent with our stress tests; warm+1 stands
   validated at T170/dt=30 only.
@@ -1175,11 +1187,14 @@ Issues encountered while implementing this plan, by milestone.
   (cloud water still exactly 0.0; T changes rel-l2 6.2e-3 with a 19 K
   colder global minimum, consistent with removing vertical interpolation
   diffusion near the tropopause — the sharpening IFS pairs with its SLVF
-  vertical smoother) but +82% step time (32.0 → 58.4 ms: the gathered
-  tensor doubles to 64 points per field). Default stays 'linear'; the
-  quasi-cubic structure (cubic only on the two inner rows, 64 → 32
-  points, §12) is the identified path to cubic vertical at production
-  cost.
+  vertical smoother) but initially +82% step time (32.0 → 58.4 ms: the
+  gathered tensor doubles to 64 points per field). The fused stencil
+  contraction (below) collapses that penalty: 33.3 vs 26.3 ms/step, +27%
+  — cubic vertical now costs about what linear did before the fusion
+  change. Default stays 'linear' on behavioral grounds (the sharper
+  vertical structure deserves validation, and IFS pairs high-order
+  vertical with its SLVF smoother); quasi-cubic (§12) remains the further
+  cost reduction if wanted.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
