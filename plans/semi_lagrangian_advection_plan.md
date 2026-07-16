@@ -1195,6 +1195,28 @@ Issues encountered while implementing this plan, by milestone.
   vertical structure deserves validation, and IFS pairs high-order
   vertical with its SLVF smoother); quasi-cubic (§12) remains the further
   cost reduction if wanted.
+- **Moist wave trains: mechanism confirmed as gravity waves; off-centering
+  is the effective knob.** Closing the diagnosis chain: the dt = 30 min
+  humidity wave trains survive the smoothed-terrain transport (R–T A/B)
+  *and* GEM-style ≥6Δx orography filtering unchanged — eliminating the
+  remaining terrain hypotheses — and they sit over the Bay of Bengal and
+  equatorial ocean, not over mountains. The surviving explanation, now
+  tested: gravity waves radiated by geostrophic adjustment of ERA5's
+  convectively driven divergence (which the dry core cannot sustain),
+  neutrally propagated by the centered semi-implicit trapezoid; the
+  undiffused nodal tracer records them faithfully while the Eulerian
+  notebook's spectrally truncated + hyperdiffused humidity hides the same
+  dynamics. Off-centering — whose operational purpose is exactly
+  first-order selective damping of these fast modes — shows the predicted
+  dose response on the executed notebooks: ε = 0.05 (the UM operational
+  value) substantially fades the wave trains, ε = 0.1 essentially
+  eliminates them, with resolved filaments and plumes visually intact,
+  cloud liquid water still exactly 0.0, and humidity extrema unchanged at
+  the 1e-8 level. The notebooks remain centered (ε = 0) by default —
+  formal second order is the better demo default, the waves are cosmetic
+  in a physics-free configuration, and any full model's moist physics
+  provides the missing humidity-variance sink — with ε documented as the
+  remedy when a clean tracer field matters.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
