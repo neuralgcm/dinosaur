@@ -22,6 +22,7 @@ from dinosaur import hybrid_coordinates
 from dinosaur import primitive_equations
 from dinosaur import primitive_equations_states
 from dinosaur import scales
+from dinosaur import semi_lagrangian
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
@@ -1073,6 +1074,42 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
     d2_lat = f[:, 1:-1] - 0.5 * (f[:, 2:] + f[:, :-2])
     return float(np.sqrt(np.mean(d2_lon[:, 1:-1] ** 2 + d2_lat**2)))
 
+  def test_limiter_bound_reference_constant_is_noop(self):
+    """A constant reference shifts both clip sides equally: exact no-op."""
+    grid = spherical_harmonic.Grid.T21()
+    vertical = sigma_coordinates.SigmaCoordinates.equidistant(8)
+    coords = coordinate_systems.CoordinateSystem(grid, vertical)
+    rng = np.random.RandomState(0)
+    field = jnp.asarray(rng.standard_normal((8,) + grid.nodal_shape))
+    u = jnp.asarray(0.3 * rng.standard_normal((8,) + grid.nodal_shape))
+    v = jnp.asarray(0.3 * rng.standard_normal((8,) + grid.nodal_shape))
+    sigma_dot = jnp.asarray(
+        0.2 * rng.standard_normal((9,) + grid.nodal_shape)
+    )
+    departure = semi_lagrangian.departure_points_3d(
+        u, v, sigma_dot, coords, dt=0.3
+    )
+    interpolator = semi_lagrangian.GridInterpolator(
+        grid, 'cubic', 'quasi_monotone'
+    )
+    base = semi_lagrangian.transport_scalar(
+        field, departure, vertical, interpolator
+    )
+    constant = semi_lagrangian.transport_scalar(
+        field, departure, vertical, interpolator,
+        limiter_bound_reference=jnp.full((8,), 7.5),
+    )
+    np.testing.assert_allclose(constant, base, atol=1e-5)
+    varying = semi_lagrangian.transport_scalar(
+        field, departure, vertical, interpolator,
+        limiter_bound_reference=jnp.linspace(0.0, 5.0, 8),
+    )
+    # a strongly varying profile moves the clip where vertical bracketing
+    # spans levels: results must differ somewhere.
+    self.assertGreater(
+        float(np.abs(np.asarray(varying) - np.asarray(base)).max()), 1e-6
+    )
+
   def test_monotone_dynamics_consistency(self):
     """Limited and unlimited dynamics agree on the baroclinic wave.
 
@@ -1611,7 +1648,7 @@ class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
     results = {}
     for limited in [False, True]:
       equation, state0, _, _ = self._setup(
-          monotone_tracers=('tracer',) if limited else ()
+          monotone_tracers=limited
       )
       physics_specs = equation.physics_specs
       state0.tracers = {
@@ -1654,7 +1691,7 @@ class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
     entirely, so the quasi-monotone limiter's bounds hold exactly.
     """
     equation, state0, _, _ = self._setup(
-        monotone_tracers=('tracer',), nodal_tracers=('tracer',)
+        monotone_tracers=True, nodal_tracers=('tracer',)
     )
     grid = equation.coords.horizontal
     physics_specs = equation.physics_specs

@@ -1736,9 +1736,9 @@ class SemiLagrangianPrimitiveEquations(
       standard operational rule — production SL models interpolate at
       least cubically in the vertical, and linear vertical is the main
       source of extra vertical diffusion at long steps).
-    monotone_tracers: names of tracers transported with the quasi-monotone
-      limiter, which prevents new extrema (and preserves positivity) at the
-      cost of formal accuracy at extrema. Dynamical fields are never limited.
+    monotone_tracers: if True, all tracers are transported with the
+      quasi-monotone limiter, which prevents new extrema (and preserves
+      positivity) at the cost of formal accuracy at extrema.
     nodal_tracers: names of tracers carried in `State.tracers` as *nodal*
       arrays instead of modal coefficients. They skip all spectral
       transforms, so sharp fields (aerosols, chemistry) avoid the per-step
@@ -1779,8 +1779,12 @@ class SemiLagrangianPrimitiveEquations(
       the 2✕2✕2 bracketing-cell corners — the same Bermejo & Staniforth
       no-new-extrema bound, engaging strictly less often per
       interpolation but also bounding the vertical for all limited
-      fields. Off by default: it adds diffusion on the dynamics near
-      sharp features.
+      fields. The temperature bound is expressed in full temperature
+      (`T′ + T_ref(σ)`, via a per-level shift of the clip interval): a
+      bound on T′ across levels with different `T_ref` would be
+      gauge-dependent, and for a constant reference profile the two are
+      provably identical. Off by default: it adds diffusion on the
+      dynamics near sharp features.
     departure_iterations: number of fixed-point iterations in the
       departure-point solves (see `semi_lagrangian.departure_points_3d`).
       The default single iteration relies on the warm-started trajectory
@@ -1798,9 +1802,7 @@ class SemiLagrangianPrimitiveEquations(
       default='planetary_momentum', kw_only=True
   )
   interpolation_order: str = dataclasses.field(default='cubic', kw_only=True)
-  monotone_tracers: tuple[str, ...] = dataclasses.field(
-      default=(), kw_only=True
-  )
+  monotone_tracers: bool = dataclasses.field(default=False, kw_only=True)
   nodal_tracers: tuple[str, ...] = dataclasses.field(default=(), kw_only=True)
   departure_iterations: int = dataclasses.field(default=1, kw_only=True)
   terrain_smoothed_log_sp: bool = dataclasses.field(
@@ -1817,6 +1819,13 @@ class SemiLagrangianPrimitiveEquations(
       raise ValueError(f'unknown {self.coriolis_mode=}')
     if self.vertical_interpolation_order not in ('linear', 'cubic'):
       raise ValueError(f'unknown {self.vertical_interpolation_order=}')
+    if not isinstance(self.monotone_tracers, bool):
+      # a nonempty tuple (the former per-name API) would silently behave as
+      # True-for-all; reject it loudly instead.
+      raise TypeError(
+          'monotone_tracers is a bool applying to all tracers; got '
+          f'{self.monotone_tracers!r}'
+      )
     dynamics_keys = {self.humidity_key, *(self.cloud_keys or ())}
     if set(self.nodal_tracers) & dynamics_keys:
       raise ValueError(
@@ -2005,6 +2014,13 @@ class SemiLagrangianPrimitiveEquations(
         vertical,
         interpolator,
         vertical_order=self.vertical_interpolation_order,
+        # with monotone dynamics, express the bound in full temperature:
+        # a T′ bound across levels with different T_ref is gauge-dependent.
+        limiter_bound_reference=(
+            jnp.asarray(self.reference_temperature)
+            if dynamics_limiter
+            else None
+        ),
     )
     log_sp_nodal = grid.to_nodal(bracket.log_surface_pressure)
     if self.terrain_smoothed_log_sp:
@@ -2023,12 +2039,12 @@ class SemiLagrangianPrimitiveEquations(
       )
     modal_tracers = {}
     nodal_tracers = {}
+    tracer_interpolator = semi_lagrangian.GridInterpolator(
+        grid,
+        self.interpolation_order,
+        limiter='quasi_monotone' if self.monotone_tracers else None,
+    )
     for name, value in bracket.tracers.items():
-      tracer_interpolator = semi_lagrangian.GridInterpolator(
-          grid,
-          self.interpolation_order,
-          limiter='quasi_monotone' if name in self.monotone_tracers else None,
-      )
       if name in self.nodal_tracers:
         # nodal tracers never touch the spectral basis: transport their grid
         # values directly (no modal round trip, no wavenumber clipping).
@@ -3470,9 +3486,7 @@ class SemiLagrangianPrimitiveEquationsHybrid(
       default='planetary_momentum', kw_only=True
   )
   interpolation_order: str = dataclasses.field(default='cubic', kw_only=True)
-  monotone_tracers: tuple[str, ...] = dataclasses.field(
-      default=(), kw_only=True
-  )
+  monotone_tracers: bool = dataclasses.field(default=False, kw_only=True)
   nodal_tracers: tuple[str, ...] = dataclasses.field(default=(), kw_only=True)
   departure_iterations: int = dataclasses.field(default=1, kw_only=True)
   terrain_smoothed_log_sp: bool = dataclasses.field(
@@ -3489,6 +3503,13 @@ class SemiLagrangianPrimitiveEquationsHybrid(
       raise ValueError(f'unknown {self.coriolis_mode=}')
     if self.vertical_interpolation_order not in ('linear', 'cubic'):
       raise ValueError(f'unknown {self.vertical_interpolation_order=}')
+    if not isinstance(self.monotone_tracers, bool):
+      # a nonempty tuple (the former per-name API) would silently behave as
+      # True-for-all; reject it loudly instead.
+      raise TypeError(
+          'monotone_tracers is a bool applying to all tracers; got '
+          f'{self.monotone_tracers!r}'
+      )
     dynamics_keys = {self.humidity_key, *(self.cloud_keys or ())}
     if set(self.nodal_tracers) & dynamics_keys:
       raise ValueError(
@@ -3681,6 +3702,13 @@ class SemiLagrangianPrimitiveEquationsHybrid(
         vertical,
         interpolator,
         vertical_order=self.vertical_interpolation_order,
+        # with monotone dynamics, express the bound in full temperature:
+        # a T′ bound across levels with different T_ref is gauge-dependent.
+        limiter_bound_reference=(
+            jnp.asarray(self.reference_temperature)
+            if dynamics_limiter
+            else None
+        ),
     )
     log_sp_nodal = grid.to_nodal(bracket.log_surface_pressure)
     if self.terrain_smoothed_log_sp:
@@ -3699,12 +3727,12 @@ class SemiLagrangianPrimitiveEquationsHybrid(
       )
     modal_tracers = {}
     nodal_tracers = {}
+    tracer_interpolator = semi_lagrangian.GridInterpolator(
+        grid,
+        self.interpolation_order,
+        limiter='quasi_monotone' if self.monotone_tracers else None,
+    )
     for name, value in bracket.tracers.items():
-      tracer_interpolator = semi_lagrangian.GridInterpolator(
-          grid,
-          self.interpolation_order,
-          limiter='quasi_monotone' if name in self.monotone_tracers else None,
-      )
       if name in self.nodal_tracers:
         # nodal tracers never touch the spectral basis: transport their grid
         # values directly (no modal round trip, no wavenumber clipping).

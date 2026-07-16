@@ -596,6 +596,7 @@ def interpolate_3d(
     order: str = 'cubic',
     limiter: str | None = None,
     vertical_order: str = 'linear',
+    limiter_bound_reference: Array | None = None,
 ) -> jnp.ndarray:
   """Interpolates a 3-D field at points (lon, sin_lat, sigma).
 
@@ -625,6 +626,15 @@ def interpolate_3d(
       bracketing cell is always the two nodes around the departure σ,
       regardless of `vertical_order`.
     vertical_order: vertical interpolation order, 'linear' or 'cubic'.
+    limiter_bound_reference: optional per-level values of shape
+      [len(sigma_nodes)] expressing the limiter's bound in a shifted
+      variable: corners are shifted by the reference at their levels and
+      the interpolated value by the reference interpolated at the
+      departure σ before clipping (and unshifted after). Interpolation
+      itself is unchanged, and a constant reference is exactly a no-op;
+      used to bound `T′ = T − T_ref(σ)` transport in full temperature,
+      where a bound on T′ across levels with different `T_ref` would be
+      gauge-dependent. Ignored without a limiter.
 
   Returns:
     Interpolated values of shape `lon.shape`.
@@ -670,6 +680,12 @@ def interpolate_3d(
   if limiter == 'quasi_monotone':
     cell = _linear_cell_slice(order)
     corners = values[..., :, cell, cell]
+    reference_at_departure = 0.0
+    if limiter_bound_reference is not None:
+      reference = jnp.asarray(limiter_bound_reference)[level_index]
+      reference_at_departure = (level_weights * reference).sum(-1)
+      corners = corners + reference[..., :, jnp.newaxis, jnp.newaxis]
+      result = result + reference_at_departure
     if vertical_order == 'cubic':
       # restrict the vertical extent to the two bracketing nodes: clipping
       # against outer stencil levels would admit values the departure point
@@ -684,6 +700,7 @@ def interpolate_3d(
         corners.min(axis=(-3, -2, -1)),
         corners.max(axis=(-3, -2, -1)),
     )
+    result = result - reference_at_departure
   return result
 
 
@@ -927,6 +944,7 @@ def transport_scalar(
     interpolator: GridInterpolator,
     *,
     vertical_order: str = 'linear',
+    limiter_bound_reference: Array | None = None,
 ) -> jnp.ndarray:
   """Remaps a scalar field to arrival points along 3-D trajectories.
 
@@ -940,6 +958,8 @@ def transport_scalar(
     interpolator: interpolation rule (its grid, order and limiter settings
       are used).
     vertical_order: vertical interpolation order (see `interpolate_3d`).
+    limiter_bound_reference: optional per-level bound shift for the
+      limiter (see `interpolate_3d`).
 
   Returns:
     The transported field at arrival points, shaped like `departure.lon`.
@@ -956,6 +976,7 @@ def transport_scalar(
       order=interpolator.order,
       limiter=interpolator.limiter,
       vertical_order=vertical_order,
+      limiter_bound_reference=limiter_bound_reference,
   )
 
 
