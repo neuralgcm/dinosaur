@@ -1114,6 +1114,59 @@ Issues encountered while implementing this plan, by milestone.
   for the wave trains are dynamics-side — stronger or steeper tail
   hyperdiffusion, smoother orography, or the Ritchie–Tanguay
   smoothed-terrain variable already flagged by the large-Δt study.
+- **Ritchie & Tanguay smoothed-terrain transport, adopted as default.**
+  `terrain_smoothed_log_sp` on both SL primitive-equation classes
+  transports `ψ = ln pₛ + Φₛ/(R·T̄)` (terrain-locked parts cancel before
+  interpolation; the static correction is removed exactly at arrival
+  nodes) and adds the compensating `v̄·∇C` to the explicit forcing,
+  evaluated spectrally with the trajectory wind's vertical weights (Δσ or
+  ΔB — the continuity exactness identity survives). Premise measured
+  sharply (a 4 km mountain rough at T42 truncation makes `ln pₛ` 33✕
+  rougher than ψ), exact no-op over flat terrain, consistent on steep
+  terrain (T′ l2 3.2e-3 over 2 days at dt = 60 min). ERA5 T170/L32 A100
+  probes: exactly neutral at dt = 30 min (rel-l2 7e-4, identical extremes,
+  unmeasurable cost) and part of the large-Δt terrain fix — at dt = 60 min
+  with converged trajectories the hot anomaly goes 327.2 K (raw) → 322.4 K
+  (smoothed) → 318.1 K (GEM-style ≥6Δx orography filtering alone) →
+  **306.9 K, the healthy value, with both** — i.e. the smoothed variable
+  and orography smoothness are complementary halves, matching GEM's
+  operational ≥6Δx orography rule (Husain et al. 2020). Two more probe
+  findings: the catastrophic cold extremes previously seen at dt = 60 min
+  were the single-warm-iteration default (gone at
+  `departure_iterations=2`, per the documented convergence-margin caveat),
+  and the earlier probe run that conflated the two effects is superseded.
+- **Production-model details audit (agent survey, 2026-07-15).** dinosaur's
+  SL core was audited against IFS Cy48r1 Part III (read in full), ARPEGE/
+  ALADIN, GEM, UM/ENDGame, JMA GSM, CAM SLD and the SL-era GFS. Coverage
+  verdict: the departure solve, warm starts, LADVF Coriolis,
+  parallel-transport wind rotation, SETTLS bracket, ln pₛ continuity,
+  limiter variant and nodal tracer storage match or supersede operational
+  practice. High-priority genuinely-new items, in order: (1) cubic/quintic
+  *vertical* interpolation (every production model is ≥cubic vertically;
+  IFS quintic+WENO for T, q since cy47r1) — the cubic option is now
+  implemented, see below; (2) IFS SETTLS vertical-extrapolation
+  safeguards (first-order limiter on the η̇ extrapolation with a
+  documented smooth tanh differentiable variant, and the cy48r1
+  warm-start sign-change fallback); (3) GEM-style ≥6Δx orography
+  filtering (validated by the probe above); (4) quasi-monotone
+  interpolation on dynamical variables (IFS default, we never limit
+  dynamics — cheap A/B). Medium tier: arrival-only physics-tendency slot
+  (Wedi/SLAVEPP: vertical diffusion must not be trapezoided along the
+  trajectory), COMAD weights, single-precision dry-mass fixer (IFS needed
+  one at cy47r2 — relevant to float32 climate runs), per-step
+  stencil/weight reuse across advected fields. Also flagged: IFS runs
+  warm+2 departure iterations even after the 48r1 warm start (Diamantakis
+  & Magnusson 2016) — consistent with our stress tests; warm+1 stands
+  validated at T170/dt=30 only.
+- **Cubic vertical interpolation option.** `vertical_order='cubic'` in
+  `interpolate_3d` (4-point Lagrange on the non-uniform nodes, degraded
+  to linear in the first and last cells per operational practice, exact
+  no-extrapolation preserved, quasi-monotone limiter still clipping
+  against the two bracketing levels only), exposed as
+  `vertical_interpolation_order` on both SL equation classes. Exact for
+  cubic σ-profiles away from boundaries; equals linear in boundary cells
+  bit-for-bit; default remains 'linear' pending GPU validation (A/B in
+  flight).
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
