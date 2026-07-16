@@ -732,7 +732,16 @@ Eulerian path.
 ## 12. Deferred efficiency roadmap (context from issue #55)
 
 For completeness, the follow-on path once this version is correct: quasi-cubic
-(32-point) interpolation; static-stencil gathers expressed as banded matmuls
+(32-point) interpolation — **measured and deprioritized for GPU** (an A100
+microbenchmark at T170/L32 transport scale shows the 24-point
+quasi-cubic-horizontal gather+sum running 1.6✕ *slower* than the aligned
+32-point cubic stencil, despite 25% less volume: 24✕4 B = 96 B rows
+straddle 128 B cache sectors while 32✕4 B and 8✕4 B rows align, and the
+8-point linear case at 0.45✕ confirms volume scaling otherwise exists;
+the point-count saving is a CPU economy that inverts on accelerators, so
+quasi-cubic belongs with the TPU banded-matmul work where stage-wise
+evaluation pays, not with the GPU gather formulation);
+static-stencil gathers expressed as banded matmuls
 (TPU-friendly, per the einsum formulation sketched in issue #55); reduced
 Gaussian / octahedral / HEALPix-like grids so polar stencils become static;
 TL-truncation grids; conservative/monotone upgrades (SLICE-3D, CSLAM);
