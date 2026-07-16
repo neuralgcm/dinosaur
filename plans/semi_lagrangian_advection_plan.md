@@ -740,7 +740,18 @@ straddle 128 B cache sectors while 32✕4 B and 8✕4 B rows align, and the
 8-point linear case at 0.45✕ confirms volume scaling otherwise exists;
 the point-count saving is a CPU economy that inverts on accelerators, so
 quasi-cubic belongs with the TPU banded-matmul work where stage-wise
-evaluation pays, not with the GPU gather formulation);
+evaluation pays, not with the GPU gather formulation. A follow-up A100
+battery measured the remaining single-GPU gather ideas: field-major
+stacking of 6 fields through one gather is 1.8✕ *slower* than the
+current per-field kernels, interleaved/array-of-structs stacking is
+2.4✕ slower (per-field SoA gathers warp-coalesce because adjacent
+targets read adjacent addresses; interleaving converts that to stride-6
+access), and a level-fastest layout is 1.5✕ slower than the current
+level-slowest order for the same coalescing reason — i.e. the existing
+formulation is measured at the XLA-attainable optimum in every probed
+direction. The one genuine remaining lever is bf16 gather payloads with
+f32 accumulation: −19% of raw gather cost, ≈ −1 ms (~4%) at the step
+level, available as an opt-in tracer-precision policy if ever wanted);
 static-stencil gathers expressed as banded matmuls
 (TPU-friendly, per the einsum formulation sketched in issue #55); reduced
 Gaussian / octahedral / HEALPix-like grids so polar stencils become static;
