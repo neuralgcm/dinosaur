@@ -305,7 +305,86 @@ class InterpolatorTest(parameterized.TestCase):
     # exact in phi, so allow a modest tolerance.
     np.testing.assert_allclose(values, expected, rtol=1e-3)
 
-  def test_interpolate_3d_monotone(self):
+  def test_interpolate_3d_cubic_in_sigma(self):
+    """Cubic vertical interpolation is exact for cubics away from boundaries.
+
+    The horizontal profile is constant so all error is vertical; sigma
+    points are restricted to interior cells (the first and last cells
+    degrade to linear by design, tested separately).
+    """
+    grid = spherical_harmonic.Grid.T21()
+    centers = sigma_coordinates.SigmaCoordinates.equidistant(10).centers
+
+    def profile(sigma):
+      return 1.0 + sigma - 2.0 * sigma**2 + 3.0 * sigma**3
+
+    field = jnp.asarray(
+        np.broadcast_to(
+            profile(centers)[:, np.newaxis, np.newaxis],
+            (10,) + grid.nodal_shape,
+        )
+    )
+    rng = np.random.RandomState(8)
+    shape = (6, 20)
+    lon = jnp.asarray(rng.uniform(0, 2 * np.pi, size=shape))
+    sin_lat = jnp.asarray(np.sin(rng.uniform(-1.4, 1.4, size=shape)))
+    # interior cells only: [centers[1], centers[-2]]
+    sigma = jnp.asarray(rng.uniform(centers[1], centers[-2], size=shape))
+    kwargs = dict(sigma_nodes=centers, order='cubic')
+    cubic = semi_lagrangian.interpolate_3d(
+        field, grid, lon, sin_lat, sigma, vertical_order='cubic', **kwargs
+    )
+    np.testing.assert_allclose(cubic, profile(np.asarray(sigma)), rtol=1e-5)
+    linear = semi_lagrangian.interpolate_3d(
+        field, grid, lon, sin_lat, sigma, vertical_order='linear', **kwargs
+    )
+    linear_error = np.abs(np.asarray(linear) - profile(np.asarray(sigma)))
+    cubic_error = np.abs(np.asarray(cubic) - profile(np.asarray(sigma)))
+    self.assertLess(cubic_error.max(), 0.05 * linear_error.max())
+
+  def test_interpolate_3d_cubic_degrades_to_linear_at_boundaries(self):
+    """Within the first and last cells, cubic vertical equals linear."""
+    grid = spherical_harmonic.Grid.T21()
+    centers = sigma_coordinates.SigmaCoordinates.equidistant(6).centers
+    rng = np.random.RandomState(9)
+    field = jnp.asarray(rng.normal(size=(6,) + grid.nodal_shape))
+    shape = (40,)
+    lon = jnp.asarray(rng.uniform(0, 2 * np.pi, size=shape))
+    sin_lat = jnp.asarray(np.sin(rng.uniform(-1.4, 1.4, size=shape)))
+    # points in the first and last cells, plus out-of-range extrapolation.
+    sigma = jnp.asarray(
+        np.concatenate([
+            rng.uniform(-0.1, centers[1], size=20),
+            rng.uniform(centers[-2], 1.1, size=20),
+        ])
+    )
+    results = {}
+    for vertical_order in ('linear', 'cubic'):
+      results[vertical_order] = semi_lagrangian.interpolate_3d(
+          field, grid, lon, sin_lat, sigma,
+          sigma_nodes=centers, order='cubic', vertical_order=vertical_order,
+      )
+    np.testing.assert_allclose(
+        results['cubic'], results['linear'], rtol=1e-6, atol=1e-6
+    )
+
+  def test_interpolate_3d_cubic_requires_four_levels(self):
+    grid = spherical_harmonic.Grid.T21()
+    with self.assertRaisesRegex(ValueError, 'at least 4 levels'):
+      semi_lagrangian.interpolate_3d(
+          jnp.zeros((3,) + grid.nodal_shape),
+          grid,
+          jnp.zeros(()),
+          jnp.zeros(()),
+          jnp.zeros(()),
+          sigma_nodes=np.array([0.2, 0.5, 0.8]),
+          vertical_order='cubic',
+      )
+
+  @parameterized.parameters(
+      dict(vertical_order='linear'), dict(vertical_order='cubic')
+  )
+  def test_interpolate_3d_monotone(self, vertical_order):
     grid = spherical_harmonic.Grid.T21()
     vertical = sigma_coordinates.SigmaCoordinates.equidistant(6)
     rng = np.random.RandomState(7)
@@ -325,6 +404,7 @@ class InterpolatorTest(parameterized.TestCase):
         sigma_nodes=vertical.centers,
         order='cubic',
         limiter='quasi_monotone',
+        vertical_order=vertical_order,
     )
     self.assertGreaterEqual(np.min(np.asarray(values)), 0.0)
 

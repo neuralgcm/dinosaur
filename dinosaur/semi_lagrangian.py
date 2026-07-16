@@ -498,7 +498,56 @@ def _interpolate_horizontal_single(
   return _interpolate_horizontal(field, grid, stencil, order, limiter)
 
 
-@functools.partial(jax.jit, static_argnames=('grid', 'order', 'limiter'))
+def _vertical_stencil(
+    sigma: Array,
+    sigma_nodes: Array,
+    vertical_order: str,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+  """Returns (level_index, level_weights, bracket_offset) for the vertical.
+
+  σ is clipped to the node range first, so boundary weights saturate and
+  interpolation never extrapolates (constant extrapolation beyond the first
+  and last nodes). 'linear' uses the two bracketing nodes. 'cubic' uses a
+  4-point Lagrange stencil on the (possibly non-uniform) nodes, degraded to
+  linear within the first and last cells — the standard operational rule
+  (e.g. IFS), which also keeps the no-extrapolation property exact.
+  `bracket_offset` is the position of the lower bracketing node within the
+  stencil (needed by the quasi-monotone limiter, which clips against the
+  bracketing cell only).
+  """
+  num_levels = sigma_nodes.shape[0]
+  sigma = jnp.clip(jnp.asarray(sigma), sigma_nodes[0], sigma_nodes[-1])
+  level_cell = (
+      jnp.searchsorted(sigma_nodes, sigma, side='right') - 1
+  ).astype(jnp.int32)
+  level_cell = jnp.clip(level_cell, 0, num_levels - 2)
+  below = sigma_nodes[level_cell]
+  above = sigma_nodes[level_cell + 1]
+  fraction = (sigma - below) / (above - below)
+  if vertical_order == 'linear':
+    level_weights = jnp.stack([1 - fraction, fraction], axis=-1)
+    level_index = level_cell[..., jnp.newaxis] + np.arange(2)
+    bracket_offset = jnp.zeros_like(level_cell)
+    return level_index, level_weights, bracket_offset
+  start = jnp.clip(level_cell - 1, 0, num_levels - 4)
+  level_index = start[..., jnp.newaxis] + np.arange(4)
+  cubic_weights = _lagrange_weights(sigma, sigma_nodes[level_index])
+  bracket_offset = level_cell - start
+  linear_weights = (1 - fraction)[..., jnp.newaxis] * jax.nn.one_hot(
+      bracket_offset, 4, dtype=cubic_weights.dtype
+  ) + fraction[..., jnp.newaxis] * jax.nn.one_hot(
+      bracket_offset + 1, 4, dtype=cubic_weights.dtype
+  )
+  boundary_cell = (level_cell == 0) | (level_cell == num_levels - 2)
+  level_weights = jnp.where(
+      boundary_cell[..., jnp.newaxis], linear_weights, cubic_weights
+  )
+  return level_index, level_weights, bracket_offset
+
+
+@functools.partial(
+    jax.jit, static_argnames=('grid', 'order', 'limiter', 'vertical_order')
+)
 def interpolate_3d(
     field: Array,
     grid: spherical_harmonic.Grid,
@@ -509,13 +558,17 @@ def interpolate_3d(
     *,
     order: str = 'cubic',
     limiter: str | None = None,
+    vertical_order: str = 'linear',
 ) -> jnp.ndarray:
   """Interpolates a 3-D field at points (lon, sin_lat, sigma).
 
   Horizontal interpolation follows `GridInterpolator` (tensor-product
-  Lagrange of the given order); vertical interpolation is linear in σ between
-  `sigma_nodes` with constant extrapolation beyond the first and last nodes
-  (matching `vertical_interpolation.interp` and the zero-gradient boundary
+  Lagrange of the given order); vertical interpolation is Lagrange in σ
+  between `sigma_nodes` — linear by default, or 4-point cubic with
+  `vertical_order='cubic'`, degraded to linear within the first and last
+  cells (the standard operational rule, e.g. in the IFS). Both use constant
+  extrapolation beyond the first and last nodes (matching
+  `vertical_interpolation.interp` and the zero-gradient boundary
   conditions of `sigma_coordinates.centered_vertical_advection`).
 
   Args:
@@ -531,35 +584,33 @@ def interpolate_3d(
     order: horizontal interpolation order, 'linear' or 'cubic'.
     limiter: None for unlimited interpolation, or 'quasi_monotone' to clip
       interpolated values to the range of the 2✕2✕2 bracketing cell corners
-      (the Bermejo & Staniforth 1992 limiter).
+      (the Bermejo & Staniforth 1992 limiter). The vertical extent of the
+      bracketing cell is always the two nodes around the departure σ,
+      regardless of `vertical_order`.
+    vertical_order: vertical interpolation order, 'linear' or 'cubic'.
 
   Returns:
     Interpolated values of shape `lon.shape`.
   """
   _validate_limiter(limiter)
+  if vertical_order not in ('linear', 'cubic'):
+    raise ValueError(f'unsupported {vertical_order=}')
   field = jnp.asarray(field)
-  if len(sigma_nodes) < 2:
-    raise ValueError('vertical interpolation requires at least 2 levels')
+  min_levels = 2 if vertical_order == 'linear' else 4
+  if len(sigma_nodes) < min_levels:
+    raise ValueError(
+        f'{vertical_order} vertical interpolation requires at least'
+        f' {min_levels} levels'
+    )
   if field.ndim != 3 or field.shape[0] != len(sigma_nodes):
     raise ValueError(
         f'expected field of shape [{len(sigma_nodes)}, lon, lat]; '
         f'got {field.shape}'
     )
   stencil = _horizontal_stencil(grid, lon, sin_lat, order)
-  sigma_nodes = jnp.asarray(sigma_nodes)
-  num_levels = sigma_nodes.shape[0]
-  # Linear vertical interpolation with constant extrapolation: clipping σ to
-  # the node range makes the boundary node weight saturate at 1.
-  sigma = jnp.clip(jnp.asarray(sigma), sigma_nodes[0], sigma_nodes[-1])
-  level_cell = (
-      jnp.searchsorted(sigma_nodes, sigma, side='right') - 1
-  ).astype(jnp.int32)
-  level_cell = jnp.clip(level_cell, 0, num_levels - 2)
-  below = sigma_nodes[level_cell]
-  above = sigma_nodes[level_cell + 1]
-  fraction = (sigma - below) / (above - below)
-  level_weights = jnp.stack([1 - fraction, fraction], axis=-1)
-  level_index = level_cell[..., jnp.newaxis] + np.arange(2)
+  level_index, level_weights, bracket_offset = _vertical_stencil(
+      sigma, jnp.asarray(sigma_nodes), vertical_order
+  )
 
   extended = _extend_with_pole_halo(field, grid)
   extended_latitude_size = extended.shape[-1]
@@ -586,6 +637,15 @@ def interpolate_3d(
   if limiter == 'quasi_monotone':
     cell = _linear_cell_slice(order)
     corners = values[..., :, cell, cell]
+    if vertical_order == 'cubic':
+      # restrict the vertical extent to the two bracketing nodes: clipping
+      # against outer stencil levels would admit values the departure point
+      # does not lie between.
+      index = (
+          bracket_offset[..., jnp.newaxis, jnp.newaxis, jnp.newaxis]
+          + np.arange(2)[:, np.newaxis, np.newaxis]
+      )
+      corners = jnp.take_along_axis(corners, index, axis=-3)
     result = jnp.clip(
         result,
         corners.min(axis=(-3, -2, -1)),
@@ -832,6 +892,8 @@ def transport_scalar(
     departure: DeparturePoints,
     vertical: sigma_coordinates.SigmaCoordinates,
     interpolator: GridInterpolator,
+    *,
+    vertical_order: str = 'linear',
 ) -> jnp.ndarray:
   """Remaps a scalar field to arrival points along 3-D trajectories.
 
@@ -844,6 +906,7 @@ def transport_scalar(
       `VerticalNodes`).
     interpolator: interpolation rule (its grid, order and limiter settings
       are used).
+    vertical_order: vertical interpolation order (see `interpolate_3d`).
 
   Returns:
     The transported field at arrival points, shaped like `departure.lon`.
@@ -859,6 +922,7 @@ def transport_scalar(
       sigma_nodes=vertical.centers,
       order=interpolator.order,
       limiter=interpolator.limiter,
+      vertical_order=vertical_order,
   )
 
 
@@ -924,6 +988,7 @@ def transport_wind(
     *,
     rotate: bool = True,
     planetary_rotation_rate: float | None = None,
+    vertical_order: str = 'linear',
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
   """Remaps horizontal winds to arrival points along 3-D trajectories.
 
@@ -971,6 +1036,7 @@ def transport_wind(
       sigma_nodes=vertical.centers,
       order=interpolator.order,
       limiter=None,
+      vertical_order=vertical_order,
   )
   # vmap over the three Cartesian components: the stencil indices and
   # weights are computed once and the gathers batch into one.

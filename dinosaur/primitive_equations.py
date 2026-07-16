@@ -1729,7 +1729,13 @@ class SemiLagrangianPrimitiveEquations(
       stability, amplifying inertial modes by ~(f·dt)⁴/8 per step).
     interpolation_order: horizontal interpolation order for transported
       fields ('cubic' or 'linear'); trajectories always use linear
-      interpolation. Vertical interpolation is linear in σ.
+      interpolation.
+    vertical_interpolation_order: vertical interpolation order for
+      transported fields ('linear', the default, or 'cubic': a 4-point
+      Lagrange stencil degraded to linear in the first and last cells, the
+      standard operational rule — production SL models interpolate at
+      least cubically in the vertical, and linear vertical is the main
+      source of extra vertical diffusion at long steps).
     monotone_tracers: names of tracers transported with the quasi-monotone
       limiter, which prevents new extrema (and preserves positivity) at the
       cost of formal accuracy at extrema. Dynamical fields are never limited.
@@ -1778,11 +1784,16 @@ class SemiLagrangianPrimitiveEquations(
   terrain_smoothed_log_sp: bool = dataclasses.field(
       default=False, kw_only=True
   )
+  vertical_interpolation_order: str = dataclasses.field(
+      default='linear', kw_only=True
+  )
 
   def __post_init__(self):
     super().__post_init__()
     if self.coriolis_mode not in ('planetary_momentum', 'explicit'):
       raise ValueError(f'unknown {self.coriolis_mode=}')
+    if self.vertical_interpolation_order not in ('linear', 'cubic'):
+      raise ValueError(f'unknown {self.vertical_interpolation_order=}')
     dynamics_keys = {self.humidity_key, *(self.cloud_keys or ())}
     if set(self.nodal_tracers) & dynamics_keys:
       raise ValueError(
@@ -1958,6 +1969,7 @@ class SemiLagrangianPrimitiveEquations(
         vertical,
         interpolator,
         planetary_rotation_rate=self._planetary_rotation_rate,
+        vertical_order=self.vertical_interpolation_order,
     )
     vorticity, divergence = spherical_harmonic.uv_nodal_to_vor_div_modal(
         grid, u, v, clip=False
@@ -1967,6 +1979,7 @@ class SemiLagrangianPrimitiveEquations(
         departure['3d'],
         vertical,
         interpolator,
+        vertical_order=self.vertical_interpolation_order,
     )
     log_sp_nodal = grid.to_nodal(bracket.log_surface_pressure)
     if self.terrain_smoothed_log_sp:
@@ -1995,7 +2008,11 @@ class SemiLagrangianPrimitiveEquations(
         # nodal tracers never touch the spectral basis: transport their grid
         # values directly (no modal round trip, no wavenumber clipping).
         nodal_tracers[name] = semi_lagrangian.transport_scalar(
-            value, departure['3d'], vertical, tracer_interpolator
+            value,
+            departure['3d'],
+            vertical,
+            tracer_interpolator,
+            vertical_order=self.vertical_interpolation_order,
         )
       else:
         modal_tracers[name] = grid.to_modal(
@@ -2004,6 +2021,7 @@ class SemiLagrangianPrimitiveEquations(
                 departure['3d'],
                 vertical,
                 tracer_interpolator,
+                vertical_order=self.vertical_interpolation_order,
             )
         )
     transported = State(
@@ -3435,11 +3453,16 @@ class SemiLagrangianPrimitiveEquationsHybrid(
   terrain_smoothed_log_sp: bool = dataclasses.field(
       default=False, kw_only=True
   )
+  vertical_interpolation_order: str = dataclasses.field(
+      default='linear', kw_only=True
+  )
 
   def __post_init__(self):
     super().__post_init__()
     if self.coriolis_mode not in ('planetary_momentum', 'explicit'):
       raise ValueError(f'unknown {self.coriolis_mode=}')
+    if self.vertical_interpolation_order not in ('linear', 'cubic'):
+      raise ValueError(f'unknown {self.vertical_interpolation_order=}')
     dynamics_keys = {self.humidity_key, *(self.cloud_keys or ())}
     if set(self.nodal_tracers) & dynamics_keys:
       raise ValueError(
@@ -3619,6 +3642,7 @@ class SemiLagrangianPrimitiveEquationsHybrid(
         vertical,
         interpolator,
         planetary_rotation_rate=self._planetary_rotation_rate,
+        vertical_order=self.vertical_interpolation_order,
     )
     vorticity, divergence = spherical_harmonic.uv_nodal_to_vor_div_modal(
         grid, u, v, clip=False
@@ -3628,6 +3652,7 @@ class SemiLagrangianPrimitiveEquationsHybrid(
         departure['3d'],
         vertical,
         interpolator,
+        vertical_order=self.vertical_interpolation_order,
     )
     log_sp_nodal = grid.to_nodal(bracket.log_surface_pressure)
     if self.terrain_smoothed_log_sp:
@@ -3656,7 +3681,11 @@ class SemiLagrangianPrimitiveEquationsHybrid(
         # nodal tracers never touch the spectral basis: transport their grid
         # values directly (no modal round trip, no wavenumber clipping).
         nodal_tracers[name] = semi_lagrangian.transport_scalar(
-            value, departure['3d'], vertical, tracer_interpolator
+            value,
+            departure['3d'],
+            vertical,
+            tracer_interpolator,
+            vertical_order=self.vertical_interpolation_order,
         )
       else:
         modal_tracers[name] = grid.to_modal(
@@ -3665,6 +3694,7 @@ class SemiLagrangianPrimitiveEquationsHybrid(
                 departure['3d'],
                 vertical,
                 tracer_interpolator,
+                vertical_order=self.vertical_interpolation_order,
             )
         )
     transported = State(

@@ -1073,6 +1073,40 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
     d2_lat = f[:, 1:-1] - 0.5 * (f[:, 2:] + f[:, :-2])
     return float(np.sqrt(np.mean(d2_lon[:, 1:-1] ** 2 + d2_lat**2)))
 
+  def test_cubic_vertical_interpolation_consistency(self):
+    """Cubic and linear vertical transport agree on the baroclinic wave.
+
+    Vertical structures at T21L8 are well resolved, so the two vertical
+    orders must give nearby solutions; the difference measures the
+    vertical-interpolation diffusion that the cubic option removes.
+    """
+    equation, _, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True
+    )
+    grid = equation.coords.horizontal
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    finals = {}
+    for order in ('linear', 'cubic'):
+      eq = dataclasses.replace(
+          equation, vertical_interpolation_order=order
+      )
+      step = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(eq, dt)
+      )
+      finals[order] = time_integration.repeated(step, 24)(state0)
+      self.assertTrue(
+          np.isfinite(
+              grid.to_nodal(finals[order].temperature_variation)
+          ).all()
+      )
+    difference = self._l2(
+        grid,
+        finals['cubic'].temperature_variation,
+        finals['linear'].temperature_variation,
+    )
+    self.assertLess(difference, 2e-2)
+    self.assertGreater(difference, 0.0)  # the option changes the scheme
+
   def test_terrain_smoothing_is_noop_over_flat_terrain(self):
     """With zero orography the smoothed-variable path adds exact zeros."""
     equation, _, state0 = self._setup(spherical_harmonic.Grid.T21())
