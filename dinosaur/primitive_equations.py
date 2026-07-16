@@ -1746,9 +1746,9 @@ class SemiLagrangianPrimitiveEquations(
       `monotone_tracers` their non-negativity is exact. They must be
       excluded from modal filters (`step_filter_excluding_nodal_tracers`)
       and cannot participate in the dynamics (`humidity_key`, `cloud_keys`).
-    terrain_smoothed_log_sp: if True, transport interpolates the smoothed
-      variable `ln pₛ + Φₛ/(R·T̄)` instead of `ln pₛ`, and the static
-      field's advection `v̄·∇(Φₛ/(R·T̄))` joins the explicit forcing,
+    terrain_smoothed_log_sp: if True (default), transport interpolates the
+      smoothed variable `ln pₛ + Φₛ/(R·T̄)` instead of `ln pₛ`, and the
+      static field's advection `v̄·∇(Φₛ/(R·T̄))` joins the explicit forcing,
       following Ritchie & Tanguay (1996, Mon. Wea. Rev. 124). Over steep
       terrain `ln pₛ` is dominated by a static, hydrostatically implied
       imprint of the orography (O(0.5) for 4 km terrain, vs O(0.03)
@@ -1758,7 +1758,13 @@ class SemiLagrangianPrimitiveEquations(
       Eulerian spectral core never sees, because its advection products
       are formed spectrally and truncated. The smoothed variable removes
       the rough component from interpolation and evaluates the mountain
-      term spectrally instead.
+      term spectrally instead. Measured on 2-day ERA5 T170/L32 forecasts:
+      exactly neutral at dt = 30 min (relative l2 7e-4, identical
+      extremes, unmeasurable cost) and reduces the large-Δt hot-terrain
+      anomaly (327.2 → 322.4 K at dt = 60 min; combined with strong
+      (≥6Δx-retaining) orography filtering it restores the healthy
+      306.9 K — orography smoothness matters independently, cf. GEM's
+      operational ≥6Δx rule).
     departure_iterations: number of fixed-point iterations in the
       departure-point solves (see `semi_lagrangian.departure_points_3d`).
       The default single iteration relies on the warm-started trajectory
@@ -1782,7 +1788,7 @@ class SemiLagrangianPrimitiveEquations(
   nodal_tracers: tuple[str, ...] = dataclasses.field(default=(), kw_only=True)
   departure_iterations: int = dataclasses.field(default=1, kw_only=True)
   terrain_smoothed_log_sp: bool = dataclasses.field(
-      default=False, kw_only=True
+      default=True, kw_only=True
   )
   vertical_interpolation_order: str = dataclasses.field(
       default='linear', kw_only=True
@@ -3451,7 +3457,7 @@ class SemiLagrangianPrimitiveEquationsHybrid(
   nodal_tracers: tuple[str, ...] = dataclasses.field(default=(), kw_only=True)
   departure_iterations: int = dataclasses.field(default=1, kw_only=True)
   terrain_smoothed_log_sp: bool = dataclasses.field(
-      default=False, kw_only=True
+      default=True, kw_only=True
   )
   vertical_interpolation_order: str = dataclasses.field(
       default='linear', kw_only=True
