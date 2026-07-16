@@ -751,7 +751,10 @@ level-slowest order for the same coalescing reason — i.e. the existing
 formulation is measured at the XLA-attainable optimum in every probed
 direction. The one genuine remaining lever is bf16 gather payloads with
 f32 accumulation: −19% of raw gather cost, ≈ −1 ms (~4%) at the step
-level, available as an opt-in tracer-precision policy if ever wanted);
+level — measured and then deliberately *not* implemented, since a ~4%
+win does not justify new API surface or a tracer-precision policy;
+recorded here so the measurement survives if the trade-off ever
+changes);
 static-stencil gathers expressed as banded matmuls
 (TPU-friendly, per the einsum formulation sketched in issue #55); reduced
 Gaussian / octahedral / HEALPix-like grids so polar stencils become static;
