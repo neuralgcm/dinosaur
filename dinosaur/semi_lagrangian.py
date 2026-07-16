@@ -228,14 +228,22 @@ def _contract_stencil(values: Array, *weights: Array) -> jnp.ndarray:
   gather and skips the materialization (1.15–1.20✕ on A100 at T170/L32).
   The backend is known at trace time, so pick per platform.
   """
-  n = len(weights)
   if jax.default_backend() == 'cpu':
+    n = len(weights)
     letters = 'ijkl'[:n]
     operands = ','.join(f'...{c}' for c in letters)
     return einsum(f'{operands},...{letters}->...', *weights, values)
+  return _contract_stencil_fused(values, *weights)
+
+
+def _contract_stencil_fused(values: Array, *weights: Array) -> jnp.ndarray:
+  """The gather-fusable form of `_contract_stencil` (any backend)."""
+  n = len(weights)
   result = values
   for axis, w in enumerate(weights):
-    shape = w.shape + (1,) * (n - 1 - axis)
+    # place the weight's stencil axis at the matching values axis, with
+    # explicit size-1 axes on both sides so batch dimensions stay aligned.
+    shape = w.shape[:-1] + (1,) * axis + (w.shape[-1],) + (1,) * (n - 1 - axis)
     result = result * w.reshape(shape)
   return result.sum(axis=tuple(range(-n, 0)))
 

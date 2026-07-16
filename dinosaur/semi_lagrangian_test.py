@@ -409,6 +409,32 @@ class InterpolatorTest(parameterized.TestCase):
     self.assertGreaterEqual(np.min(np.asarray(values)), 0.0)
 
 
+class ContractStencilTest(parameterized.TestCase):
+
+  @parameterized.parameters(dict(n=2), dict(n=3))
+  def test_fused_form_matches_einsum(self, n):
+    """The accelerator (fused) contraction equals the einsum form.
+
+    The dispatch in `_contract_stencil` picks by backend, so CPU test runs
+    exercise only the einsum branch; this pins the fused branch directly.
+    """
+    rng = np.random.RandomState(0)
+    batch = (3, 5, 7)
+    sizes = (2, 4, 4)[-n:]
+    values = jnp.asarray(rng.standard_normal(batch + sizes))
+    weights = [
+        jnp.asarray(rng.standard_normal(batch + (s,))) for s in sizes
+    ]
+    letters = 'ijkl'[:n]
+    expected = jnp.einsum(
+        ','.join(f'...{c}' for c in letters) + f',...{letters}->...',
+        *weights,
+        values,
+    )
+    actual = semi_lagrangian._contract_stencil_fused(values, *weights)
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+
 class DifferentiabilityTest(parameterized.TestCase):
 
   def test_gradients_through_transport(self):
