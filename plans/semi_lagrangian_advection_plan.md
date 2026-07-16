@@ -1217,6 +1217,28 @@ Issues encountered while implementing this plan, by milestone.
   in a physics-free configuration, and any full model's moist physics
   provides the missing humidity-variance sink — with ε documented as the
   remedy when a clean tracer field matters.
+- **Time-step re-evaluation after the terrain fixes: 30 min stays.** A
+  post-remedy dt scan in the shipped configuration (ε = 0.05, smoothed
+  terrain variable, standard orography; warm+1 at 30 min, warm+2 beyond
+  per the convergence caveat) against the Eulerian dt = 5 min reference,
+  day-2 ERA5 T170/L32: dt = 30 → T rel-l2 8.2e-3, 26.5 ms/step, 2.54 s;
+  dt = 45 → 1.19e-2 (1.45✕), clean extremes, 33.3 ms/step, 2.13 s;
+  dt = 60 → 1.58e-2 and the foothills hot anomaly returns on standard
+  orography (326.5 K), consistent with the earlier finding that 60 min
+  additionally requires ≥6Δx orography filtering. The decisive point is
+  the cost structure: beyond 30 min the two-iteration trajectory
+  requirement raises per-step cost by ~26%, so 45 min buys only 19%
+  wall-clock for 45% more temperature error — a bad trade. 30 min remains
+  the recommended operating point (fastest per-step configuration, best
+  accuracy, 5.5✕ the Eulerian baseline end-to-end); 45 min is usable when
+  wall-clock dominates; 60 min only with smoothed orography. One side
+  effect recorded: at dt = 30, ε = 0.05 slightly improves the global
+  reference distance (8.2e-3 vs 9.4e-3 centered) but introduces a mild
+  warm spot at the Himalayan foothills (max T 312.2 K vs 305.8 centered;
+  the reference's global max is 307.9 K elsewhere) — the small-ε cousin
+  of the ε-terrain interaction seen at large Δt, judged acceptable for
+  the notebook (plausible pre-monsoon magnitude, global error improved)
+  and worth remembering if ε is ever raised.
 - Submitted as https://github.com/neuralgcm/dinosaur/pull/135 (the plan
   moved into plans/ in the same PR).
 
