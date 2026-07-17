@@ -1924,6 +1924,141 @@ class SemiLagrangianHybridTest(parameterized.TestCase):
     reconstructed = jax.tree.map(lambda x, y: x + y, advective, nonadvective)
     assert_states_close(full, reconstructed, rtol=1e-4, atol=1e-6)
 
+  def test_moist_reduces_to_dry_on_hybrid_levels(self):
+    """With q = 0, the moist hybrid SL class matches the dry one."""
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        8, sigma_exponent=1.5, stretch_exponent=0.5
+    )
+    moist, state, ref_temps, orography = self._hybrid_setup(
+        hybrid_levels, humidity_key='specific_humidity'
+    )
+    state.tracers = {
+        'specific_humidity': jnp.zeros_like(state.temperature_variation)
+    }
+    dry = primitive_equations.SemiLagrangianPrimitiveEquationsHybrid(
+        ref_temps, orography, moist.coords, moist.physics_specs
+    )
+    jax.tree.map(
+        lambda x, y: np.testing.assert_allclose(x, y, atol=1e-7),
+        moist.nonadvective_terms(state),
+        dry.nonadvective_terms(state),
+    )
+    dt = self._nondim_minutes(moist.physics_specs, 30)
+    step_moist = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(moist, dt)
+    )
+    step_dry = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(dry, dt)
+    )
+    jax.tree.map(
+        lambda x, y: np.testing.assert_allclose(x, y, atol=1e-6),
+        step_moist(state),
+        step_dry(state),
+    )
+
+  def test_moist_sigma_like_matches_moist_sigma_semi_lagrangian(self):
+    """With A = 0 levels, moist hybrid SL matches the moist sigma SL class.
+
+    The moist counterpart of `test_sigma_like_matches_sigma_semi_lagrangian`:
+    pins the previously untested hybrid ✕ semi-Lagrangian ✕ moist corner to
+    the well-tested moist sigma class.
+    """
+    layers = 8
+    physics_specs = units.SimUnits.from_si()
+    grid = spherical_harmonic.Grid.T21()
+    sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(layers)
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.from_sigma_levels(
+        sigma_levels
+    )
+    coords_sigma = coordinate_systems.CoordinateSystem(grid, sigma_levels)
+    coords_hybrid = coordinate_systems.CoordinateSystem(grid, hybrid_levels)
+    init_fn, aux_features = primitive_equations_states.steady_state_jw(
+        coords_sigma, physics_specs
+    )
+    state = init_fn()
+    state = state + primitive_equations_states.baroclinic_perturbation_jw(
+        coords_sigma, physics_specs
+    )
+    state.tracers = {
+        'specific_humidity': primitive_equations_states.gaussian_scalar(
+            coords_sigma, physics_specs, amplitude=0.01
+        )
+    }
+    orography = primitive_equations.truncated_modal_orography(
+        aux_features[xarray_utils.OROGRAPHY], coords_sigma
+    )
+    ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
+    sl_sigma = primitive_equations.SemiLagrangianPrimitiveEquations(
+        ref_temps,
+        orography,
+        coords_sigma,
+        physics_specs,
+        humidity_key='specific_humidity',
+    )
+    sl_hybrid = primitive_equations.SemiLagrangianPrimitiveEquationsHybrid(
+        ref_temps,
+        orography,
+        coords_hybrid,
+        physics_specs,
+        humidity_key='specific_humidity',
+    )
+    with self.subTest('non-advective terms match'):
+      # the humidity coupling enters the vorticity and divergence
+      # tendencies; the temperature entry carries the same
+      # Simmons-Burridge vs sigma discretization gap as the dry pinning
+      # test.
+      n_sigma = sl_sigma.nonadvective_terms(state)
+      n_hybrid = sl_hybrid.nonadvective_terms(state)
+      # measured: vorticity 1.3e-3 and divergence 1.5e-2 — the humidity
+      # coupling (virtual-temperature geopotential adjustment) inherits
+      # the Simmons-Burridge vs sigma vertical-integration gap, the same
+      # family as the 0.1 temperature tolerance below; the integrated
+      # 12-step comparison absorbs it.
+      for field, tol in [
+          ('vorticity', 3e-3),
+          ('divergence', 3e-2),
+          ('temperature_variation', 0.1),
+      ]:
+        self.assertLess(
+            self._l2(grid, getattr(n_hybrid, field), getattr(n_sigma, field)),
+            tol,
+            field,
+        )
+    with self.subTest('stepped run matches'):
+      dt = self._nondim_minutes(physics_specs, 30)
+      step_sigma = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(sl_sigma, dt)
+      )
+      step_hybrid = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(sl_hybrid, dt)
+      )
+      final_sigma = time_integration.repeated(step_sigma, 12)(state)
+      final_hybrid = time_integration.repeated(step_hybrid, 12)(state)
+      # measured: temperature 4e-3 (as in the dry pinning test) and
+      # vorticity 1.9e-2 — the per-tendency coupling gap accumulated over
+      # the 12 steps.
+      for field, tol in [
+          ('temperature_variation', 8e-3),
+          ('vorticity', 4e-2),
+      ]:
+        self.assertLess(
+            self._l2(
+                grid,
+                getattr(final_hybrid, field),
+                getattr(final_sigma, field),
+            ),
+            tol,
+            field,
+        )
+      self.assertLess(
+          self._l2(
+              grid,
+              final_hybrid.tracers['specific_humidity'],
+              final_sigma.tracers['specific_humidity'],
+          ),
+          8e-3,
+      )
+
   def test_sigma_like_matches_sigma_semi_lagrangian(self):
     """With A = 0 levels, the hybrid SL class matches the sigma SL class."""
     layers = 8
