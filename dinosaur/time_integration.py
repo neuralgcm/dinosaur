@@ -204,27 +204,27 @@ class SemiLagrangianImplicitExplicitODE:
     raise NotImplementedError
 
   def semi_lagrangian_transport(
-      self, bracket: PyTreeState, departure: Any
+      self, state: PyTreeState, departure: Any
   ) -> PyTreeState:
     """Remaps a state-like pytree from departure to arrival points.
 
-    Applies `T_D[bracket]`: interpolates the advected representation of
-    `bracket` (a state or state-like linear combination of states and
-    tendencies) at the departure points of the trajectories.
+    Applies `T_D[state]`: interpolates the advected representation of
+    `state` (the actual state, or a state-like linear combination of the
+    state and weighted tendencies) at the departure points.
 
-    Implementations need not be linear in `bracket`: equations that
-    transport planetary momentum add an analytic `2Ω✕R` term with a fixed
-    unit coefficient. Steppers must therefore only pass brackets of the
-    form `state + (weighted tendencies)` — carrying the state with
-    coefficient exactly one — and must not transport tendency-only brackets
-    or rescale transported results.
+    Implementations need not be linear: equations that transport planetary
+    momentum add an analytic `2Ω✕R` term with a fixed unit coefficient.
+    Steppers must therefore only pass combinations of the form
+    `state + (weighted tendencies)` — carrying the state with coefficient
+    exactly one — and must not transport tendency-only combinations or
+    rescale transported results.
 
     Args:
-      bracket: modal state-like pytree to transport.
+      state: modal state-like pytree to transport.
       departure: departure points from `departure_points`.
 
     Returns:
-      The transported bracket, in the same (modal) representation.
+      The transported pytree, in the same (modal) representation.
     """
     raise NotImplementedError
 
@@ -267,22 +267,12 @@ def semi_lagrangian_crank_nicolson_rk2(
       ε-weighted terms; ε = 0 (default) is fully centered and second order.
     warm_start_corrector: if True (default), the corrector stage's
       departure-point iteration starts from the predictor stage's
-      departure points instead of the arrival points (the analogue, within
-      a single step, of the warm-started iteration adopted in IFS Cycle
-      48r1; see `semi_lagrangian.horizontal_departure_points`). Paired
-      with the equations' default `departure_iterations=1`, one
-      warm-started iteration matches the trajectory residual of two cold
-      ones at ~18% less step time (T170/L32 on A100); the
-      trajectory-truncation error stays below — though within a factor of
-      ~2 of — the converged scheme's own sensitivity to the time step
-      (1.1e-4 vs 2.3e-4 relative l2 on T′ over a 12 h T85 baroclinic wave
-      at dt = 30 min, against 30 → 7.5 min refinement). If disabled, raise
-      `departure_iterations` to at least 2: a cold single iteration
-      (3.6e-3) is not accurate enough. At two iterations the warm start is
-      measurably counterproductive (a cold corrector's first iteration
-      interpolates at the constant arrival mesh, which compiles to cheaper
-      code), so pair `warm_start_corrector=False` with
-      `departure_iterations=2` to reproduce pre-warm-start behavior.
+      departure points instead of the arrival points — the within-step
+      analogue of the warm-started iteration adopted in IFS Cycle 48r1
+      (see `semi_lagrangian.horizontal_departure_points`). This makes the
+      equations' default single departure iteration about as accurate as
+      two cold iterations; if disabled, raise `departure_iterations` to
+      at least 2.
 
   Returns:
     Function that performs a time step.
@@ -360,17 +350,12 @@ def semi_lagrangian_settls(
     time_step: time step.
     warm_start_departures: if True (default), carry each step's departure
       points and use them to warm-start the next step's iteration — the
-      direct analogue of the warm-started trajectory iteration adopted in
-      IFS Cycle 48r1 (consecutive steps' departure points differ only by
-      O(dt²); see `semi_lagrangian.horizontal_departure_points`). Measured
-      cost-neutral at T170/L32 on A100 while cutting the trajectory
-      residual by well over an order of magnitude at two iterations, since
-      the carried refinement compounds across steps; with
-      `departure_iterations=1` on the equation it matches the two-cold-
-      iteration residual at ~22% less step time (trajectory-truncation
-      error 1.5e-5 relative l2 on T′ over a 12 h T85 baroclinic wave at
-      dt = 30 min, ~15✕ below the converged scheme's 2.3e-4 sensitivity
-      to 30 → 7.5 min time-step refinement).
+      approach adopted in IFS Cycle 48r1 (consecutive steps' departure
+      points differ only by O(dt²); see
+      `semi_lagrangian.horizontal_departure_points`). The carried
+      refinement compounds across steps, making the equations' default
+      single departure iteration about as accurate as two cold ones; if
+      disabled, raise `departure_iterations` to at least 2.
 
   Returns:
     Function mapping `(x, aux)` to the next `(x, aux)`.
@@ -511,9 +496,9 @@ class TimeReversedSemiLagrangianODE(SemiLagrangianImplicitExplicitODE):
     return self.forward_eq.departure_points(velocities, dt, initial_guess)
 
   def semi_lagrangian_transport(
-      self, bracket: PyTreeState, departure: Any
+      self, state: PyTreeState, departure: Any
   ) -> PyTreeState:
-    return self.forward_eq.semi_lagrangian_transport(bracket, departure)
+    return self.forward_eq.semi_lagrangian_transport(state, departure)
 
 
 @dataclasses.dataclass
@@ -540,12 +525,16 @@ class TimeReversedImExODE(ImplicitExplicitODE):
     return self.forward_eq.implicit_inverse(state, -step_size)
 
 
+ImplicitExplicitODET = TypeVar(
+    'ImplicitExplicitODET',
+    ImplicitExplicitODE,
+    SemiLagrangianImplicitExplicitODE,
+)
+
+
 def compose_equations(
-    equations: Sequence[
-        Union[ImplicitExplicitODE, SemiLagrangianImplicitExplicitODE,
-              ExplicitODE]
-    ],
-) -> Union[ImplicitExplicitODE, SemiLagrangianImplicitExplicitODE]:
+    equations: Sequence[Union[ImplicitExplicitODET, ExplicitODE]],
+) -> ImplicitExplicitODET:
   """Combines a `equations` with at-most one ImplicitExplicitODE instance.
 
   If the ImplicitExplicitODE instance is a SemiLagrangianImplicitExplicitODE,

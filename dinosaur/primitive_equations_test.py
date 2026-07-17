@@ -1560,6 +1560,54 @@ class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
     x, y = grid.to_nodal(x), grid.to_nodal(y)
     return float(np.sqrt(np.square(x - y).sum() / np.square(y).sum()))
 
+  def test_nodal_humidity_couples_to_the_dynamics(self):
+    """A dynamics-coupled tracer may be stored nodally.
+
+    The coupling terms convert the nodal tracer to modal once per step, so
+    for a band-limited humidity field the nonadvective tendencies match
+    the modal-storage configuration.
+    """
+    moist, state, _, _ = self._setup(humidity=True)
+    grid = moist.coords.horizontal
+    nodal_moist = dataclasses.replace(
+        moist, nodal_tracers=('specific_humidity',)
+    )
+    q_modal = state.tracers['specific_humidity']
+    nodal_state = state.replace(
+        tracers={'specific_humidity': grid.to_nodal(q_modal)}
+    )
+    modal_tendency = moist.nonadvective_terms(state)
+    nodal_tendency = nodal_moist.nonadvective_terms(nodal_state)
+    for field in (
+        'vorticity',
+        'divergence',
+        'temperature_variation',
+        'log_surface_pressure',
+    ):
+      np.testing.assert_allclose(
+          getattr(nodal_tendency, field),
+          getattr(modal_tendency, field),
+          atol=1e-6,
+          err_msg=field,
+      )
+    # the tracer's own tendency is zero in both storages (advection-only),
+    # in the matching representation.
+    np.testing.assert_array_equal(
+        nodal_tendency.tracers['specific_humidity'],
+        jnp.zeros_like(nodal_state.tracers['specific_humidity']),
+    )
+    dt = self._nondim_minutes(moist.physics_specs, 30)
+    step = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(nodal_moist, dt)
+    )
+    final = step(nodal_state)
+    self.assertTrue(
+        np.isfinite(grid.to_nodal(final.temperature_variation)).all()
+    )
+    self.assertTrue(
+        np.isfinite(np.asarray(final.tracers['specific_humidity'])).all()
+    )
+
   def test_moist_equations_reduce_to_dry_for_zero_humidity(self):
     """With q = 0, moist SL tendencies match treating q as a passive tracer."""
     moist, state, ref_temps, orography = self._setup(humidity=True)
@@ -1751,10 +1799,6 @@ class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
         / np.square(finals[False]).sum()
     )
     self.assertLess(float(difference), 0.05)
-
-  def test_nodal_tracers_reject_dynamics_keys(self):
-    with self.assertRaisesRegex(ValueError, 'cannot be stored nodally'):
-      self._setup(humidity=True, nodal_tracers=('specific_humidity',))
 
   def test_step_filter_excluding_nodal_tracers(self):
     equation, state0, _, _ = self._setup(nodal_tracers=('tracer',))

@@ -168,6 +168,21 @@ class DiagnosticStateSigma:
 
 
 @tree_math.struct
+class PrimitiveDeparturePoints:
+  """Departure points for primitive-equation semi-Lagrangian transport.
+
+  Attributes:
+    full: 3-D departure points, for winds, temperature and tracers.
+    horizontal: 2-D departure points of the vertically averaged wind, for
+      `log_surface_pressure` (which is independent of the vertical
+      coordinate, making horizontal-only trajectories exact for it).
+  """
+
+  full: semi_lagrangian.DeparturePoints
+  horizontal: semi_lagrangian.DeparturePoints
+
+
+@tree_math.struct
 class NodalVelocities:
   """Nodal velocities used to compute semi-Lagrangian trajectories.
 
@@ -1744,8 +1759,12 @@ class SemiLagrangianPrimitiveEquations(
       transforms, so sharp fields (aerosols, chemistry) avoid the per-step
       Gibbs ringing of a modal round trip, and combined with
       `monotone_tracers` their non-negativity is exact. They must be
-      excluded from modal filters (`step_filter_excluding_nodal_tracers`)
-      and cannot participate in the dynamics (`humidity_key`, `cloud_keys`).
+      excluded from modal filters (`step_filter_excluding_nodal_tracers`).
+      Tracers that enter the dynamics (`humidity_key`, `cloud_keys`) may
+      also be stored nodally: they are converted to modal coefficients
+      once per step where the dynamical coupling terms need them, so the
+      coupling sees the spectrally truncated field while storage and
+      transport stay nodal.
     terrain_smoothed_log_sp: if True (default), transport interpolates the
       smoothed variable `ln pₛ + Φₛ/(R·T̄)` instead of `ln pₛ`, and the
       static field's advection `v̄·∇(Φₛ/(R·T̄))` joins the explicit forcing,
@@ -1819,19 +1838,6 @@ class SemiLagrangianPrimitiveEquations(
       raise ValueError(f'unknown {self.coriolis_mode=}')
     if self.vertical_interpolation_order not in ('linear', 'cubic'):
       raise ValueError(f'unknown {self.vertical_interpolation_order=}')
-    if not isinstance(self.monotone_tracers, bool):
-      # a nonempty tuple (the former per-name API) would silently behave as
-      # True-for-all; reject it loudly instead.
-      raise TypeError(
-          'monotone_tracers is a bool applying to all tracers; got '
-          f'{self.monotone_tracers!r}'
-      )
-    dynamics_keys = {self.humidity_key, *(self.cloud_keys or ())}
-    if set(self.nodal_tracers) & dynamics_keys:
-      raise ValueError(
-          'tracers that enter the dynamics (humidity_key, cloud_keys) cannot '
-          f'be stored nodally: {self.nodal_tracers=}'
-      )
 
   @property
   def _planetary_rotation_rate(self) -> float | None:
@@ -1925,6 +1931,16 @@ class SemiLagrangianPrimitiveEquations(
   def nonadvective_terms(self, state: State) -> State:
     """Computes non-advective explicit tendencies ("N")."""
     modal_state, nodal_tracers = self._split_nodal_tracers(state)
+    dynamics_keys = {self.humidity_key, *(self.cloud_keys or ())}
+    coupled = {
+        name: self.coords.horizontal.to_modal(value)
+        for name, value in nodal_tracers.items()
+        if name in dynamics_keys
+    }
+    if coupled:
+      modal_state = modal_state.replace(
+          tracers={**modal_state.tracers, **coupled}
+      )
     tendency = self.explicit_nonadvective_terms(
         modal_state, include_coriolis=self.coriolis_mode == 'explicit'
     )
@@ -1955,35 +1971,35 @@ class SemiLagrangianPrimitiveEquations(
       self,
       velocities: NodalVelocities,
       dt: float,
-      initial_guess: dict[str, semi_lagrangian.DeparturePoints] | None = None,
-  ) -> dict[str, semi_lagrangian.DeparturePoints]:
-    """Solves for 3-D departure points and 2-D ones for `ln(pₛ)`."""
+      initial_guess: PrimitiveDeparturePoints | None = None,
+  ) -> PrimitiveDeparturePoints:
+    """Solves 3-D departure points, plus 2-D ones for `ln(pₛ)`."""
     no_guess = initial_guess is None
-    return {
-        '3d': semi_lagrangian.departure_points_3d(
+    return PrimitiveDeparturePoints(
+        full=semi_lagrangian.departure_points_3d(
             velocities.u,
             velocities.v,
             velocities.sigma_dot,
             self.coords,
             dt,
             iterations=self.departure_iterations,
-            initial_guess=None if no_guess else initial_guess['3d'],
+            initial_guess=None if no_guess else initial_guess.full,
         ),
-        '2d': semi_lagrangian.horizontal_departure_points(
+        horizontal=semi_lagrangian.horizontal_departure_points(
             velocities.u_mean,
             velocities.v_mean,
             self.coords.horizontal,
             dt,
             iterations=self.departure_iterations,
-            initial_guess=None if no_guess else initial_guess['2d'],
+            initial_guess=None if no_guess else initial_guess.horizontal,
         ),
-    }
+    )
 
   @jax.named_call
   def semi_lagrangian_transport(
       self,
-      bracket: State,
-      departure: dict[str, semi_lagrangian.DeparturePoints],
+      state: State,
+      departure: PrimitiveDeparturePoints,
   ) -> State:
     """Remaps the advected representation of a modal state-like pytree."""
     grid = self.coords.horizontal
@@ -1993,12 +2009,12 @@ class SemiLagrangianPrimitiveEquations(
         grid, self.interpolation_order, dynamics_limiter
     )
     u, v = spherical_harmonic.vor_div_to_uv_nodal(
-        grid, bracket.vorticity, bracket.divergence, clip=False
+        grid, state.vorticity, state.divergence, clip=False
     )
     u, v = semi_lagrangian.transport_wind(
         u,
         v,
-        departure['3d'],
+        departure.full,
         vertical,
         interpolator,
         planetary_rotation_rate=self._planetary_rotation_rate,
@@ -2009,8 +2025,8 @@ class SemiLagrangianPrimitiveEquations(
         grid, u, v, clip=False
     )
     temperature_variation = semi_lagrangian.transport_scalar(
-        grid.to_nodal(bracket.temperature_variation),
-        departure['3d'],
+        grid.to_nodal(state.temperature_variation),
+        departure.full,
         vertical,
         interpolator,
         vertical_order=self.vertical_interpolation_order,
@@ -2022,7 +2038,7 @@ class SemiLagrangianPrimitiveEquations(
             else None
         ),
     )
-    log_sp_nodal = grid.to_nodal(bracket.log_surface_pressure)
+    log_sp_nodal = grid.to_nodal(state.log_surface_pressure)
     if self.terrain_smoothed_log_sp:
       # interpolate the smoothed variable ψ = ln pₛ + C: the terrain-locked
       # parts cancel before interpolation; C is static, so it is removed
@@ -2030,7 +2046,7 @@ class SemiLagrangianPrimitiveEquations(
       log_sp_nodal = log_sp_nodal + self._log_sp_terrain_correction
     log_surface_pressure = semi_lagrangian.transport_scalar_2d(
         log_sp_nodal,
-        departure['2d'],
+        departure.horizontal,
         interpolator,
     )
     if self.terrain_smoothed_log_sp:
@@ -2039,31 +2055,25 @@ class SemiLagrangianPrimitiveEquations(
       )
     modal_tracers = {}
     nodal_tracers = {}
-    tracer_interpolator = semi_lagrangian.GridInterpolator(
-        grid,
-        self.interpolation_order,
-        limiter='quasi_monotone' if self.monotone_tracers else None,
+    transport_tracer = functools.partial(
+        semi_lagrangian.transport_scalar,
+        departure=departure.full,
+        vertical=vertical,
+        interpolator=semi_lagrangian.GridInterpolator(
+            grid,
+            self.interpolation_order,
+            limiter='quasi_monotone' if self.monotone_tracers else None,
+        ),
+        vertical_order=self.vertical_interpolation_order,
     )
-    for name, value in bracket.tracers.items():
+    for name, value in state.tracers.items():
       if name in self.nodal_tracers:
         # nodal tracers never touch the spectral basis: transport their grid
         # values directly (no modal round trip, no wavenumber clipping).
-        nodal_tracers[name] = semi_lagrangian.transport_scalar(
-            value,
-            departure['3d'],
-            vertical,
-            tracer_interpolator,
-            vertical_order=self.vertical_interpolation_order,
-        )
+        nodal_tracers[name] = transport_tracer(value)
       else:
         modal_tracers[name] = grid.to_modal(
-            semi_lagrangian.transport_scalar(
-                grid.to_nodal(value),
-                departure['3d'],
-                vertical,
-                tracer_interpolator,
-                vertical_order=self.vertical_interpolation_order,
-            )
+            transport_tracer(grid.to_nodal(value))
         )
     transported = State(
         vorticity=vorticity,
@@ -2071,7 +2081,7 @@ class SemiLagrangianPrimitiveEquations(
         temperature_variation=grid.to_modal(temperature_variation),
         log_surface_pressure=grid.to_modal(log_surface_pressure),
         tracers=modal_tracers,
-        sim_time=bracket.sim_time,
+        sim_time=state.sim_time,
     )
     transported = grid.clip_wavenumbers(transported)
     if not nodal_tracers:
@@ -3503,19 +3513,6 @@ class SemiLagrangianPrimitiveEquationsHybrid(
       raise ValueError(f'unknown {self.coriolis_mode=}')
     if self.vertical_interpolation_order not in ('linear', 'cubic'):
       raise ValueError(f'unknown {self.vertical_interpolation_order=}')
-    if not isinstance(self.monotone_tracers, bool):
-      # a nonempty tuple (the former per-name API) would silently behave as
-      # True-for-all; reject it loudly instead.
-      raise TypeError(
-          'monotone_tracers is a bool applying to all tracers; got '
-          f'{self.monotone_tracers!r}'
-      )
-    dynamics_keys = {self.humidity_key, *(self.cloud_keys or ())}
-    if set(self.nodal_tracers) & dynamics_keys:
-      raise ValueError(
-          'tracers that enter the dynamics (humidity_key, cloud_keys) cannot '
-          f'be stored nodally: {self.nodal_tracers=}'
-      )
 
   @property
   def _planetary_rotation_rate(self) -> float | None:
@@ -3612,6 +3609,16 @@ class SemiLagrangianPrimitiveEquationsHybrid(
   def nonadvective_terms(self, state: State) -> State:
     """Computes non-advective explicit tendencies ("N")."""
     modal_state, nodal_tracers = self._split_nodal_tracers(state)
+    dynamics_keys = {self.humidity_key, *(self.cloud_keys or ())}
+    coupled = {
+        name: self.coords.horizontal.to_modal(value)
+        for name, value in nodal_tracers.items()
+        if name in dynamics_keys
+    }
+    if coupled:
+      modal_state = modal_state.replace(
+          tracers={**modal_state.tracers, **coupled}
+      )
     tendency = self.explicit_nonadvective_terms(
         modal_state, include_coriolis=self.coriolis_mode == 'explicit'
     )
@@ -3642,12 +3649,12 @@ class SemiLagrangianPrimitiveEquationsHybrid(
       self,
       velocities: NodalVelocities,
       dt: float,
-      initial_guess: dict[str, semi_lagrangian.DeparturePoints] | None = None,
-  ) -> dict[str, semi_lagrangian.DeparturePoints]:
-    """Solves for 3-D departure points and 2-D ones for `ln(pₛ)`."""
+      initial_guess: PrimitiveDeparturePoints | None = None,
+  ) -> PrimitiveDeparturePoints:
+    """Solves 3-D departure points, plus 2-D ones for `ln(pₛ)`."""
     no_guess = initial_guess is None
-    return {
-        '3d': semi_lagrangian.departure_points_3d(
+    return PrimitiveDeparturePoints(
+        full=semi_lagrangian.departure_points_3d(
             velocities.u,
             velocities.v,
             velocities.sigma_dot,
@@ -3655,23 +3662,23 @@ class SemiLagrangianPrimitiveEquationsHybrid(
             dt,
             vertical_nodes=self._vertical_nodes,
             iterations=self.departure_iterations,
-            initial_guess=None if no_guess else initial_guess['3d'],
+            initial_guess=None if no_guess else initial_guess.full,
         ),
-        '2d': semi_lagrangian.horizontal_departure_points(
+        horizontal=semi_lagrangian.horizontal_departure_points(
             velocities.u_mean,
             velocities.v_mean,
             self.coords.horizontal,
             dt,
             iterations=self.departure_iterations,
-            initial_guess=None if no_guess else initial_guess['2d'],
+            initial_guess=None if no_guess else initial_guess.horizontal,
         ),
-    }
+    )
 
   @jax.named_call
   def semi_lagrangian_transport(
       self,
-      bracket: State,
-      departure: dict[str, semi_lagrangian.DeparturePoints],
+      state: State,
+      departure: PrimitiveDeparturePoints,
   ) -> State:
     """Remaps the advected representation of a modal state-like pytree."""
     grid = self.coords.horizontal
@@ -3681,12 +3688,12 @@ class SemiLagrangianPrimitiveEquationsHybrid(
         grid, self.interpolation_order, dynamics_limiter
     )
     u, v = spherical_harmonic.vor_div_to_uv_nodal(
-        grid, bracket.vorticity, bracket.divergence, clip=False
+        grid, state.vorticity, state.divergence, clip=False
     )
     u, v = semi_lagrangian.transport_wind(
         u,
         v,
-        departure['3d'],
+        departure.full,
         vertical,
         interpolator,
         planetary_rotation_rate=self._planetary_rotation_rate,
@@ -3697,8 +3704,8 @@ class SemiLagrangianPrimitiveEquationsHybrid(
         grid, u, v, clip=False
     )
     temperature_variation = semi_lagrangian.transport_scalar(
-        grid.to_nodal(bracket.temperature_variation),
-        departure['3d'],
+        grid.to_nodal(state.temperature_variation),
+        departure.full,
         vertical,
         interpolator,
         vertical_order=self.vertical_interpolation_order,
@@ -3710,7 +3717,7 @@ class SemiLagrangianPrimitiveEquationsHybrid(
             else None
         ),
     )
-    log_sp_nodal = grid.to_nodal(bracket.log_surface_pressure)
+    log_sp_nodal = grid.to_nodal(state.log_surface_pressure)
     if self.terrain_smoothed_log_sp:
       # interpolate the smoothed variable ψ = ln pₛ + C: the terrain-locked
       # parts cancel before interpolation; C is static, so it is removed
@@ -3718,7 +3725,7 @@ class SemiLagrangianPrimitiveEquationsHybrid(
       log_sp_nodal = log_sp_nodal + self._log_sp_terrain_correction
     log_surface_pressure = semi_lagrangian.transport_scalar_2d(
         log_sp_nodal,
-        departure['2d'],
+        departure.horizontal,
         interpolator,
     )
     if self.terrain_smoothed_log_sp:
@@ -3727,31 +3734,25 @@ class SemiLagrangianPrimitiveEquationsHybrid(
       )
     modal_tracers = {}
     nodal_tracers = {}
-    tracer_interpolator = semi_lagrangian.GridInterpolator(
-        grid,
-        self.interpolation_order,
-        limiter='quasi_monotone' if self.monotone_tracers else None,
+    transport_tracer = functools.partial(
+        semi_lagrangian.transport_scalar,
+        departure=departure.full,
+        vertical=vertical,
+        interpolator=semi_lagrangian.GridInterpolator(
+            grid,
+            self.interpolation_order,
+            limiter='quasi_monotone' if self.monotone_tracers else None,
+        ),
+        vertical_order=self.vertical_interpolation_order,
     )
-    for name, value in bracket.tracers.items():
+    for name, value in state.tracers.items():
       if name in self.nodal_tracers:
         # nodal tracers never touch the spectral basis: transport their grid
         # values directly (no modal round trip, no wavenumber clipping).
-        nodal_tracers[name] = semi_lagrangian.transport_scalar(
-            value,
-            departure['3d'],
-            vertical,
-            tracer_interpolator,
-            vertical_order=self.vertical_interpolation_order,
-        )
+        nodal_tracers[name] = transport_tracer(value)
       else:
         modal_tracers[name] = grid.to_modal(
-            semi_lagrangian.transport_scalar(
-                grid.to_nodal(value),
-                departure['3d'],
-                vertical,
-                tracer_interpolator,
-                vertical_order=self.vertical_interpolation_order,
-            )
+            transport_tracer(grid.to_nodal(value))
         )
     transported = State(
         vorticity=vorticity,
@@ -3759,7 +3760,7 @@ class SemiLagrangianPrimitiveEquationsHybrid(
         temperature_variation=grid.to_modal(temperature_variation),
         log_surface_pressure=grid.to_modal(log_surface_pressure),
         tracers=modal_tracers,
-        sim_time=bracket.sim_time,
+        sim_time=state.sim_time,
     )
     transported = grid.clip_wavenumbers(transported)
     if not nodal_tracers:

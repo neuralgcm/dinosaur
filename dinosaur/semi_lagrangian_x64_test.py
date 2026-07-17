@@ -514,9 +514,9 @@ class _IdentityTransportODE(
     del velocities, dt, initial_guess  # unused
     return None
 
-  def semi_lagrangian_transport(self, bracket, departure):
+  def semi_lagrangian_transport(self, state, departure):
     del departure  # unused
-    return bracket
+    return state
 
 
 class _RingAdvectionODE(time_integration.SemiLagrangianImplicitExplicitODE):
@@ -550,10 +550,10 @@ class _RingAdvectionODE(time_integration.SemiLagrangianImplicitExplicitODE):
     del initial_guess  # departure points are exact on the ring
     return velocities * dt
 
-  def semi_lagrangian_transport(self, bracket, departure):
+  def semi_lagrangian_transport(self, state, departure):
     num_points = self.theta.size
     k = jnp.fft.rfftfreq(num_points, d=1 / num_points)
-    shifted = jnp.fft.rfft(bracket) * jnp.exp(-1j * k * departure)
+    shifted = jnp.fft.rfft(state) * jnp.exp(-1j * k * departure)
     return jnp.fft.irfft(shifted, num_points)
 
   def exact_solution(self, state0, time):

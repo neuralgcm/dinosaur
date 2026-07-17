@@ -354,12 +354,12 @@ class SemiLagrangianShallowWaterEquations(
     )
 
   def semi_lagrangian_transport(
-      self, bracket: State, departure: semi_lagrangian.DeparturePoints
+      self, state: State, departure: semi_lagrangian.DeparturePoints
   ) -> State:
     grid = self.coords.horizontal
     interpolator = self._interpolator
     u, v = spherical_harmonic.vor_div_to_uv_nodal(
-        grid, bracket.vorticity, bracket.divergence, clip=False
+        grid, state.vorticity, state.divergence, clip=False
     )
     u, v = semi_lagrangian.transport_wind_2d(
         u,
@@ -369,7 +369,7 @@ class SemiLagrangianShallowWaterEquations(
         planetary_rotation_rate=self._planetary_rotation_rate,
         limiter=interpolator.limiter,
     )
-    nodal_potential = grid.to_nodal(bracket.potential)
+    nodal_potential = grid.to_nodal(state.potential)
     transported_potential = semi_lagrangian.transport_scalar_2d(
         nodal_potential, departure, interpolator
     )

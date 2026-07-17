@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from dinosaur import coordinate_systems
 from dinosaur import sigma_coordinates
@@ -432,7 +432,9 @@ def _interpolate_horizontal(
   result = _contract_stencil(
       values, stencil.lon_weights, stencil.lat_weights
   )
-  if limiter == 'quasi_monotone':
+  if limiter is not None:
+    if limiter != 'quasi_monotone':
+      raise ValueError(f'unimplemented interpolation {limiter=}')
     cell = _linear_cell_slice(order)
     corners = values[..., cell, cell]
     result = jnp.clip(
@@ -485,7 +487,10 @@ class GridInterpolator:
     """
     field = jnp.asarray(field)
     interpolate = functools.partial(
-        self._interpolate_single, order=self.order, limiter=self.limiter
+        _interpolate_horizontal_single,
+        grid=self.grid,
+        order=self.order,
+        limiter=self.limiter,
     )
     if field.ndim == 2:
       return interpolate(field, lon, sin_lat)
@@ -500,27 +505,7 @@ class GridInterpolator:
       )
     return jax.vmap(interpolate)(field, lon, sin_lat)
 
-  def _interpolate_single(
-      self,
-      field: Array,
-      lon: Array,
-      sin_lat: Array,
-      order: str,
-      limiter: str | None,
-  ) -> jnp.ndarray:
-    return _interpolate_horizontal_single(
-        field, lon, sin_lat, grid=self.grid, order=order, limiter=limiter
-    )
 
-
-# jitting the per-field interpolation entry points means repeated call sites
-# with the same signature (e.g. the two stages of an RK2 step, or several
-# tracers with the same limiter) share a single lowered computation instead
-# of inlining a copy each (~30% fewer lowered ops on a full step). Measured
-# GPU compile time is unchanged — XLA's cost is dominated elsewhere — so
-# this is a tracing/lowering cleanup, not a compile-time fix. `grid` is
-# hashable (frozen dataclass), following the
-# `spherical_harmonic.vor_div_to_uv_nodal` precedent.
 @functools.partial(jax.jit, static_argnames=('grid', 'order', 'limiter'))
 def _interpolate_horizontal_single(
     field: Array,
@@ -538,7 +523,7 @@ def _interpolate_horizontal_single(
 def _vertical_stencil(
     sigma: Array,
     sigma_nodes: Array,
-    vertical_order: str,
+    vertical_order: Literal['linear', 'cubic'],
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
   """Returns (level_index, level_weights, bracket_offset) for the vertical.
 
@@ -566,6 +551,8 @@ def _vertical_stencil(
     level_index = level_cell[..., jnp.newaxis] + np.arange(2)
     bracket_offset = jnp.zeros_like(level_cell)
     return level_index, level_weights, bracket_offset
+  if vertical_order != 'cubic':
+    raise ValueError(f'unknown {vertical_order=}')
   start = jnp.clip(level_cell - 1, 0, num_levels - 4)
   level_index = start[..., jnp.newaxis] + np.arange(4)
   cubic_weights = _lagrange_weights(sigma, sigma_nodes[level_index])
@@ -582,6 +569,23 @@ def _vertical_stencil(
   return level_index, level_weights, bracket_offset
 
 
+def _bracketing_level_corners(
+    corners: Array, bracket_offset: Array
+) -> jnp.ndarray:
+  """Restricts corner values to the two levels bracketing the departure σ.
+
+  The quasi-monotone limiter must clip against the bracketing cell only:
+  including outer stencil levels would admit values the departure point
+  does not lie between. For the linear vertical stencil the offset is zero
+  and this selection is the identity.
+  """
+  index = (
+      bracket_offset[..., jnp.newaxis, jnp.newaxis, jnp.newaxis]
+      + np.arange(2)[:, np.newaxis, np.newaxis]
+  )
+  return jnp.take_along_axis(corners, index, axis=-3)
+
+
 @functools.partial(
     jax.jit, static_argnames=('grid', 'order', 'limiter', 'vertical_order')
 )
@@ -595,7 +599,7 @@ def interpolate_3d(
     *,
     order: str = 'cubic',
     limiter: str | None = None,
-    vertical_order: str = 'linear',
+    vertical_order: Literal['linear', 'cubic'] = 'linear',
     limiter_bound_reference: Array | None = None,
 ) -> jnp.ndarray:
   """Interpolates a 3-D field at points (lon, sin_lat, sigma).
@@ -677,7 +681,9 @@ def interpolate_3d(
   result = _contract_stencil(
       values, level_weights, stencil.lon_weights, stencil.lat_weights
   )
-  if limiter == 'quasi_monotone':
+  if limiter is not None:
+    if limiter != 'quasi_monotone':
+      raise ValueError(f'unimplemented interpolation {limiter=}')
     cell = _linear_cell_slice(order)
     corners = values[..., :, cell, cell]
     reference_at_departure = 0.0
@@ -686,15 +692,7 @@ def interpolate_3d(
       reference_at_departure = (level_weights * reference).sum(-1)
       corners = corners + reference[..., :, jnp.newaxis, jnp.newaxis]
       result = result + reference_at_departure
-    if vertical_order == 'cubic':
-      # restrict the vertical extent to the two bracketing nodes: clipping
-      # against outer stencil levels would admit values the departure point
-      # does not lie between.
-      index = (
-          bracket_offset[..., jnp.newaxis, jnp.newaxis, jnp.newaxis]
-          + np.arange(2)[:, np.newaxis, np.newaxis]
-      )
-      corners = jnp.take_along_axis(corners, index, axis=-3)
+    corners = _bracketing_level_corners(corners, bracket_offset)
     result = jnp.clip(
         result,
         corners.min(axis=(-3, -2, -1)),
@@ -943,7 +941,7 @@ def transport_scalar(
     vertical: sigma_coordinates.SigmaCoordinates,
     interpolator: GridInterpolator,
     *,
-    vertical_order: str = 'linear',
+    vertical_order: Literal['linear', 'cubic'] = 'linear',
     limiter_bound_reference: Array | None = None,
 ) -> jnp.ndarray:
   """Remaps a scalar field to arrival points along 3-D trajectories.
@@ -1042,7 +1040,7 @@ def transport_wind(
     *,
     rotate: bool = True,
     planetary_rotation_rate: float | None = None,
-    vertical_order: str = 'linear',
+    vertical_order: Literal['linear', 'cubic'] = 'linear',
     limiter: str | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
   """Remaps horizontal winds to arrival points along 3-D trajectories.
