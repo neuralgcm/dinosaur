@@ -425,11 +425,11 @@ class MonotoneWindTransportTest(parameterized.TestCase):
     departure = semi_lagrangian.horizontal_departure_points(
         u, v, grid, dt=0.1
     )
-    interpolator = semi_lagrangian.GridInterpolator(grid, 'cubic')
     results = {}
     for limiter in (None, 'quasi_monotone'):
+      interpolator = semi_lagrangian.GridInterpolator(grid, 'cubic', limiter)
       results[limiter] = semi_lagrangian.transport_wind_2d(
-          u, v, departure, interpolator, limiter=limiter
+          u, v, departure, interpolator
       )
     for a, b in zip(results[None], results['quasi_monotone']):
       np.testing.assert_allclose(a, b, atol=1e-6)
@@ -448,12 +448,14 @@ class MonotoneWindTransportTest(parameterized.TestCase):
     departure = semi_lagrangian.horizontal_departure_points(
         u_smooth, v_smooth, grid, dt=0.3
     )
-    interpolator = semi_lagrangian.GridInterpolator(grid, 'cubic')
     unlimited = semi_lagrangian.transport_wind_2d(
-        u, v, departure, interpolator, limiter=None
+        u, v, departure, semi_lagrangian.GridInterpolator(grid, 'cubic')
     )
     limited = semi_lagrangian.transport_wind_2d(
-        u, v, departure, interpolator, limiter='quasi_monotone'
+        u,
+        v,
+        departure,
+        semi_lagrangian.GridInterpolator(grid, 'cubic', 'quasi_monotone'),
     )
     difference = max(
         float(np.abs(np.asarray(a) - np.asarray(b)).max())

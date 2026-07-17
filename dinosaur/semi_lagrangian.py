@@ -731,17 +731,25 @@ class DeparturePoints:
   """Departure points of trajectories arriving at grid points.
 
   Attributes:
-    lon: longitudes in radians.
-    sin_lat: sine of latitudes.
-    cartesian: unit vectors on the sphere of shape [3, *lon.shape].
+    cartesian: unit vectors on the sphere, of shape [3, *points].
     sigma: σ coordinates of departure points, or None for horizontal-only
       trajectories.
+    lon: longitudes in radians (derived from `cartesian`).
+    sin_lat: sine of latitudes (derived from `cartesian`).
   """
 
-  lon: Array
-  sin_lat: Array
   cartesian: Array
   sigma: Array | None = None
+
+  @property
+  def lon(self) -> jnp.ndarray:
+    lon, _ = cartesian_to_lon_sin_lat(self.cartesian)
+    return lon
+
+  @property
+  def sin_lat(self) -> jnp.ndarray:
+    _, sin_lat = cartesian_to_lon_sin_lat(self.cartesian)
+    return sin_lat
 
 
 def horizontal_departure_points(
@@ -815,10 +823,7 @@ def horizontal_departure_points(
     )(wind)
     departure = _normalize(arrival - angular_dt * wind_mid)
 
-  lon, sin_lat = cartesian_to_lon_sin_lat(departure)
-  return DeparturePoints(
-      lon=lon, sin_lat=sin_lat, cartesian=departure, sigma=None
-  )
+  return DeparturePoints(cartesian=departure, sigma=None)
 
 
 def departure_points_3d(
@@ -905,10 +910,7 @@ def departure_points_3d(
         sigma_arrival - dt * sigma_dot_mid, float(centers[0]), float(centers[-1])
     )
 
-  lon, sin_lat = cartesian_to_lon_sin_lat(departure)
-  return DeparturePoints(
-      lon=lon, sin_lat=sin_lat, cartesian=departure, sigma=sigma_departure
-  )
+  return DeparturePoints(cartesian=departure, sigma=sigma_departure)
 
 
 #  =============================================================================
@@ -1041,7 +1043,6 @@ def transport_wind(
     rotate: bool = True,
     planetary_rotation_rate: float | None = None,
     vertical_order: Literal['linear', 'cubic'] = 'linear',
-    limiter: str | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
   """Remaps horizontal winds to arrival points along 3-D trajectories.
 
@@ -1059,8 +1060,12 @@ def transport_wind(
     departure: 3-D departure points (with σ coordinates).
     vertical: vertical coordinates on which the winds live (anything with
       increasing `.centers` node values).
-    interpolator: interpolation rule (its grid and order are used; its own
-      limiter setting is ignored in favor of the explicit `limiter`).
+    interpolator: interpolation rule. Its limiter (if any) clips each
+      interpolated Cartesian component of the *relative* wind to its
+      bracketing-cell range, before parallel transport and before the
+      analytic planetary term is applied — the IFS operationally applies
+      quasi-monotone interpolation to momentum too. Adds diffusion on the
+      dynamics near sharp features.
     rotate: whether to parallel-transport interpolated vectors from the
       departure to the arrival tangent plane.
     planetary_rotation_rate: if not None, transport the planetary momentum
@@ -1072,17 +1077,10 @@ def transport_wind(
       steps. Note this makes transport affine rather than linear: the
       caller's (u, v) must carry the state winds with coefficient exactly
       one (see `SemiLagrangianImplicitExplicitODE.semi_lagrangian_transport`).
-    limiter: None (default) for unlimited wind interpolation, or
-      'quasi_monotone' to clip each interpolated Cartesian component of the
-      *relative* wind to its bracketing-cell range, before parallel
-      transport and before the analytic planetary term is applied — the
-      IFS operationally applies quasi-monotone interpolation to momentum
-      too. Adds diffusion on the dynamics near sharp features.
 
   Returns:
     Tuple (u, v) of transported winds at arrival points.
   """
-  _validate_limiter(limiter)
   if departure.sigma is None:
     raise ValueError('transport_wind requires 3-D departure points')
   grid = interpolator.grid
@@ -1096,7 +1094,7 @@ def transport_wind(
       sigma=departure.sigma,
       sigma_nodes=vertical.centers,
       order=interpolator.order,
-      limiter=limiter,
+      limiter=interpolator.limiter,
       vertical_order=vertical_order,
   )
   # vmap over the three Cartesian components: the stencil indices and
@@ -1115,7 +1113,6 @@ def transport_wind_2d(
     *,
     rotate: bool = True,
     planetary_rotation_rate: float | None = None,
-    limiter: str | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
   """Remaps horizontal winds along 2-D trajectories (see `transport_wind`).
 
@@ -1125,28 +1122,23 @@ def transport_wind_2d(
       latitude_nodes].
     v: nodal meridional wind, same shape as `u`.
     departure: horizontal departure points with fields shaped like `u`.
-    interpolator: interpolation rule (its grid and order are used; its own
-      limiter setting is ignored in favor of the explicit `limiter`).
+    interpolator: interpolation rule; its limiter applies to the wind
+      components (see `transport_wind`).
     rotate: whether to parallel-transport interpolated vectors from the
       departure to the arrival tangent plane.
     planetary_rotation_rate: if not None, transport the planetary momentum
       `v + 2Ω ✕ R` (see `transport_wind`).
-    limiter: wind-component limiter (see `transport_wind`).
 
   Returns:
     Tuple (u, v) of transported winds at arrival points.
   """
-  _validate_limiter(limiter)
   grid = interpolator.grid
-  component_interpolator = dataclasses.replace(interpolator, limiter=limiter)
   lon_mesh, sin_lat_mesh = grid.nodal_mesh
   wind = cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
   # vmap over the three Cartesian components: the stencil indices and
   # weights are computed once and the gathers batch into one.
   wind_departure = jax.vmap(
-      lambda component: component_interpolator(
-          component, departure.lon, departure.sin_lat
-      )
+      lambda component: interpolator(component, departure.lon, departure.sin_lat)
   )(wind)
   return _finish_wind_transport(
       wind_departure, departure, grid, rotate, planetary_rotation_rate

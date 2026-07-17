@@ -166,6 +166,26 @@ class SemiLagrangianImplicitExplicitODE:
         ' nonadvective_terms for the non-advective forcing.'
     )
 
+  @classmethod
+  def from_functions(
+      cls,
+      nonadvective_terms: PyTreeTermsFn,
+      implicit_terms: PyTreeTermsFn,
+      implicit_inverse: PyTreeInverseFn,
+      nodal_velocities: Callable[[PyTreeState], typing.Pytree],
+      departure_points: Callable[..., Any],
+      semi_lagrangian_transport: Callable[[PyTreeState, Any], PyTreeState],
+  ) -> SemiLagrangianImplicitExplicitODE:
+    """Constructs a `SemiLagrangianImplicitExplicitODE` with given methods."""
+    ode = cls()
+    ode.nonadvective_terms = nonadvective_terms
+    ode.implicit_terms = implicit_terms
+    ode.implicit_inverse = implicit_inverse
+    ode.nodal_velocities = nodal_velocities
+    ode.departure_points = departure_points
+    ode.semi_lagrangian_transport = semi_lagrangian_transport
+    return ode
+
   def nodal_velocities(self, state: PyTreeState) -> typing.Pytree:
     """Computes the velocities that define trajectories.
 
@@ -578,14 +598,14 @@ def compose_equations(
       return tree_map(
           lambda *args: sum([x for x in args if x is not None]), *tendencies)
 
-    composed = SemiLagrangianImplicitExplicitODE()
-    composed.nonadvective_terms = nonadvective_fn
-    composed.implicit_terms = base.implicit_terms
-    composed.implicit_inverse = base.implicit_inverse
-    composed.nodal_velocities = base.nodal_velocities
-    composed.departure_points = base.departure_points
-    composed.semi_lagrangian_transport = base.semi_lagrangian_transport
-    return composed
+    return SemiLagrangianImplicitExplicitODE.from_functions(
+        nonadvective_terms=nonadvective_fn,
+        implicit_terms=base.implicit_terms,
+        implicit_inverse=base.implicit_inverse,
+        nodal_velocities=base.nodal_velocities,
+        departure_points=base.departure_points,
+        semi_lagrangian_transport=base.semi_lagrangian_transport,
+    )
 
   return ImplicitExplicitODE.from_functions(
       explicit_fn, implicit_explicit_equation.implicit_terms,

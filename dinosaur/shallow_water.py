@@ -367,7 +367,6 @@ class SemiLagrangianShallowWaterEquations(
         departure,
         interpolator,
         planetary_rotation_rate=self._planetary_rotation_rate,
-        limiter=interpolator.limiter,
     )
     nodal_potential = grid.to_nodal(state.potential)
     transported_potential = semi_lagrangian.transport_scalar_2d(
