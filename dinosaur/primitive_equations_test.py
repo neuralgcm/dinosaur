@@ -1211,7 +1211,9 @@ class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
         terrain_smoothed_log_sp=True,
     )
     lnps_nodal = grid.to_nodal(state0.log_surface_pressure)
-    psi = lnps_nodal + eq._log_sp_terrain_correction
+    psi = lnps_nodal + grid.to_nodal(
+        primitive_equations._log_sp_terrain_correction_modal(eq)
+    )
     # measured: 4.3e-3 raw vs 1.3e-4 smoothed (33x) for the 4 km mountain.
     self.assertLess(
         self._index_roughness(psi),
@@ -1952,7 +1954,7 @@ class SemiLagrangianHybridTest(parameterized.TestCase):
     )
     with self.subTest('vertical nodes match sigma levels'):
       np.testing.assert_allclose(
-          sl_hybrid._vertical_nodes.centers, sigma_levels.centers, atol=1e-6
+          sl_hybrid._reference_vertical_nodes.centers, sigma_levels.centers, atol=1e-6
       )
     with self.subTest('nodal velocities match'):
       v_sigma = sl_sigma.nodal_velocities(state)
