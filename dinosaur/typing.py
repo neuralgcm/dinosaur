@@ -68,7 +68,7 @@ class RandomnessState:
   nodal_value: Pytree | None = None
   modal_value: Pytree | None = None
   prng_key: PRNGKeyArray | None = None
-  prng_step: int | None = None
+  prng_step: int | Array | None = None
 
 
 @tree_math.struct

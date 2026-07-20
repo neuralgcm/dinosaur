@@ -62,12 +62,14 @@ einsum = functools.partial(jnp.einsum, precision=jax.lax.Precision.HIGHEST)
 class State:
   """Records the state of a system described by the primitive equations."""
 
-  vorticity: Array
-  divergence: Array
-  temperature_variation: Array
-  log_surface_pressure: Array
-  tracers: Mapping[str, Array] = dataclasses.field(default_factory=dict)
-  sim_time: float | None = None
+  vorticity: Array | jax.sharding.PartitionSpec
+  divergence: Array | jax.sharding.PartitionSpec
+  temperature_variation: Array | jax.sharding.PartitionSpec
+  log_surface_pressure: Array | jax.sharding.PartitionSpec
+  tracers: Mapping[str, Array | jax.sharding.PartitionSpec] = dataclasses.field(
+      default_factory=dict
+  )
+  sim_time: float | Array | jax.sharding.PartitionSpec | None = None
 
 
 def _asdict(state: State) -> dict[str, Any]:
@@ -1567,7 +1569,7 @@ def compute_diagnostic_state_hybrid(
   # Hybrid vertical velocity / mass flux calculation.
   nodal_surface_pressure = jnp.exp(to_nodal_fn(state.log_surface_pressure))
   delta_p = coords.vertical.layer_thickness(nodal_surface_pressure)  # pyrefly: ignore[missing-attribute]
-  delta_b = coords.vertical.sigma_thickness[:, np.newaxis, np.newaxis]
+  delta_b = coords.vertical.sigma_thickness[:, np.newaxis, np.newaxis]  # pyrefly: ignore[missing-attribute]
 
   # D_k = div(v * dp) = dp * div(v) + v . grad(dp)
   # grad(dp) = grad(da + db * ps) = db * ps * grad(ln ps)
@@ -1582,7 +1584,7 @@ def compute_diagnostic_state_hybrid(
     cumsum_d = jax_numpy_utils.cumsum(d_k, axis=0)
     # pad top with 0
     cumsum_d_padded = jnp.pad(cumsum_d, ((1, 0), (0, 0), (0, 0)))
-    b_boundaries = coords.vertical.b_boundaries[:, np.newaxis, np.newaxis]
+    b_boundaries = coords.vertical.b_boundaries[:, np.newaxis, np.newaxis]  # pyrefly: ignore[missing-attribute]
     return -cumsum_d_padded + b_boundaries * sum_d
 
   mass_flux_full = compute_mass_flux(d_k_full)
@@ -1985,11 +1987,11 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
       raise ValueError('`reference_surface_pressure` must be positive.')
     self._nondim_reference_surface_pressure = nondim_reference_surface_pressure
     nondim_a_boundaries = self.physics_specs.nondimensionalize(
-        self.coords.vertical.a_boundaries * self.hpa_quantity
+        self.coords.vertical.a_boundaries * self.hpa_quantity  # pyrefly: ignore[missing-attribute]
     )
     self.nondim_levels = hybrid_coordinates.HybridCoordinates(
         a_boundaries=nondim_a_boundaries,  # pyrefly: ignore[bad-argument-type]
-        b_boundaries=self.coords.vertical.b_boundaries,
+        b_boundaries=self.coords.vertical.b_boundaries,  # pyrefly: ignore[missing-attribute]
     )
     nondim_coords = dataclasses.replace(
         self.coords,

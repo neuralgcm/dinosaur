@@ -236,7 +236,7 @@ class HeldSuarezForcingHybrid(time_integration.ExplicitODE):
     nodal_surface_pressure = jnp.exp(nodal_log_surface_pressure)
 
     # Pressure at layer centers, with shape (levels, latitude, longitude)
-    pressure = self.nondim_coords.vertical.pressure_centers(
+    pressure = self.nondim_coords.vertical.pressure_centers(  # pyrefly: ignore[missing-attribute]
         nodal_surface_pressure
     )
 
