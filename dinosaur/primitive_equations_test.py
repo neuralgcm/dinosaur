@@ -1950,8 +1950,11 @@ class SemiLagrangianHybridTest(parameterized.TestCase):
     step_dry = jax.jit(
         time_integration.semi_lagrangian_crank_nicolson_rk2(dry, dt)
     )
+    # moist and dry steps are separately compiled programs, so float32
+    # reassociation differs with the XLA version (measured max 5.3e-6 on
+    # CI's linux wheels vs <1e-6 on macOS arm64).
     jax.tree.map(
-        lambda x, y: np.testing.assert_allclose(x, y, atol=1e-6),
+        lambda x, y: np.testing.assert_allclose(x, y, atol=2e-5),
         step_moist(state),
         step_dry(state),
     )
