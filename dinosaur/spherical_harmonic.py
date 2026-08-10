@@ -601,16 +601,30 @@ class FastSphericalHarmonics(SphericalHarmonics):
         inverse.astype(np.float32).reshape(shape),
     )
 
-  def _fourier_fft(self, wx: jax.Array) -> jax.Array:
+  @functools.cached_property
+  def _weighted_p(self) -> np.ndarray:
+    """Legendre coefficients with quadrature weights folded in.
+
+    The quadrature weights act per-latitude, so they commute with the Fourier
+    transform over longitude and can be absorbed into the Legendre transform.
+    This saves a full elementwise pass over nodal data in `transform` when
+    using the FFT path (with the matmul path, XLA fuses the weighting into
+    the Fourier matmul).
+    """
+    p = self.basis.p
+    w = self.basis.w
+    return p * w[np.newaxis, :, np.newaxis]
+
+  def _fourier_fft(self, x: jax.Array) -> jax.Array:
     """Forward Fourier transform via FFT, to the unstacked representation."""
     assert self.nodal_padding[0] == 0, 'FFT does not support nodal padding'
     num_m = self.modal_shape[0] // 2
     scale, _ = self._fft_scales
     with jax.named_scope('fwd_fourier_fft'):
-      freqs = jnp.fft.rfft(wx, axis=-2)[..., :num_m, :]
+      freqs = jnp.fft.rfft(x, axis=-2)[..., :num_m, :]
       return jnp.stack(
           [scale * freqs.real, -scale * freqs.imag], axis=-3
-      ).astype(wx.dtype)
+      ).astype(x.dtype)
 
   def _inverse_fourier_fft(self, x: jax.Array) -> jax.Array:
     """Inverse Fourier transform via FFT, from the unstacked representation."""
@@ -657,10 +671,16 @@ class FastSphericalHarmonics(SphericalHarmonics):
     mesh = self.spmd_mesh
     einsum_args = (self.reverse_einsum_arg_order, self.transform_precision)
 
-    x = w * x
     if self.fourier_method == 'fft':
+      # quadrature weights are folded into the Legendre coefficients
       x = self._fourier_fft(x)
-    elif self.stacked_fourier_transforms:
+      x = jax.named_call(_transform_einsum, name='fwd_legendre')(
+          'mjl,...smj->...sml', self._weighted_p, x, mesh, *einsum_args
+      )
+      return _stack_m(x, mesh)
+
+    x = w * x
+    if self.stacked_fourier_transforms:
       x = jax.named_call(_transform_einsum, name='fwd_fourier')(
           'ism,...ij->...smj', f, x, mesh, *einsum_args
       )
