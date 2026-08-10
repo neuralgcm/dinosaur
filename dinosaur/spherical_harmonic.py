@@ -429,7 +429,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
   base_shape_multiple: int | None = None
   reverse_einsum_arg_order: bool | None = None
   stacked_fourier_transforms: bool | None = None
-  transform_precision: str = 'tensorfloat32'
+  transform_precision: str | jax.lax.DotAlgorithmPreset = 'tensorfloat32'
   fourier_method: Literal['matmul', 'fft'] = 'matmul'
 
   def __post_init__(self):
