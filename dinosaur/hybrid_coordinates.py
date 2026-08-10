@@ -193,7 +193,7 @@ def centered_difference(
   dx_axes = range(dx.ndim)
   inv_dη = 1 / coordinates.center_to_center
   inv_dη_axes = [dx_axes[axis]]
-  return einsum(dx, dx_axes, inv_dη, inv_dη_axes, dx_axes, precision=None)
+  return einsum(dx, dx_axes, inv_dη, inv_dη_axes, dx_axes)
 
 
 @jax.named_call

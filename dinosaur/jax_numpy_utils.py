@@ -127,12 +127,21 @@ def _single_device_dot_cumsum(
   w = op(i, j).astype(np.float32)
   out_axes = list(range(x.ndim))
   out_axes[axis] = x.ndim
-  return precise_einsum(
+  # Request the bf16 6-pass algorithm on every platform: the binary matrix is
+  # exact in bfloat16, and on TPU v5e this measures faster (53us at T170
+  # shapes) than both Precision.HIGHEST (69us) and the historical per-operand
+  # ('bfloat16', 'highest') tuple (57us). resolve_dot_precision still falls
+  # back to HIGHEST for float64 inputs and pre-Ampere GPUs.
+  precision = resolve_dot_precision(
+      None, w, x, float32_algorithm=FLOAT32_DOT_ALGORITHM
+  )
+  return jnp.einsum(
       w.astype(x.dtype),
       [axis, x.ndim],
       x,
       list(range(x.ndim)),
       out_axes,
+      precision=precision,
   )
 
 
@@ -273,7 +282,7 @@ def _allgather_matmul_twoway(
     split_axis: int,
     axis_name: str | tuple[str, str],
     reverse_arg_order: bool = False,
-    precision: jax.lax.PrecisionLike = lax.Precision.HIGHEST,
+    precision: jax.lax.PrecisionLike = None,
 ) -> jax.Array:
   """All-gather matmul using two way communication.
 
@@ -289,7 +298,8 @@ def _allgather_matmul_twoway(
     axis_name: name of the axis to reduce along.
     reverse_arg_order: whether to reverse the order of arguments when calling
       einsum on chunks.
-    precision: floating point precision to use for einsum.
+    precision: floating point precision to use for einsum; None resolves
+      to an explicit choice like `precise_einsum`.
 
   Returns:
     Result of einsum operation.
@@ -352,7 +362,7 @@ def _matmul_reducescatter_twoway(
     scatter_axis: int,
     axis_name: str | tuple[str, str],
     reverse_arg_order: bool = False,
-    precision: jax.lax.PrecisionLike = lax.Precision.HIGHEST,
+    precision: jax.lax.PrecisionLike = None,
 ) -> jax.Array:
   """All-gather matmul using two way communication.
 
@@ -368,7 +378,8 @@ def _matmul_reducescatter_twoway(
     axis_name: name of the axis to reduce along.
     reverse_arg_order: whether to reverse the order of arguments when calling
       einsum on chunks.
-    precision: floating point precision to use for einsum.
+    precision: floating point precision to use for einsum; None resolves
+      to an explicit choice like `precise_einsum`.
 
   Returns:
     Result of einsum operation.
@@ -483,7 +494,7 @@ def sharded_einsum(
     *,
     gather_inputs: bool | None = None,
     reverse_arg_order: bool = False,
-    precision: jax.lax.PrecisionLike = lax.Precision.HIGHEST,
+    precision: jax.lax.PrecisionLike = None,
     mesh: jax.sharding.Mesh | None,
     rhs_spec: jax.sharding.PartitionSpec,
     out_spec: jax.sharding.PartitionSpec,
@@ -507,7 +518,8 @@ def sharded_einsum(
     reverse_arg_order: if True, call einsum on each chunk like `einsum(..., rhs,
       lhs)` instead of `einsum(..., lhs, rhs)`. This results in different XLA
       optimizations and can occasionally be somewhat faster.
-    precision: floating point precision to use for einsum.
+    precision: floating point precision to use for einsum; None resolves
+      to an explicit choice like `precise_einsum`.
     mesh: parallel mesh to use for implementing this operation, or `None`, which
       indicates no sharding.
     rhs_spec: sharding spec for `rhs`.
@@ -519,6 +531,7 @@ def sharded_einsum(
   """
   all_subscripts = _parse_einsum_subscripts(subscripts)
   lhs_subscripts, rhs_subscripts, out_subscripts = all_subscripts
+  precision = resolve_dot_precision(precision, lhs, rhs)
 
   if mesh is None:
     # validation complete; calculate non-sharded einsum if no mesh supplied
