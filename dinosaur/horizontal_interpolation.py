@@ -278,7 +278,7 @@ class ConservativeRegridder(Regridder):
         lon_weights,
         lat_weights,
         field,
-        precision='float32',
+        precision=jax.lax.Precision.HIGHEST,
     )
 
   def __call__(self, field: typing.Array) -> jnp.ndarray:

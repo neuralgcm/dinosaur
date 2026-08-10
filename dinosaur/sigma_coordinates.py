@@ -34,7 +34,7 @@ import numpy as np
 Array = typing.Array
 
 # All `einsum`s should be done at highest available precision.
-einsum = functools.partial(jnp.einsum, precision=lax.Precision.HIGHEST)
+einsum = jax_numpy_utils.precise_einsum
 
 
 def _slice_shape_along_axis(
@@ -195,7 +195,7 @@ def centered_difference(
   dx_axes = range(dx.ndim)
   inv_d𝜎 = 1 / coordinates.center_to_center
   inv_d𝜎_axes = [dx_axes[axis]]
-  return einsum(dx, dx_axes, inv_d𝜎, inv_d𝜎_axes, dx_axes, precision='float32')  # pytype: disable=bad-return-type
+  return einsum(dx, dx_axes, inv_d𝜎, inv_d𝜎_axes, dx_axes, precision=None)  # pytype: disable=bad-return-type
 
 
 @jax.named_call

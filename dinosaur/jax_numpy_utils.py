@@ -29,6 +29,42 @@ import numpy as np
 # pylint: disable=logging-fstring-interpolation
 
 
+# The strongest dot algorithm supported by dense matrix multiplication on all
+# of CPU, GPU and TPU: 6-pass bfloat16 emulation, which matches float32
+# accuracy. TPUs do not support F32_F32_F32, and on GPU plain float32 runs on
+# CUDA cores at a fraction of tensor core throughput.
+FLOAT32_DOT_ALGORITHM = lax.DotAlgorithmPreset.BF16_BF16_F32_X6
+
+
+def resolve_dot_precision(
+    precision: jax.lax.PrecisionLike,
+    *operands,
+    float32_algorithm: lax.DotAlgorithmPreset = FLOAT32_DOT_ALGORITHM,
+) -> jax.lax.PrecisionLike:
+  """Resolves `precision=None` to an explicit, platform-independent choice.
+
+  Explicit dot algorithms guarantee consistent accuracy across platforms,
+  but they pin operand types, so they only apply to float32 inputs: float64
+  inputs (e.g., with x64 enabled) would be silently demoted. Non-float32
+  inputs instead use Precision.HIGHEST, which is dtype-relative.
+  """
+  if precision is not None:
+    return precision
+  arrays = [
+      x for x in operands
+      if hasattr(x, 'dtype') or isinstance(x, (int, float, complex))
+  ]
+  if jnp.result_type(*arrays) == jnp.float32:
+    return float32_algorithm
+  return jax.lax.Precision.HIGHEST
+
+
+def precise_einsum(*args, precision: jax.lax.PrecisionLike = None, **kwargs):
+  """einsum with a platform-independent explicit precision by default."""
+  precision = resolve_dot_precision(precision, *args)
+  return jnp.einsum(*args, precision=precision, **kwargs)
+
+
 @jax.named_call
 def _single_device_dot_cumsum(
     x: jax.Array, axis: int, reverse: bool = False
@@ -46,13 +82,12 @@ def _single_device_dot_cumsum(
   w = op(i, j).astype(np.float32)
   out_axes = list(range(x.ndim))
   out_axes[axis] = x.ndim
-  return jnp.einsum(
-      w,
+  return precise_einsum(
+      w.astype(x.dtype),
       [axis, x.ndim],
       x,
       list(range(x.ndim)),
       out_axes,
-      precision=('bfloat16', 'highest'),
   )
 
 
@@ -193,7 +228,7 @@ def _allgather_matmul_twoway(
     split_axis: int,
     axis_name: str | tuple[str, str],
     reverse_arg_order: bool = False,
-    precision: str = 'float32',
+    precision: jax.lax.PrecisionLike = lax.Precision.HIGHEST,
 ) -> jax.Array:
   """All-gather matmul using two way communication.
 
@@ -272,7 +307,7 @@ def _matmul_reducescatter_twoway(
     scatter_axis: int,
     axis_name: str | tuple[str, str],
     reverse_arg_order: bool = False,
-    precision: str = 'float32',
+    precision: jax.lax.PrecisionLike = lax.Precision.HIGHEST,
 ) -> jax.Array:
   """All-gather matmul using two way communication.
 
@@ -403,7 +438,7 @@ def sharded_einsum(
     *,
     gather_inputs: bool | None = None,
     reverse_arg_order: bool = False,
-    precision: str = 'float32',
+    precision: jax.lax.PrecisionLike = lax.Precision.HIGHEST,
     mesh: jax.sharding.Mesh | None,
     rhs_spec: jax.sharding.PartitionSpec,
     out_spec: jax.sharding.PartitionSpec,

@@ -21,6 +21,7 @@ import functools
 from typing import Sequence
 
 from dinosaur import coordinate_systems
+from dinosaur import jax_numpy_utils
 from dinosaur import scales
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
@@ -45,7 +46,7 @@ SCALE = scales.DEFAULT_SCALE
 
 
 # All `einsum`s should be done at highest available precision.
-einsum = functools.partial(jnp.einsum, precision=jax.lax.Precision.HIGHEST)
+einsum = jax_numpy_utils.precise_einsum
 
 #  =============================================================================
 #  Data Structures

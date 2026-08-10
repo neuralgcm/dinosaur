@@ -66,7 +66,7 @@ def _dot_interp(x, xp, fp):
   weights = w_left * (i == (u - 1)) + w_right * (i == u)
   weights = jnp.where(x < xp[0], i == 0, weights)
   weights = jnp.where(x > xp[-1], i == (n - 1), weights)
-  return jnp.dot(weights, fp, precision='highest')
+  return jnp.dot(weights, fp, precision=jax.lax.Precision.HIGHEST)
 
 
 @jax.jit
@@ -116,7 +116,7 @@ def linear_interp_with_linear_extrap(
   u = jnp.searchsorted(xp, x, side='right', method='compare_all')
   u = jnp.clip(u, 1, n - 1)
   weights = w_left * (i == (u - 1)) + w_right * (i == u)
-  return jnp.dot(weights, fp, precision='highest')
+  return jnp.dot(weights, fp, precision=jax.lax.Precision.HIGHEST)
 
 
 # TODO(shoyer): add higher order interpolation schemes, e.g., with splines.
@@ -391,7 +391,7 @@ def regrid_hybrid_to_sigma(
       )
     hybrid_bounds = hybrid_coords.get_sigma_boundaries(surface_pressure)
     weights = conservative_regrid_weights(hybrid_bounds, sigma_bounds)
-    result = jnp.einsum('ab,b->a', weights, field, precision='float32')
+    result = jnp.einsum('ab,b->a', weights, field, precision=jax.lax.Precision.HIGHEST)
     assert result.shape[0] == sigma_coords.layers
     return result
 
@@ -431,7 +431,7 @@ def regrid_hybrid_to_hybrid(
     weights = conservative_regrid_weights(
         source_pressure_bounds, target_pressure_bounds
     )
-    result = jnp.einsum('ab,b->a', weights, field_1d, precision='float32')
+    result = jnp.einsum('ab,b->a', weights, field_1d, precision=jax.lax.Precision.HIGHEST)
     return result
 
   return pytree_utils.tree_map_over_nonscalars(

@@ -31,7 +31,7 @@ import numpy as np
 
 
 Array = typing.Array
-einsum = functools.partial(jnp.einsum, precision=lax.Precision.HIGHEST)
+einsum = jax_numpy_utils.precise_einsum
 # For consistency with commonly accepted notation, we use Greek letters within
 # some of the functions below.
 # pylint: disable=invalid-name
@@ -193,7 +193,7 @@ def centered_difference(
   dx_axes = range(dx.ndim)
   inv_dη = 1 / coordinates.center_to_center
   inv_dη_axes = [dx_axes[axis]]
-  return einsum(dx, dx_axes, inv_dη, inv_dη_axes, dx_axes, precision='float32')
+  return einsum(dx, dx_axes, inv_dη, inv_dη_axes, dx_axes, precision=None)
 
 
 @jax.named_call

@@ -36,8 +36,15 @@ Array = typing.Array
 ArrayOrArrayTuple = typing.ArrayOrArrayTuple
 
 
-# All `einsum`s should be done at highest available precision.
-einsum = functools.partial(jnp.einsum, precision=jax.lax.Precision.HIGHEST)
+einsum = jax_numpy_utils.precise_einsum
+
+# The default algorithm for spherical harmonic transform matmuls: 3-pass
+# bfloat16 emulation (~2^-21 relative error), which is supported on CPU, GPU
+# and TPU, and runs on tensor cores / MXU at a fraction of the cost of full
+# float32 emulation. On TPU this matches the historical behavior of
+# Precision.HIGH; on GPU it is far more accurate than the historical
+# single-pass tensorfloat32.
+TRANSFORM_DOT_ALGORITHM = jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3
 
 
 LATITUDE_SPACINGS = dict(
@@ -367,9 +374,12 @@ def _transform_einsum(
     rhs: jax.Array,
     mesh: jax.sharding.Mesh | None,
     reverse_einsum_arg_order: bool | None,
-    precision: str,
+    precision: jax.lax.PrecisionLike,
 ) -> jax.Array:
   """einsum for calculating Fourier and Legendre transforms."""
+  precision = jax_numpy_utils.resolve_dot_precision(
+      precision, lhs, rhs, float32_algorithm=TRANSFORM_DOT_ALGORITHM
+  )
   if mesh is None:
     return jnp.einsum(subscripts, lhs, rhs, precision=precision)
 
@@ -429,7 +439,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
   base_shape_multiple: int | None = None
   reverse_einsum_arg_order: bool | None = None
   stacked_fourier_transforms: bool | None = None
-  transform_precision: str | jax.lax.DotAlgorithmPreset = 'tensorfloat32'
+  transform_precision: jax.lax.PrecisionLike = None
   fourier_method: Literal['matmul', 'fft'] = 'matmul'
 
   def __post_init__(self):
