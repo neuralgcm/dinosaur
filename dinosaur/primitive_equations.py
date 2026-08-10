@@ -44,7 +44,6 @@ Quantity = typing.Quantity
 OrographyInitFn = Callable[..., Array]
 
 
-# All `einsum`s should be done at highest available precision.
 einsum = jax_numpy_utils.precise_einsum
 
 # For consistency with commonly accepted notation, we use Greek letters within

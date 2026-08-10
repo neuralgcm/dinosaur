@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import dataclasses
-import functools
 from typing import Sequence
 
 from dinosaur import coordinate_systems
@@ -45,7 +44,6 @@ StepFn = typing.StepFn
 SCALE = scales.DEFAULT_SCALE
 
 
-# All `einsum`s should be done at highest available precision.
 einsum = jax_numpy_utils.precise_einsum
 
 #  =============================================================================
