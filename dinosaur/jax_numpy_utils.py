@@ -53,6 +53,24 @@ def _gpu_supports_bf16_dot_algorithms() -> bool:
     return False
 
 
+# The legacy precision strings 'tensorfloat32', 'bfloat16_3x' and 'high' are
+# all aliases for Precision.HIGH, whose meaning is backend-dependent: 3-pass
+# bfloat16 emulation on TPU but single-pass tensorfloat32 (10-bit mantissa,
+# ~50x less accurate) on GPU. Downstream users (e.g., NeuralGCM) wrote these
+# strings on TPU expecting bfloat16_3x semantics, so resolve them to the
+# explicit algorithm their names promise on every platform. 'bfloat16' is
+# likewise mapped to true single-pass bfloat16 rather than backend-dependent
+# Precision.DEFAULT. Dtype-relative values ('float32', 'highest', 'default',
+# 'fastest', per-operand tuples) pass through unchanged.
+_LEGACY_PRECISION_ALIASES = {
+    'high': lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
+    'tensorfloat32': lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
+    'bfloat16_3x': lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
+    lax.Precision.HIGH: lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
+    'bfloat16': lax.DotAlgorithmPreset.BF16_BF16_F32,
+}
+
+
 def resolve_dot_precision(
     precision: jax.lax.PrecisionLike,
     *operands,
@@ -60,6 +78,11 @@ def resolve_dot_precision(
     lhs_exact_in_bf16: bool = False,
 ) -> jax.lax.PrecisionLike:
   """Resolves `precision=None` to an explicit precision choice.
+
+  Legacy precision strings that name a specific algorithm ('tensorfloat32',
+  'bfloat16_3x', 'high', 'bfloat16') are normalized to the explicit dot
+  algorithm their names promise, so they behave identically on all platforms
+  (see `_LEGACY_PRECISION_ALIASES`).
 
   Explicit dot algorithms pin operand types, so they only apply to float32
   inputs: float64 inputs (e.g., with x64 enabled) would be silently demoted.
@@ -82,6 +105,11 @@ def resolve_dot_precision(
   bf16/tf32 algorithms (defaulted or explicitly requested) are downgraded to
   Precision.HIGHEST there.
   """
+  if isinstance(precision, (str, lax.Precision)):
+    precision = _LEGACY_PRECISION_ALIASES.get(
+        precision.lower() if isinstance(precision, str) else precision,
+        precision,
+    )
   if precision is None:
     arrays = [x for x in operands if hasattr(x, 'dtype')]
     if jnp.result_type(*arrays) == jnp.float32:
