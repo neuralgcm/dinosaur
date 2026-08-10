@@ -19,7 +19,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from dinosaur import associated_legendre
 from dinosaur import fourier
@@ -430,7 +430,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
   reverse_einsum_arg_order: bool | None = None
   stacked_fourier_transforms: bool | None = None
   transform_precision: str = 'tensorfloat32'
-  fourier_method: str = 'matmul'
+  fourier_method: Literal['matmul', 'fft'] = 'matmul'
 
   def __post_init__(self):
     model_parallelism = self.spmd_mesh is not None and any(
@@ -461,6 +461,11 @@ class FastSphericalHarmonics(SphericalHarmonics):
       if self.fourier_method == 'fft':
         stack = False
       object.__setattr__(self, 'stacked_fourier_transforms', stack)
+    elif self.stacked_fourier_transforms and self.fourier_method == 'fft':
+      raise ValueError(
+          'stacked_fourier_transforms=True is incompatible with '
+          'fourier_method="fft"'
+      )
 
   @functools.cached_property
   def nodal_limits(self) -> tuple[int, int]:
