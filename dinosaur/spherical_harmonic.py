@@ -430,11 +430,19 @@ class FastSphericalHarmonics(SphericalHarmonics):
   reverse_einsum_arg_order: bool | None = None
   stacked_fourier_transforms: bool | None = None
   transform_precision: str = 'tensorfloat32'
+  fourier_method: str = 'matmul'
 
   def __post_init__(self):
     model_parallelism = self.spmd_mesh is not None and any(
         self.spmd_mesh.shape[dim] > 1 for dim in 'zxy'
     )
+
+    if self.fourier_method not in ('matmul', 'fft'):
+      raise ValueError(f'unknown {self.fourier_method=}')
+    if self.fourier_method == 'fft' and model_parallelism:
+      raise NotImplementedError(
+          'fourier_method="fft" does not support model parallelism'
+      )
 
     if self.base_shape_multiple is None:
       shape_multiple = 8 if model_parallelism else 1
@@ -450,6 +458,8 @@ class FastSphericalHarmonics(SphericalHarmonics):
       unstacked_matmuls = math.ceil(self.longitude_wavenumbers / 128)
       stacked_matmuls = 2 * math.ceil(self.longitude_wavenumbers / 256)
       stack = stacked_matmuls <= unstacked_matmuls
+      if self.fourier_method == 'fft':
+        stack = False
       object.__setattr__(self, 'stacked_fourier_transforms', stack)
 
   @functools.cached_property
@@ -568,6 +578,50 @@ class FastSphericalHarmonics(SphericalHarmonics):
 
     return _SphericalHarmonicBasis(f=f, p=p, w=w)
 
+  @functools.cached_property
+  def _fft_scales(self) -> tuple[np.ndarray, np.ndarray]:
+    """Scale factors relating rfft coefficients to the real basis.
+
+    In the "unstacked" modal representation, the cos/sin coefficient pair for
+    wavenumber m equals (Re, -Im) of the complex rfft coefficient, up to the
+    normalization of the real basis functions (unit L² norm on [0, 2π]).
+    """
+    num_m = self.modal_shape[0] // 2
+    m = np.arange(num_m)
+    forward = np.where(m == 0, 1 / np.sqrt(2 * np.pi), 1 / np.sqrt(np.pi))
+    # structural zeros for padded wavenumber columns
+    forward = np.where(m < self.longitude_wavenumbers, forward, 0.0)
+    nodes = self.longitude_nodes
+    inverse = np.where(
+        m == 0, nodes / np.sqrt(2 * np.pi), nodes / (2 * np.sqrt(np.pi))
+    )
+    shape = (num_m, 1)  # broadcast against trailing latitude axis
+    return (
+        forward.astype(np.float32).reshape(shape),
+        inverse.astype(np.float32).reshape(shape),
+    )
+
+  def _fourier_fft(self, wx: jax.Array) -> jax.Array:
+    """Forward Fourier transform via FFT, to the unstacked representation."""
+    assert self.nodal_padding[0] == 0, 'FFT does not support nodal padding'
+    num_m = self.modal_shape[0] // 2
+    scale, _ = self._fft_scales
+    with jax.named_scope('fwd_fourier_fft'):
+      freqs = jnp.fft.rfft(wx, axis=-2)[..., :num_m, :]
+      return jnp.stack(
+          [scale * freqs.real, -scale * freqs.imag], axis=-3
+      ).astype(wx.dtype)
+
+  def _inverse_fourier_fft(self, x: jax.Array) -> jax.Array:
+    """Inverse Fourier transform via FFT, from the unstacked representation."""
+    assert self.nodal_padding[0] == 0, 'FFT does not support nodal padding'
+    _, scale = self._fft_scales
+    with jax.named_scope('inv_fourier_fft'):
+      coefficients = scale * jax.lax.complex(x[..., 0, :, :], -x[..., 1, :, :])
+      return jnp.fft.irfft(
+          coefficients, n=self.longitude_nodes, axis=-2
+      ).astype(x.dtype)
+
   def inverse_transform(self, x):
     p = self.basis.p
     f = self.basis.f
@@ -581,9 +635,11 @@ class FastSphericalHarmonics(SphericalHarmonics):
     x = jax.named_call(_transform_einsum, name='inv_legendre')(
         'mjl,...sml->...smj', p, x, mesh, *einsum_args
     )
-    if self.stacked_fourier_transforms:
-      # note: explicit matrix multiplication seems to be faster than using an
-      # explicit FFT at the resolutions we use.
+    if self.fourier_method == 'fft':
+      x = self._inverse_fourier_fft(x)
+    elif self.stacked_fourier_transforms:
+      # note: on TPU, explicit matrix multiplication seems to be faster than
+      # using an explicit FFT at the resolutions we use.
       x = jax.named_call(_transform_einsum, name='inv_fourier')(
           'ism,...smj->...ij', f, x, mesh, *einsum_args
       )
@@ -602,7 +658,9 @@ class FastSphericalHarmonics(SphericalHarmonics):
     einsum_args = (self.reverse_einsum_arg_order, self.transform_precision)
 
     x = w * x
-    if self.stacked_fourier_transforms:
+    if self.fourier_method == 'fft':
+      x = self._fourier_fft(x)
+    elif self.stacked_fourier_transforms:
       x = jax.named_call(_transform_einsum, name='fwd_fourier')(
           'ism,...ij->...smj', f, x, mesh, *einsum_args
       )
