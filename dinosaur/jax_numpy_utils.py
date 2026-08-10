@@ -127,11 +127,12 @@ def _single_device_dot_cumsum(
   w = op(i, j).astype(np.float32)
   out_axes = list(range(x.ndim))
   out_axes[axis] = x.ndim
-  # Request the bf16 6-pass algorithm on every platform: the binary matrix is
-  # exact in bfloat16, and on TPU v5e this measures faster (53us at T170
-  # shapes) than both Precision.HIGHEST (69us) and the historical per-operand
-  # ('bfloat16', 'highest') tuple (57us). resolve_dot_precision still falls
-  # back to HIGHEST for float64 inputs and pre-Ampere GPUs.
+  # Request the bf16 6-pass algorithm on every platform. On TPU this compiles
+  # to a program byte-identical to Precision.HIGHEST and runs at the same
+  # speed as the historical per-operand ('bfloat16', 'highest') tuple
+  # (measured on v5e at layers up to 127); on Ampere+ GPUs it runs on tensor
+  # cores. resolve_dot_precision still falls back to HIGHEST for float64
+  # inputs and pre-Ampere GPUs.
   precision = resolve_dot_precision(
       None, w, x, float32_algorithm=FLOAT32_DOT_ALGORITHM
   )
