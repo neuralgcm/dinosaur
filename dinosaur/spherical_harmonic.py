@@ -44,7 +44,7 @@ einsum = jax_numpy_utils.precise_einsum
 # float32 emulation. On TPU this matches the historical behavior of
 # Precision.HIGH; on GPU it is far more accurate than the historical
 # single-pass tensorfloat32.
-TRANSFORM_DOT_ALGORITHM = jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3
+FAST_TRANSFORM_DOT_ALGORITHM = jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3
 
 
 LATITUDE_SPACINGS = dict(
@@ -395,7 +395,7 @@ def _transform_einsum(
 ) -> jax.Array:
   """einsum for calculating Fourier and Legendre transforms."""
   precision = jax_numpy_utils.resolve_dot_precision(
-      precision, lhs, rhs, float32_algorithm=TRANSFORM_DOT_ALGORITHM
+      precision, lhs, rhs, float32_algorithm=FAST_TRANSFORM_DOT_ALGORITHM
   )
   if mesh is None:
     return jnp.einsum(subscripts, lhs, rhs, precision=precision)
