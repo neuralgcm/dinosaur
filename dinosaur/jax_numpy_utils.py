@@ -36,6 +36,23 @@ import numpy as np
 FLOAT32_DOT_ALGORITHM = lax.DotAlgorithmPreset.BF16_BF16_F32_X6
 
 
+@functools.cache
+def _gpu_supports_bf16_dot_algorithms() -> bool:
+  """Whether GPU devices support the bfloat16 dot algorithm family.
+
+  bf16 (and tf32) dot algorithm presets require Ampere or newer GPUs;
+  pre-Ampere GPUs like the T4 (compute capability 7.5) reject them with
+  UNIMPLEMENTED errors.
+  """
+  capability = getattr(jax.devices()[0], 'compute_capability', None)
+  if capability is None:
+    return False
+  try:
+    return float(capability) >= 8.0
+  except ValueError:
+    return False
+
+
 def resolve_dot_precision(
     precision: jax.lax.PrecisionLike,
     *operands,
@@ -52,6 +69,10 @@ def resolve_dot_precision(
   (faster and more accurate than float32 there) and Precision.HIGHEST
   elsewhere: on TPU, mandating the explicit 6-pass algorithm measures ~50%
   slower per model step than the equivalent-accuracy Precision.HIGHEST.
+
+  Pre-Ampere GPUs reject the bf16 algorithm family outright, so they always
+  resolve to Precision.HIGHEST (plain float32 there), including when
+  `float32_algorithm` is set.
   """
   if precision is not None:
     return precision
@@ -60,9 +81,12 @@ def resolve_dot_precision(
       if hasattr(x, 'dtype') or isinstance(x, (int, float, complex))
   ]
   if jnp.result_type(*arrays) == jnp.float32:
+    is_gpu = jax.default_backend() == 'gpu'
+    if is_gpu and not _gpu_supports_bf16_dot_algorithms():
+      return jax.lax.Precision.HIGHEST
     if float32_algorithm is not None:
       return float32_algorithm
-    if jax.default_backend() == 'gpu':
+    if is_gpu:
       return FLOAT32_DOT_ALGORITHM
   return jax.lax.Precision.HIGHEST
 
