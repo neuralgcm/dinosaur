@@ -440,12 +440,22 @@ class FastSphericalHarmonics(SphericalHarmonics):
   reverse_einsum_arg_order: bool | None = None
   stacked_fourier_transforms: bool | None = None
   transform_precision: jax.lax.PrecisionLike = None
-  fourier_method: Literal['matmul', 'fft'] = 'matmul'
+  fourier_method: Literal['matmul', 'fft'] | None = None
 
   def __post_init__(self):
     model_parallelism = self.spmd_mesh is not None and any(
         self.spmd_mesh.shape[dim] > 1 for dim in 'zxy'
     )
+
+    if self.fourier_method is None:
+      # cuFFT wins over the explicit DFT matmul on GPU; on TPU the matmul is
+      # ~3x faster (measured at T170 on A100/H100 vs TPU v5e).
+      method = (
+          'fft'
+          if self.spmd_mesh is None and jax.default_backend() == 'gpu'
+          else 'matmul'
+      )
+      object.__setattr__(self, 'fourier_method', method)
 
     if self.fourier_method not in ('matmul', 'fft'):
       raise ValueError(f'unknown {self.fourier_method=}')

@@ -218,6 +218,12 @@ class GridTest(parameterized.TestCase):
     reconstructed_modal = transform(nodal)
     np.testing.assert_allclose(modal, reconstructed_modal, atol=1e-5)
 
+  def testFourierMethodDefaultResolution(self):
+    """The default fourier_method resolves per backend (matmul off-GPU)."""
+    harmonics = spherical_harmonic.FastSphericalHarmonics(32, 33, 96, 48)
+    expected = 'fft' if jax.default_backend() == 'gpu' else 'matmul'
+    self.assertEqual(harmonics.fourier_method, expected)
+
   @parameterized.product(
       wavenumbers=(32, 137),
       latitude_spacing=('gauss', 'equiangular'),
