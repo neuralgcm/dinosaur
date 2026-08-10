@@ -34,7 +34,6 @@ class ResolveDotPrecisionTest(parameterized.TestCase):
       ('tensorfloat32', jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3),
       ('bfloat16_3x', jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3),
       ('high', jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3),
-      (jax.lax.Precision.HIGH, jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3),
       ('bfloat16', jax.lax.DotAlgorithmPreset.BF16_BF16_F32),
       ('highest', 'highest'),
       ('float32', 'float32'),

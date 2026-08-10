@@ -66,7 +66,6 @@ _LEGACY_PRECISION_ALIASES = {
     'high': lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
     'tensorfloat32': lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
     'bfloat16_3x': lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
-    lax.Precision.HIGH: lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
     'bfloat16': lax.DotAlgorithmPreset.BF16_BF16_F32,
 }
 
@@ -105,11 +104,8 @@ def resolve_dot_precision(
   bf16/tf32 algorithms (defaulted or explicitly requested) are downgraded to
   Precision.HIGHEST there.
   """
-  if isinstance(precision, (str, lax.Precision)):
-    precision = _LEGACY_PRECISION_ALIASES.get(
-        precision.lower() if isinstance(precision, str) else precision,
-        precision,
-    )
+  if isinstance(precision, str):
+    precision = _LEGACY_PRECISION_ALIASES.get(precision.lower(), precision)
   if precision is None:
     arrays = [x for x in operands if hasattr(x, 'dtype')]
     if jnp.result_type(*arrays) == jnp.float32:
