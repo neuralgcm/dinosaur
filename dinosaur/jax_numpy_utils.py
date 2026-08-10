@@ -73,6 +73,19 @@ def precise_einsum(*args, precision: jax.lax.PrecisionLike = None, **kwargs):
   return jnp.einsum(*args, precision=precision, **kwargs)
 
 
+def precise_dot(
+    a: jax.Array, b: jax.Array, *, precision: jax.lax.PrecisionLike = None
+) -> jax.Array:
+  """jnp.dot with precision resolved like `precise_einsum`.
+
+  Matrix-vector shaped products don't use tensor cores directly, but under
+  `vmap` they batch into matrix-matrix products, so they get the same
+  precision treatment as einsums (verified supported by XLA:GPU for
+  matvec/GEMV shapes; non-GPU backends resolve to Precision.HIGHEST).
+  """
+  return jnp.dot(a, b, precision=resolve_dot_precision(precision, a, b))
+
+
 @jax.named_call
 def _single_device_dot_cumsum(
     x: jax.Array, axis: int, reverse: bool = False
