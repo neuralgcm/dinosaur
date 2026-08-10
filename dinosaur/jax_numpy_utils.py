@@ -29,24 +29,29 @@ import numpy as np
 # pylint: disable=logging-fstring-interpolation
 
 
-# The strongest dot algorithm supported by dense matrix multiplication on all
-# of CPU, GPU and TPU: 6-pass bfloat16 emulation, which matches float32
-# accuracy. TPUs do not support F32_F32_F32, and on GPU plain float32 runs on
-# CUDA cores at a fraction of tensor core throughput.
+# On GPU, 6-pass bfloat16 emulation is both faster (tensor cores) and more
+# accurate (exact bf16 x bf16 products, i.e., compensated arithmetic) than
+# plain float32 matrix multiplication. Measured on A100/H100: ~5x smaller
+# error than float32 at ~0.8x the runtime.
 FLOAT32_DOT_ALGORITHM = lax.DotAlgorithmPreset.BF16_BF16_F32_X6
 
 
 def resolve_dot_precision(
     precision: jax.lax.PrecisionLike,
     *operands,
-    float32_algorithm: lax.DotAlgorithmPreset = FLOAT32_DOT_ALGORITHM,
+    float32_algorithm: lax.DotAlgorithmPreset | None = None,
 ) -> jax.lax.PrecisionLike:
-  """Resolves `precision=None` to an explicit, platform-independent choice.
+  """Resolves `precision=None` to an explicit precision choice.
 
-  Explicit dot algorithms guarantee consistent accuracy across platforms,
-  but they pin operand types, so they only apply to float32 inputs: float64
-  inputs (e.g., with x64 enabled) would be silently demoted. Non-float32
-  inputs instead use Precision.HIGHEST, which is dtype-relative.
+  Explicit dot algorithms pin operand types, so they only apply to float32
+  inputs: float64 inputs (e.g., with x64 enabled) would be silently demoted.
+  Non-float32 inputs use Precision.HIGHEST, which is dtype-relative.
+
+  If `float32_algorithm` is provided, it is used for float32 inputs on every
+  platform. Otherwise float32 inputs resolve to BF16_BF16_F32_X6 on GPU
+  (faster and more accurate than float32 there) and Precision.HIGHEST
+  elsewhere: on TPU, mandating the explicit 6-pass algorithm measures ~50%
+  slower per model step than the equivalent-accuracy Precision.HIGHEST.
   """
   if precision is not None:
     return precision
@@ -55,7 +60,10 @@ def resolve_dot_precision(
       if hasattr(x, 'dtype') or isinstance(x, (int, float, complex))
   ]
   if jnp.result_type(*arrays) == jnp.float32:
-    return float32_algorithm
+    if float32_algorithm is not None:
+      return float32_algorithm
+    if jax.default_backend() == 'gpu':
+      return FLOAT32_DOT_ALGORITHM
   return jax.lax.Precision.HIGHEST
 
 
