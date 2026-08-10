@@ -75,8 +75,13 @@ class _SphericalHarmonicBasis:
     w: nodal quadrature weights.
   """
 
-  f: np.ndarray
-  p: np.ndarray
+  # The large Fourier and Legendre matrices are stored as jax (device) arrays
+  # because as of jax 0.11, jnp.einsum embeds a fresh copy of a numpy operand
+  # at every call site instead of deduplicating (~1.7GB of duplicated
+  # constants when lowering a T170 model step, versus ~50MB deduplicated);
+  # jax.Array operands are deduplicated by identity.
+  f: jax.Array
+  p: jax.Array
   w: np.ndarray
 
 
@@ -264,7 +269,10 @@ class RealSphericalHarmonics(SphericalHarmonics):
     # When m = 0, the associated Legendre polynomial is paired only with the
     # constant component of the Fourier matrix, so we only need one copy.
     p = p[1:]
-    return _SphericalHarmonicBasis(f=f, p=p, w=w)
+    # ensure_compile_time_eval yields concrete arrays even if the basis is
+    # first evaluated inside a traced function (caching a tracer would leak)
+    with jax.ensure_compile_time_eval():
+      return _SphericalHarmonicBasis(f=jnp.asarray(f), p=jnp.asarray(p), w=w)
 
   def inverse_transform(self, x):
     p = self.basis.p
@@ -601,7 +609,10 @@ class FastSphericalHarmonics(SphericalHarmonics):
     )
     p = np.pad(p, [(0, modal_pad_x // 2), (0, nodal_pad_y), (0, modal_pad_y)])
 
-    return _SphericalHarmonicBasis(f=f, p=p, w=w)
+    # ensure_compile_time_eval yields concrete arrays even if the basis is
+    # first evaluated inside a traced function (caching a tracer would leak)
+    with jax.ensure_compile_time_eval():
+      return _SphericalHarmonicBasis(f=jnp.asarray(f), p=jnp.asarray(p), w=w)
 
   @functools.cached_property
   def _fft_scales(self) -> tuple[np.ndarray, np.ndarray]:
@@ -627,7 +638,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
     )
 
   @functools.cached_property
-  def _weighted_p(self) -> np.ndarray:
+  def _weighted_p(self) -> jax.Array:
     """Legendre coefficients with quadrature weights folded in.
 
     The quadrature weights act per-latitude, so they commute with the Fourier
@@ -638,7 +649,8 @@ class FastSphericalHarmonics(SphericalHarmonics):
     """
     p = self.basis.p
     w = self.basis.w
-    return p * w[np.newaxis, :, np.newaxis]
+    with jax.ensure_compile_time_eval():
+      return p * w[np.newaxis, :, np.newaxis]
 
   def _fourier_fft(self, x: jax.Array) -> jax.Array:
     """Forward Fourier transform via FFT, to the unstacked representation."""
