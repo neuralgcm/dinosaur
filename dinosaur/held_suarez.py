@@ -157,7 +157,7 @@ class HeldSuarezForcingSigma(time_integration.ExplicitODE):
     divergence_tendency = self.coords.horizontal.div_cos_lat(velocity_tendency)
 
     # Zero log_surface_pressure tendency
-    log_surface_pressure_tendency = jnp.zeros_like(state.log_surface_pressure)
+    log_surface_pressure_tendency = jnp.zeros_like(state.log_surface_pressure)  # pyrefly: ignore[bad-argument-type]
 
     return primitive_equations.State(
         vorticity=vorticity_tendency,  # pyrefly: ignore[unexpected-keyword]
@@ -236,7 +236,7 @@ class HeldSuarezForcingHybrid(time_integration.ExplicitODE):
     nodal_surface_pressure = jnp.exp(nodal_log_surface_pressure)
 
     # Pressure at layer centers, with shape (levels, latitude, longitude)
-    pressure = self.nondim_coords.vertical.pressure_centers(
+    pressure = self.nondim_coords.vertical.pressure_centers(  # pyrefly: ignore[missing-attribute]
         nodal_surface_pressure
     )
 
@@ -279,7 +279,7 @@ class HeldSuarezForcingHybrid(time_integration.ExplicitODE):
     divergence_tendency = self.coords.horizontal.div_cos_lat(velocity_tendency)
 
     # Zero log_surface_pressure tendency
-    log_surface_pressure_tendency = jnp.zeros_like(state.log_surface_pressure)
+    log_surface_pressure_tendency = jnp.zeros_like(state.log_surface_pressure)  # pyrefly: ignore[bad-argument-type]
 
     return primitive_equations.State(
         vorticity=vorticity_tendency,  # pyrefly: ignore[unexpected-keyword]

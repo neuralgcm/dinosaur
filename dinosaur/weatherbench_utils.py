@@ -17,6 +17,7 @@
 import dataclasses
 
 from dinosaur import typing
+import jax
 import tree_math
 
 
@@ -27,6 +28,6 @@ class State:
   v: typing.Array
   t: typing.Array
   z: typing.Array
-  sim_time: float
+  sim_time: float | typing.Array | jax.sharding.PartitionSpec | None
   tracers: dict[str, typing.Array] = dataclasses.field(default_factory=dict)
   diagnostics: dict[str, typing.Array] = dataclasses.field(default_factory=dict)

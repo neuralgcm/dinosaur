@@ -62,12 +62,14 @@ einsum = functools.partial(jnp.einsum, precision=jax.lax.Precision.HIGHEST)
 class State:
   """Records the state of a system described by the primitive equations."""
 
-  vorticity: Array
-  divergence: Array
-  temperature_variation: Array
-  log_surface_pressure: Array
-  tracers: Mapping[str, Array] = dataclasses.field(default_factory=dict)
-  sim_time: float | None = None
+  vorticity: Array | jax.sharding.PartitionSpec
+  divergence: Array | jax.sharding.PartitionSpec
+  temperature_variation: Array | jax.sharding.PartitionSpec
+  log_surface_pressure: Array | jax.sharding.PartitionSpec
+  tracers: Mapping[str, Array | jax.sharding.PartitionSpec] = dataclasses.field(
+      default_factory=dict
+  )
+  sim_time: float | Array | jax.sharding.PartitionSpec | None = None
 
 
 def _asdict(state: State) -> dict[str, Any]:
@@ -92,29 +94,30 @@ def validate_state_shape(
     state: State, coords: coordinate_systems.CoordinateSystem
 ):
   """Validates that values in `state` have appropriate shapes."""
-  if state.vorticity.shape != coords.modal_shape:
+  if state.vorticity.shape != coords.modal_shape:  # pyrefly: ignore[missing-attribute]
     raise StateShapeError(
         f'Expected vorticity shape {coords.modal_shape}; '
         f'got shape {state.vorticity.shape}.'
     )
-  if state.divergence.shape != coords.modal_shape:
+  if state.divergence.shape != coords.modal_shape:  # pyrefly: ignore[missing-attribute]
     raise StateShapeError(
         f'Expected divergence shape {coords.modal_shape}; '
         f'got shape {state.divergence.shape}.'
     )
-  if state.temperature_variation.shape != coords.modal_shape:
+  if state.temperature_variation.shape != coords.modal_shape:  # pyrefly: ignore[missing-attribute]
     raise StateShapeError(
         f'Expected temperature_variation shape {coords.modal_shape}; '
         f'got shape {state.temperature_variation.shape}.'
     )
-  if state.log_surface_pressure.shape != coords.surface_modal_shape:
+  if state.log_surface_pressure.shape != coords.surface_modal_shape:  # pyrefly: ignore[missing-attribute]
     raise StateShapeError(
         f'Expected log_surface_pressure shape {coords.surface_modal_shape}; '
         f'got shape {state.log_surface_pressure.shape}.'
     )
   for tracer_name, array in state.tracers.items():
-    if array.shape[-3:] != coords.modal_shape:
+    if array.shape[-3:] != coords.modal_shape:  # pyrefly: ignore[missing-attribute]
       raise StateShapeError(
+          # pyrefly: ignore[missing-attribute]
           f'Expected tracer {tracer_name} shape {coords.modal_shape}; '
           f'got shape {array.shape}.'
       )
@@ -220,7 +223,7 @@ def compute_diagnostic_state_sigma(
       sigma_dot_explicit=sigma_dot_explicit,  # pyrefly: ignore[unexpected-keyword]
       sigma_dot_full=sigma_dot_full,  # pyrefly: ignore[unexpected-keyword]
       cos_lat_grad_log_sp=nodal_cos_lat_grad_log_sp,  # pyrefly: ignore[unexpected-keyword]
-      u_dot_grad_log_sp=nodal_u_dot_grad_log_sp,  # pyrefly: ignore[unexpected-keyword]
+      u_dot_grad_log_sp=nodal_u_dot_grad_log_sp,  # pyrefly: ignore[bad-argument-type, unexpected-keyword]
       tracers=tracers,  # pyrefly: ignore[unexpected-keyword]
   )
 
@@ -1212,23 +1215,23 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
       method = 'sparse' if mesh is not None and mesh.shape['z'] > 1 else 'dense'
 
     geopotential_diff = get_geopotential_diff_sigma(
-        state.temperature_variation,
+        state.temperature_variation,  # pyrefly: ignore[bad-argument-type]
         self.coords.vertical,  # pyrefly: ignore[bad-argument-type]
         self.physics_specs.R,
         method=method,
         sharding=self.coords.dycore_sharding,
     )
     rt_log_p = (
-        self.physics_specs.ideal_gas_constant
+        self.physics_specs.ideal_gas_constant  # pyrefly: ignore[unsupported-operation]
         * self.T_ref
         * state.log_surface_pressure
     )
-    vorticity_implicit = jnp.zeros_like(state.vorticity)
+    vorticity_implicit = jnp.zeros_like(state.vorticity)  # pyrefly: ignore[bad-argument-type]
     divergence_implicit = -self.coords.horizontal.laplacian(
         geopotential_diff + rt_log_p
     )
     temperature_variation_implicit = get_temperature_implicit_sigma(
-        state.divergence,
+        state.divergence,  # pyrefly: ignore[bad-argument-type]
         self.coords.vertical,  # pyrefly: ignore[bad-argument-type]
         self.reference_temperature,
         self.physics_specs.kappa,
@@ -1336,7 +1339,7 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
       # on TPUs.
       inverse = np.linalg.inv(implicit_matrix)
       assert not np.isnan(inverse).any()
-      stacked_state = jnp.concatenate([
+      stacked_state = jnp.concatenate([  # pyrefly: ignore[bad-argument-type]
           state.divergence,
           state.temperature_variation,
           state.log_surface_pressure,
@@ -1390,7 +1393,7 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
       λ = self.coords.horizontal.laplacian_eigenvalues
 
       gt = get_geopotential_diff_sigma(
-          state.temperature_variation,
+          state.temperature_variation,  # pyrefly: ignore[bad-argument-type]
           self.coords.vertical,  # pyrefly: ignore[bad-argument-type]
           self.physics_specs.R,
           method='sparse',
@@ -1402,7 +1405,7 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
           implicit_matrix[:, div, logp], state.log_surface_pressure
       )
       inverted_divergence = named_vertical_matvec('div_solve')(
-          div_inverse, state.divergence - div_from_temp - div_from_logp
+          div_inverse, state.divergence - div_from_temp - div_from_logp  # pyrefly: ignore[unsupported-operation]
       )
       HG = (
           implicit_matrix[:, temp_logp, div]
@@ -1411,7 +1414,7 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
       temp_logp_inverse = np.linalg.inv(np.eye(layers + 1) - HG)
 
       hd = -get_temperature_implicit_sigma(
-          state.divergence,
+          state.divergence,  # pyrefly: ignore[bad-argument-type]
           self.coords.vertical,  # pyrefly: ignore[bad-argument-type]
           self.reference_temperature,
           self.physics_specs.kappa,
@@ -1419,7 +1422,7 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
           sharding=self.coords.dycore_sharding,
       )
       temp_from_div = η * hd
-      temp_part = state.temperature_variation - temp_from_div
+      temp_part = state.temperature_variation - temp_from_div  # pyrefly: ignore[unsupported-operation]
 
       logp_from_div = named_vertical_matvec('logp_from_div')(
           implicit_matrix[:, logp, div], state.divergence
@@ -1567,7 +1570,7 @@ def compute_diagnostic_state_hybrid(
   # Hybrid vertical velocity / mass flux calculation.
   nodal_surface_pressure = jnp.exp(to_nodal_fn(state.log_surface_pressure))
   delta_p = coords.vertical.layer_thickness(nodal_surface_pressure)  # pyrefly: ignore[missing-attribute]
-  delta_b = coords.vertical.sigma_thickness[:, np.newaxis, np.newaxis]
+  delta_b = coords.vertical.sigma_thickness[:, np.newaxis, np.newaxis]  # pyrefly: ignore[missing-attribute]
 
   # D_k = div(v * dp) = dp * div(v) + v . grad(dp)
   # grad(dp) = grad(da + db * ps) = db * ps * grad(ln ps)
@@ -1582,7 +1585,7 @@ def compute_diagnostic_state_hybrid(
     cumsum_d = jax_numpy_utils.cumsum(d_k, axis=0)
     # pad top with 0
     cumsum_d_padded = jnp.pad(cumsum_d, ((1, 0), (0, 0), (0, 0)))
-    b_boundaries = coords.vertical.b_boundaries[:, np.newaxis, np.newaxis]
+    b_boundaries = coords.vertical.b_boundaries[:, np.newaxis, np.newaxis]  # pyrefly: ignore[missing-attribute]
     return -cumsum_d_padded + b_boundaries * sum_d
 
   mass_flux_full = compute_mass_flux(d_k_full)
@@ -1596,7 +1599,7 @@ def compute_diagnostic_state_hybrid(
       mass_flux_explicit=mass_flux_explicit,  # pyrefly: ignore[unexpected-keyword]
       mass_flux_full=mass_flux_full,  # pyrefly: ignore[unexpected-keyword]
       cos_lat_grad_log_sp=nodal_cos_lat_grad_log_sp,  # pyrefly: ignore[unexpected-keyword]
-      u_dot_grad_log_sp=nodal_u_dot_grad_log_sp,  # pyrefly: ignore[unexpected-keyword]
+      u_dot_grad_log_sp=nodal_u_dot_grad_log_sp,  # pyrefly: ignore[bad-argument-type, unexpected-keyword]
       tracers=tracers,  # pyrefly: ignore[unexpected-keyword]
       layer_pressure_thickness=delta_p,  # pyrefly: ignore[unexpected-keyword]
   )
@@ -1985,11 +1988,11 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
       raise ValueError('`reference_surface_pressure` must be positive.')
     self._nondim_reference_surface_pressure = nondim_reference_surface_pressure
     nondim_a_boundaries = self.physics_specs.nondimensionalize(
-        self.coords.vertical.a_boundaries * self.hpa_quantity
+        self.coords.vertical.a_boundaries * self.hpa_quantity  # pyrefly: ignore[missing-attribute]
     )
     self.nondim_levels = hybrid_coordinates.HybridCoordinates(
         a_boundaries=nondim_a_boundaries,  # pyrefly: ignore[bad-argument-type]
-        b_boundaries=self.coords.vertical.b_boundaries,
+        b_boundaries=self.coords.vertical.b_boundaries,  # pyrefly: ignore[missing-attribute]
     )
     nondim_coords = dataclasses.replace(
         self.coords,
@@ -2367,7 +2370,7 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
       method = 'sparse' if mesh is not None and mesh.shape['z'] > 1 else 'dense'
 
     geopotential_diff = get_geopotential_diff_hybrid(
-        state.temperature_variation,
+        state.temperature_variation,  # pyrefly: ignore[bad-argument-type]
         self.nondim_levels,
         self.physics_specs.R,
         self.p_s_ref,
@@ -2384,12 +2387,12 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
         pgf_lps_coeff[:, np.newaxis, np.newaxis] * state.log_surface_pressure
     )
 
-    vorticity_implicit = jnp.zeros_like(state.vorticity)
+    vorticity_implicit = jnp.zeros_like(state.vorticity)  # pyrefly: ignore[bad-argument-type]
     divergence_implicit = -self.coords.horizontal.laplacian(
         geopotential_diff + rt_log_p
     )
     temperature_variation_implicit = get_temperature_implicit_hybrid(
-        state.divergence,
+        state.divergence,  # pyrefly: ignore[bad-argument-type]
         self.nondim_levels,
         self.reference_temperature,
         self.physics_specs.kappa,
@@ -2498,7 +2501,7 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
     2. The Geopotential terms are handled in `explicit_terms` by adjusting the
        temperature passed to `get_geopotential_diff_hybrid`.
     """
-    return jnp.zeros_like(state.divergence)
+    return jnp.zeros_like(state.divergence)  # pyrefly: ignore[bad-argument-type]
 
   @jax.named_call
   def vorticity_tendency_due_to_humidity(
@@ -2515,7 +2518,7 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
     explicit, one implicit), so the interaction term q * T_{ref} is missed
     and must be added back explicitly.
     """
-    return jnp.zeros_like(state.vorticity)
+    return jnp.zeros_like(state.vorticity)  # pyrefly: ignore[bad-argument-type]
 
 
 ###############################################################################
