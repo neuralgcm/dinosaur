@@ -114,6 +114,413 @@ class ImplicitExplicitODE:
     return explicit_implicit_ode
 
 
+class SemiLagrangianImplicitExplicitODE:
+  """Describes a set of ODEs solved along semi-Lagrangian trajectories.
+
+  The structure of the equation is assumed to be:
+
+    DX/Dt = nonadvective_terms(X) + implicit_terms(X),  dr/dt = V(X)
+
+  where D/Dt is the material derivative along trajectories moving with the
+  velocities V. Unlike `ImplicitExplicitODE`, *all* advection is handled by
+  remapping fields along trajectories (`semi_lagrangian_transport`), and
+  the non-advective explicit forcing ("N" in the semi-Lagrangian
+  literature) is exposed as `nonadvective_terms`. `implicit_terms` and
+  `implicit_inverse` have the same meaning as on `ImplicitExplicitODE`,
+  which is deliberately *not* a base class: a semi-Lagrangian equation is
+  not usable where an Eulerian one is expected.
+
+  `explicit_terms` raises TypeError rather than being left undefined:
+  Eulerian steppers duck-type, and concrete equations also inherit an
+  Eulerian `explicit_terms` from their equation base class (e.g.
+  `PrimitiveEquationsSigma`), so without the explicit rejection an Eulerian
+  stepper handed a semi-Lagrangian equation would silently integrate
+  advection-free (or advection-doubled) dynamics.
+
+  Any `sim_time` field passes through transport untouched and keeps its
+  existing convention (`nonadvective_terms` contributes rate 1.0).
+  """
+
+  def nonadvective_terms(self, state: PyTreeState) -> PyTreeState:
+    """Evaluates the non-advective explicit tendencies ("N")."""
+    raise NotImplementedError
+
+  def implicit_terms(self, state: PyTreeState) -> PyTreeState:
+    """Evaluates implicit terms in the ODE."""
+    raise NotImplementedError
+
+  def implicit_inverse(
+      self, state: PyTreeState, step_size: float,
+  ) -> PyTreeState:
+    """Applies `(1 - step_size * implicit_terms)⁻¹` to `state`."""
+    raise NotImplementedError
+
+  def explicit_terms(self, state: PyTreeState) -> PyTreeState:
+    """Raises TypeError: see the class docstring."""
+    raise TypeError(
+        f'{type(self).__name__} is a semi-Lagrangian equation: advection is'
+        ' handled by transport along trajectories, so explicit_terms is'
+        ' disabled to prevent silently advection-free integration with'
+        ' Eulerian time steppers. Use a semi-Lagrangian stepper (e.g.'
+        ' semi_lagrangian_crank_nicolson_rk2 or semi_lagrangian_settls), or'
+        ' nonadvective_terms for the non-advective forcing.'
+    )
+
+  @classmethod
+  def from_functions(
+      cls,
+      nonadvective_terms: PyTreeTermsFn,
+      implicit_terms: PyTreeTermsFn,
+      implicit_inverse: PyTreeInverseFn,
+      nodal_velocities: Callable[[PyTreeState], typing.Pytree],
+      departure_points: Callable[..., Any],
+      semi_lagrangian_transport: Callable[[PyTreeState, Any], PyTreeState],
+  ) -> SemiLagrangianImplicitExplicitODE:
+    """Constructs a `SemiLagrangianImplicitExplicitODE` with given methods."""
+    ode = cls()
+    ode.nonadvective_terms = nonadvective_terms
+    ode.implicit_terms = implicit_terms
+    ode.implicit_inverse = implicit_inverse
+    ode.nodal_velocities = nodal_velocities
+    ode.departure_points = departure_points
+    ode.semi_lagrangian_transport = semi_lagrangian_transport
+    return ode
+
+  def nodal_velocities(self, state: PyTreeState) -> typing.Pytree:
+    """Computes the velocities that define trajectories.
+
+    Args:
+      state: the (modal) state.
+
+    Returns:
+      An equation-specific pytree of nodal velocities (e.g. horizontal winds
+      per level, vertical velocity, and the vertically averaged wind for the
+      continuity equation). Time steppers form linear combinations of these
+      pytrees (e.g. averaging velocities from two states), then pass them to
+      `departure_points`.
+    """
+    raise NotImplementedError
+
+  def departure_points(
+      self,
+      velocities: typing.Pytree,
+      dt: float,
+      initial_guess: Any | None = None,
+  ) -> Any:
+    """Solves for departure points of trajectories arriving at grid points.
+
+    Args:
+      velocities: velocities as returned by `nodal_velocities`.
+      dt: time step over which to integrate trajectories backwards.
+      initial_guess: optional previously computed departure points (in the
+        same equation-specific representation this method returns) used to
+        warm-start the fixed-point iteration, e.g. a predictor stage's or
+        the previous time step's solution.
+
+    Returns:
+      An equation-specific representation of departure points, passed on to
+      `semi_lagrangian_transport`.
+    """
+    raise NotImplementedError
+
+  def semi_lagrangian_transport(
+      self, state: PyTreeState, departure: Any
+  ) -> PyTreeState:
+    """Remaps a state-like pytree from departure to arrival points.
+
+    Applies `T_D[state]`: interpolates the advected representation of
+    `state` (the actual state, or a state-like linear combination of the
+    state and weighted tendencies) at the departure points.
+
+    Implementations need not be linear: equations that transport planetary
+    momentum add an analytic `2Ω✕R` term with a fixed unit coefficient.
+    Steppers must therefore only pass combinations of the form
+    `state + (weighted tendencies)` — carrying the state with coefficient
+    exactly one — and must not transport tendency-only combinations or
+    rescale transported results.
+
+    Args:
+      state: modal state-like pytree to transport.
+      departure: departure points from `departure_points`.
+
+    Returns:
+      The transported pytree, in the same (modal) representation.
+    """
+    raise NotImplementedError
+
+
+def semi_lagrangian_crank_nicolson_rk2(
+    equation: SemiLagrangianImplicitExplicitODE,
+    time_step: float,
+    off_centering: float = 0.0,
+    warm_start_corrector: bool = True,
+) -> TimeStepFn:
+  """Semi-Lagrangian time stepping via Crank-Nicolson and Heun's method.
+
+  This is the semi-Lagrangian lift of `crank_nicolson_rk2`: a two-stage,
+  one-step (self-starting) scheme, second order accurate in time. Stage 1
+  computes a predictor using trajectories from the current winds; stage 2
+  recomputes trajectories with time-centered winds `(V(x) + V(x*)) / 2` and
+  applies the trapezoidal semi-implicit semi-Lagrangian update, with
+  old-time-level terms interpolated at departure points and new-time-level
+  terms evaluated at arrival points:
+
+    x* = G⁻¹(T_D1[x + β·L(x) + dt·N(x)], α)
+    x' = G⁻¹(T_D2[x + β·(L(x) + N(x))] + α·N(x*), α)
+
+  where `T_D` denotes transport along trajectories, `G⁻¹(·, η) =
+  (1 - η·L)⁻¹` is the implicit inverse, `α = (1/2 + ε)·dt` and
+  `β = (1/2 - ε)·dt`.
+
+  With zero velocities (`T_D` the identity) and ε = 0 this reduces exactly
+  to `crank_nicolson_rk2`. Unlike the extrapolation-based two-time-level
+  schemes (SETTLS) used operationally, it requires no multistep memory, at
+  the cost of a second evaluation of the explicit terms and trajectories.
+
+  Args:
+    equation: equation to solve.
+    time_step: time step.
+    off_centering: optional off-centering (decentering) parameter ε ≥ 0,
+      shifting weight from the departure to the arrival side of the
+      trapezoidal rule — the standard remedy for orographic resonance in
+      semi-implicit semi-Lagrangian models. First-order accurate in the
+      ε-weighted terms; ε = 0 (default) is fully centered and second order.
+    warm_start_corrector: if True (default), the corrector stage's
+      departure-point iteration starts from the predictor stage's
+      departure points instead of the arrival points — the within-step
+      analogue of the warm-started iteration adopted in IFS Cycle 48r1
+      (see `semi_lagrangian.horizontal_departure_points`). This makes the
+      equations' default single departure iteration about as accurate as
+      two cold iterations; if disabled, raise `departure_iterations` to
+      at least 2.
+
+  Returns:
+    Function that performs a time step.
+
+  References:
+    Diamantakis, M. The semi-Lagrangian technique in atmospheric modelling:
+    current status and future challenges. ECMWF Seminar on Numerical Methods
+    for Atmosphere and Ocean Modelling (2014).
+    Temperton, C., Hortal, M. & Simmons, A. A two-time-level semi-Lagrangian
+    global spectral model. Q. J. R. Meteorol. Soc. 127, 111-127 (2001).
+  """
+  dt = time_step
+  α = (0.5 + off_centering) * dt
+  β = (0.5 - off_centering) * dt
+
+  def step_fn(x0: PyTreeState) -> PyTreeState:
+    n0 = equation.nonadvective_terms(x0)
+    l0 = equation.implicit_terms(x0)
+    v0 = equation.nodal_velocities(x0)
+
+    # Stage 1 (predictor): first-order trajectories from current winds.
+    departure1 = equation.departure_points(v0, dt)
+    bracket1 = tree_map(lambda x, l, n: x + β * l + dt * n, x0, l0, n0)
+    x_star = equation.implicit_inverse(
+        equation.semi_lagrangian_transport(bracket1, departure1), α
+    )
+
+    # Stage 2 (corrector): time-centered trajectories and trapezoidal update.
+    v_star = equation.nodal_velocities(x_star)
+    v_mid = tree_map(lambda a, b: 0.5 * (a + b), v0, v_star)
+    guess = departure1 if warm_start_corrector else None
+    departure2 = equation.departure_points(v_mid, dt, initial_guess=guess)
+    n_star = equation.nonadvective_terms(x_star)
+    bracket2 = tree_map(lambda x, l, n: x + β * (l + n), x0, l0, n0)
+    transported = equation.semi_lagrangian_transport(bracket2, departure2)
+    combined = tree_map(lambda t, n: t + α * n, transported, n_star)
+    return equation.implicit_inverse(combined, α)
+
+  return step_fn
+
+
+def semi_lagrangian_settls(
+    equation: SemiLagrangianImplicitExplicitODE,
+    time_step: float,
+    warm_start_departures: bool = True,
+) -> TimeStepFn:
+  """Two-time-level SETTLS semi-Lagrangian stepper.
+
+  The Stable Extrapolation Two-Time-Level Scheme (Hortal 2002), the
+  configuration used operationally by ECMWF's IFS. Instead of recomputing
+  tendencies with a predictor (as `semi_lagrangian_crank_nicolson_rk2`
+  does), it carries the previous step's non-advective tendencies and
+  velocities and uses the stable two-term extrapolation:
+
+    x' = G⁻¹(T_D[x + (dt/2)·(L(x) + 2N(x) − N_prev)] + (dt/2)·N(x), dt/2)
+
+  halving the per-step cost — one tendency evaluation, one departure solve,
+  one transport, one implicit solve — at the price of multistep memory and
+  the residual extrapolation sensitivity that SETTLS manages but does not
+  eliminate.
+
+  Trajectories use the midpoint iteration of `departure_points` with winds
+  extrapolated to `t + dt/2` (`(3·V(x) − V_prev)/2`, as in Temperton et al.
+  2001), rather than Hortal's endpoint-form iteration, so the equation
+  interface is reused verbatim.
+
+  The step state is a tuple `(x, (N_prev, V_prev))`, or
+  `(x, (N_prev, V_prev, D_prev))` with `warm_start_departures=True`; build
+  the initial tuple with `semi_lagrangian_settls_init` (a self-starting RK2
+  bootstrap, with a matching flag), and adapt modal filters with
+  `settls_step_filter`.
+
+  Args:
+    equation: equation to solve.
+    time_step: time step.
+    warm_start_departures: if True (default), carry each step's departure
+      points and use them to warm-start the next step's iteration — the
+      approach adopted in IFS Cycle 48r1 (consecutive steps' departure
+      points differ only by O(dt²); see
+      `semi_lagrangian.horizontal_departure_points`). The carried
+      refinement compounds across steps, making the equations' default
+      single departure iteration about as accurate as two cold ones; if
+      disabled, raise `departure_iterations` to at least 2.
+
+  Returns:
+    Function mapping `(x, aux)` to the next `(x, aux)`.
+
+  References:
+    Hortal, M. The development and testing of a new two-time-level
+    semi-Lagrangian scheme (SETTLS) in the ECMWF forecast model.
+    Q. J. R. Meteorol. Soc. 128, 1671-1687 (2002).
+  """
+  dt = time_step
+
+  def step_fn(carry):
+    if warm_start_departures:
+      x, (n_prev, v_prev, dep_prev) = carry
+    else:
+      x, (n_prev, v_prev) = carry
+      dep_prev = None
+    n = equation.nonadvective_terms(x)
+    l = equation.implicit_terms(x)
+    v = equation.nodal_velocities(x)
+    v_mid = tree_map(lambda a, b: 1.5 * a - 0.5 * b, v, v_prev)
+    departure = equation.departure_points(v_mid, dt, initial_guess=dep_prev)
+    bracket = tree_map(
+        lambda xi, li, ni, pi: xi + 0.5 * dt * (li + 2 * ni - pi),
+        x,
+        l,
+        n,
+        n_prev,
+    )
+    transported = equation.semi_lagrangian_transport(bracket, departure)
+    combined = tree_map(lambda t, ni: t + 0.5 * dt * ni, transported, n)
+    x_next = equation.implicit_inverse(combined, 0.5 * dt)
+    if warm_start_departures:
+      return (x_next, (n, v, departure))
+    return (x_next, (n, v))
+
+  return step_fn
+
+
+def semi_lagrangian_settls_init(
+    equation: SemiLagrangianImplicitExplicitODE,
+    time_step: float,
+    warm_start_departures: bool = True,
+) -> TimeStepFn:
+  """Returns a function building the initial SETTLS step state.
+
+  Takes the first step with the self-starting
+  `semi_lagrangian_crank_nicolson_rk2` while recording the initial
+  tendencies and velocities, so no accuracy-degraded startup step is needed.
+
+  The bootstrap step is unfiltered: in pipelines that wrap
+  `semi_lagrangian_settls` with `step_with_filters`, apply the state filter
+  to the first element of the returned tuple manually if a filtered first
+  step matters.
+
+  Args:
+    equation: equation to solve.
+    time_step: time step.
+    warm_start_departures: must match the flag passed to
+      `semi_lagrangian_settls`. If True, the step state additionally
+      carries the departure points of trajectories arriving at `x1` (from
+      the initial winds `V(x0)`), warm-starting the first SETTLS step.
+
+  Returns:
+    Function mapping an initial state `x0` to the `(x1, (N(x0), V(x0)))`
+    tuple (plus carried departure points if warm-starting) consumed by
+    `semi_lagrangian_settls`.
+  """
+  rk2_step = semi_lagrangian_crank_nicolson_rk2(equation, time_step)
+
+  def init_fn(x0):
+    n0 = equation.nonadvective_terms(x0)
+    v0 = equation.nodal_velocities(x0)
+    if warm_start_departures:
+      dep0 = equation.departure_points(v0, time_step)
+      return (rk2_step(x0), (n0, v0, dep0))
+    return (rk2_step(x0), (n0, v0))
+
+  return init_fn
+
+
+def settls_step_filter(
+    state_filter: PyTreeStepFilterFn,
+) -> PyTreeStepFilterFn:
+  """Adapts a step filter to the `(x, aux)` step state of SETTLS.
+
+  The filter is applied to the state only; the carried tendencies and
+  velocities pass through unmodified (they are consumed once, at the next
+  step, and filtering them would double-filter the corresponding terms).
+  """
+
+  def _filter(u, u_next):
+    x_previous, _ = u
+    x, aux = u_next
+    return (state_filter(x_previous, x), aux)
+
+  return _filter
+
+
+@dataclasses.dataclass
+class TimeReversedSemiLagrangianODE(SemiLagrangianImplicitExplicitODE):
+  """A SemiLagrangianImplicitExplicitODE reversed in time.
+
+  In reversed time τ = -t, trajectories follow the negated velocities and
+  the material derivative of any transported quantity ψ satisfies
+  D̃ψ/D̃τ = -Dψ/Dt, so the reversed equation negates the non-advective and
+  implicit tendencies while reusing transport unchanged. In particular,
+  planetary-momentum transport (`v + 2Ω✕R`) remains correct: the analytic
+  planetary term depends only on position, and its along-trajectory
+  bookkeeping is the same along reversed trajectories.
+
+  Used for digital filter initialization, which integrates both forwards
+  and backwards over the filter window.
+  """
+
+  forward_eq: SemiLagrangianImplicitExplicitODE
+
+  def nonadvective_terms(self, state: PyTreeState) -> PyTreeState:
+    return tree_map(jnp.negative, self.forward_eq.nonadvective_terms(state))
+
+  def implicit_terms(self, state: PyTreeState) -> PyTreeState:
+    return tree_map(jnp.negative, self.forward_eq.implicit_terms(state))
+
+  def implicit_inverse(
+      self, state: PyTreeState, step_size: float,
+  ) -> PyTreeState:
+    return self.forward_eq.implicit_inverse(state, -step_size)
+
+  def nodal_velocities(self, state: PyTreeState) -> typing.Pytree:
+    return tree_map(jnp.negative, self.forward_eq.nodal_velocities(state))
+
+  def departure_points(
+      self,
+      velocities: typing.Pytree,
+      dt: float,
+      initial_guess: Any | None = None,
+  ) -> Any:
+    return self.forward_eq.departure_points(velocities, dt, initial_guess)
+
+  def semi_lagrangian_transport(
+      self, state: PyTreeState, departure: Any
+  ) -> PyTreeState:
+    return self.forward_eq.semi_lagrangian_transport(state, departure)
+
+
 @dataclasses.dataclass
 class TimeReversedImExODE(ImplicitExplicitODE):
   """An ImplicitExplicitODE reversed in time.
@@ -138,23 +545,67 @@ class TimeReversedImExODE(ImplicitExplicitODE):
     return self.forward_eq.implicit_inverse(state, -step_size)
 
 
+ImplicitExplicitODET = TypeVar(
+    'ImplicitExplicitODET',
+    ImplicitExplicitODE,
+    SemiLagrangianImplicitExplicitODE,
+)
+
+
 def compose_equations(
-    equations: Sequence[Union[ImplicitExplicitODE, ExplicitODE]],
-) -> ImplicitExplicitODE:
-  """Combines a `equations` with at-most one ImplicitExplicitODE instance."""
-  implicit_explicit_eqs = list(
-      filter(lambda x: isinstance(x, ImplicitExplicitODE), equations))
+    equations: Sequence[Union[ImplicitExplicitODET, ExplicitODE]],
+) -> ImplicitExplicitODET:
+  """Combines a `equations` with at-most one ImplicitExplicitODE instance.
+
+  If the ImplicitExplicitODE instance is a SemiLagrangianImplicitExplicitODE,
+  the composed equation is too, delegating trajectories and transport to it:
+  the explicit terms of the other equations are treated as additional
+  non-advective forcing.
+
+  All equations must return tendency pytrees with matching structure. In
+  particular, forcings that construct states with empty `tracers` (e.g.
+  `HeldSuarezForcingSigma`) fail loudly when composed over states carrying
+  tracers.
+  """
+  implicit_explicit_eqs = [
+      x
+      for x in equations
+      if isinstance(
+          x, (ImplicitExplicitODE, SemiLagrangianImplicitExplicitODE)
+      )
+  ]
   if len(implicit_explicit_eqs) != 1:
     raise ValueError('compose_equations supports at most 1 ImplicitExplicitODE '
                      f'got {len(implicit_explicit_eqs)}')
   (implicit_explicit_equation,) = implicit_explicit_eqs
-  assert isinstance(implicit_explicit_equation, ImplicitExplicitODE)
 
   def explicit_fn(x: PyTreeState) -> PyTreeState:
     explicit_tendencies = [fn.explicit_terms(x) for fn in equations]
     return tree_map(
         lambda *args: sum([x for x in args if x is not None]),
         *explicit_tendencies)
+
+  if isinstance(
+      implicit_explicit_equation, SemiLagrangianImplicitExplicitODE
+  ):
+    base = implicit_explicit_equation
+
+    def nonadvective_fn(x: PyTreeState) -> PyTreeState:
+      tendencies = [
+          base.nonadvective_terms(x) if fn is base else fn.explicit_terms(x)
+          for fn in equations
+      ]
+      return tree_map(
+          lambda *args: sum([x for x in args if x is not None]), *tendencies)
+
+    return SemiLagrangianImplicitExplicitODE.from_functions(
+        nonadvective_terms=nonadvective_fn,
+        implicit_terms=base.implicit_terms,
+        implicit_inverse=base.implicit_inverse,
+        nodal_velocities=base.nodal_velocities,
+        departure_points=base.departure_points,
+        semi_lagrangian_transport=base.semi_lagrangian_transport,
+    )
 
   return ImplicitExplicitODE.from_functions(
       explicit_fn, implicit_explicit_equation.implicit_terms,
@@ -672,7 +1123,7 @@ def _dfi_lanczos_weights(
 
 
 def digital_filter_initialization(
-    equation: ImplicitExplicitODE,
+    equation: Union[ImplicitExplicitODE, SemiLagrangianImplicitExplicitODE],
     ode_solver: Callable[[ImplicitExplicitODE, float], StateFn],
     filters: Sequence[PyTreeStepFilterFn],
     time_span: float,
@@ -683,7 +1134,9 @@ def digital_filter_initialization(
 
   Args:
     equation: equation to solve for forward dynamics. This equation must be
-      reversible (i.e., it should only include dynamics).
+      reversible (i.e., it should only include dynamics). Semi-Lagrangian
+      equations are supported (pass a semi-Lagrangian `ode_solver`, e.g.
+      `semi_lagrangian_crank_nicolson_rk2`).
     ode_solver: ODE solver to use for time-stepping.
     filters: sequence of filters to apply after each ODE step forward or
       backwards.
@@ -702,9 +1155,13 @@ def digital_filter_initialization(
     https://doi.org/10.1175/1520-0493(1992)120<1019:IOTHMU>2.0.CO;2
   """
   def f(state):
+    if isinstance(equation, SemiLagrangianImplicitExplicitODE):
+      reversed_equation = TimeReversedSemiLagrangianODE(equation)
+    else:
+      reversed_equation = TimeReversedImExODE(equation)
     forward_step = step_with_filters(ode_solver(equation, dt), filters)
     backward_step = step_with_filters(
-        ode_solver(TimeReversedImExODE(equation), dt), filters)
+        ode_solver(reversed_equation, dt), filters)
     # for times [1, ..., N] and [-1, ..., -N]
     weights = _dfi_lanczos_weights(time_span, cutoff_period, dt)
     init_weight = 1.0  # for time=0

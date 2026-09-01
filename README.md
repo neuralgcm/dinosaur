@@ -18,9 +18,16 @@ documenting.
 
 We currently have three notebooks illustrating how to use Dinosaur:
 
-- [Baroclinic instability](https://nbviewer.org/github/neuralgcm/dinosaur/blob/main/notebooks/baroclinic_instability.ipynb)
-- [Held-Suarez forcing](https://nbviewer.org/github/neuralgcm/dinosaur/blob/main/notebooks/held_suarez.ipynb)
-- [Weather forecast on ERA5](https://nbviewer.org/github/neuralgcm/dinosaur/blob/main/notebooks/weather_forecast_on_era5.ipynb)
+- [Baroclinic instability](https://nbviewer.org/github/neuralgcm/dinosaur/blob/main/notebooks/eulerian/baroclinic_instability.ipynb)
+- [Held-Suarez forcing](https://nbviewer.org/github/neuralgcm/dinosaur/blob/main/notebooks/eulerian/held_suarez.ipynb)
+- [Weather forecast on ERA5](https://nbviewer.org/github/neuralgcm/dinosaur/blob/main/notebooks/eulerian/weather_forecast_on_era5.ipynb)
+
+Each also has a [semi-Lagrangian](https://github.com/neuralgcm/dinosaur/tree/main/notebooks/semi_lagrangian)
+variant demonstrating semi-Lagrangian advection at 6-12x longer time steps:
+
+- [Baroclinic instability](https://nbviewer.org/github/neuralgcm/dinosaur/blob/main/notebooks/semi_lagrangian/baroclinic_instability.ipynb)
+- [Held-Suarez forcing](https://nbviewer.org/github/neuralgcm/dinosaur/blob/main/notebooks/semi_lagrangian/held_suarez.ipynb)
+- [Weather forecast on ERA5](https://nbviewer.org/github/neuralgcm/dinosaur/blob/main/notebooks/semi_lagrangian/weather_forecast_on_era5.ipynb)
 
 We recommend running them using [Google Colab](https://colab.research.google.com/) with a GPU runtime.
 You can also install Dinosaur locally: `pip install dinosaur`

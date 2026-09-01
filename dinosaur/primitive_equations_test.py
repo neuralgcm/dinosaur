@@ -11,15 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 import functools
 
 from absl.testing import absltest
 from absl.testing import parameterized
 from dinosaur import coordinate_systems
+from dinosaur import held_suarez
 from dinosaur import hybrid_coordinates
 from dinosaur import primitive_equations
 from dinosaur import primitive_equations_states
 from dinosaur import scales
+from dinosaur import semi_lagrangian
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
@@ -701,6 +704,1491 @@ class PrimitiveEquationsSigmaImplicitTest(parameterized.TestCase):
         tendencies_a,
         tendencies_b,
     )
+
+
+class ExplicitTermsSplitTest(parameterized.TestCase):
+  """Tests the advective/non-advective split of explicit tendencies."""
+
+  def _make_equation_and_state(
+      self,
+      humidity,
+      variable_t_ref,
+      clouds=False,
+      include_vertical_advection=True,
+  ):
+    physics_specs = units.SimUnits.from_si()
+    horizontal = spherical_harmonic.Grid.T21()
+    vertical = sigma_coordinates.SigmaCoordinates.equidistant(4)
+    coords = coordinate_systems.CoordinateSystem(horizontal, vertical)
+    initial_state_fn, aux_features = primitive_equations_states.steady_state_jw(
+        coords, physics_specs
+    )
+    modal_orography = primitive_equations.truncated_modal_orography(
+        aux_features[xarray_utils.OROGRAPHY], coords
+    )
+    state = initial_state_fn()
+    state = state + primitive_equations_states.baroclinic_perturbation_jw(
+        coords, physics_specs
+    )
+    state.sim_time = 0.0
+    state.tracers = {
+        'tracer': primitive_equations_states.gaussian_scalar(
+            coords, physics_specs
+        )
+    }
+    if humidity:
+      state.tracers['specific_humidity'] = (
+          primitive_equations_states.gaussian_scalar(
+              coords, physics_specs, amplitude=0.01
+          )
+      )
+    if clouds:
+      state.tracers['cloud_water'] = primitive_equations_states.gaussian_scalar(
+          coords, physics_specs, amplitude=0.001
+      )
+    if variable_t_ref:
+      ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
+    else:
+      ref_temps = 288.0 * np.ones(coords.vertical.layers)
+    primitive = primitive_equations.PrimitiveEquationsSigma(
+        ref_temps,
+        modal_orography,
+        coords,
+        physics_specs,
+        humidity_key='specific_humidity' if humidity else None,
+        cloud_keys=('cloud_water',) if clouds else None,
+        include_vertical_advection=include_vertical_advection,
+    )
+    return primitive, state
+
+  @parameterized.parameters(
+      dict(humidity=False, variable_t_ref=False),
+      dict(humidity=False, variable_t_ref=True),
+      dict(humidity=True, variable_t_ref=True),
+      dict(humidity=True, variable_t_ref=True, clouds=True),
+      dict(
+          humidity=False, variable_t_ref=True, include_vertical_advection=False
+      ),
+  )
+  def test_explicit_terms_split_reconstruction(self, **kwargs):
+    """Advective + non-advective terms must reconstruct explicit_terms."""
+    primitive, state = self._make_equation_and_state(**kwargs)
+    full = primitive.explicit_terms(state)
+    advective = primitive.explicit_advective_terms(state)
+    nonadvective = primitive.explicit_nonadvective_terms(state)
+    reconstructed = jax.tree.map(lambda x, y: x + y, advective, nonadvective)
+    # The only differences are floating point rounding from re-associated
+    # linear operations.
+    tol = dict(rtol=1e-4, atol=1e-6)
+    assert_states_close(full, reconstructed, **tol)
+    self.assertEqual(full.sim_time, 1.0)
+    self.assertEqual(advective.sim_time, 0.0)
+    self.assertEqual(nonadvective.sim_time, 1.0)
+
+  def test_nonadvective_terms_have_no_transport(self):
+    """Tracers and log surface pressure have zero non-advective tendencies."""
+    primitive, state = self._make_equation_and_state(
+        humidity=False, variable_t_ref=True
+    )
+    nonadvective = primitive.explicit_nonadvective_terms(state)
+    np.testing.assert_array_equal(
+        nonadvective.log_surface_pressure,
+        np.zeros_like(state.log_surface_pressure),
+    )
+    for name, tracer in nonadvective.tracers.items():
+      np.testing.assert_array_equal(
+          tracer, np.zeros_like(state.tracers[name]), err_msg=name
+      )
+
+  def test_nodal_velocities(self):
+    """Checks shapes and consistency of nodal velocities."""
+    primitive, state = self._make_equation_and_state(
+        humidity=False, variable_t_ref=True
+    )
+    coords = primitive.coords
+    velocities = primitive.nodal_velocities(state)
+    layers = coords.vertical.layers
+    self.assertEqual(velocities.u.shape, coords.nodal_shape)
+    self.assertEqual(velocities.v.shape, coords.nodal_shape)
+    self.assertEqual(
+        velocities.sigma_dot.shape,
+        (layers + 1,) + coords.horizontal.nodal_shape,
+    )
+    self.assertEqual(velocities.u_mean.shape, coords.surface_nodal_shape)
+    self.assertEqual(velocities.v_mean.shape, coords.surface_nodal_shape)
+    # winds match the standard modal-to-nodal conversion.
+    u_expected, v_expected = spherical_harmonic.vor_div_to_uv_nodal(
+        coords.horizontal, state.vorticity, state.divergence, clip=False
+    )
+    np.testing.assert_allclose(velocities.u, u_expected, atol=1e-6)
+    np.testing.assert_allclose(velocities.v, v_expected, atol=1e-6)
+    # sigma_dot vanishes at the top and bottom boundaries.
+    np.testing.assert_array_equal(
+        velocities.sigma_dot[0], np.zeros_like(velocities.sigma_dot[0])
+    )
+    np.testing.assert_array_equal(
+        velocities.sigma_dot[-1], np.zeros_like(velocities.sigma_dot[-1])
+    )
+    # vertical mean matches explicit integration.
+    np.testing.assert_allclose(
+        velocities.u_mean,
+        sigma_coordinates.sigma_integral(velocities.u, coords.vertical),
+        atol=1e-6,
+    )
+
+  @parameterized.parameters(dict(humidity=False), dict(humidity=True))
+  def test_nonadvective_terms_affine_in_winds(self, humidity):
+    """Pins the classification: N must be affine in (ζ, δ).
+
+    At fixed (T', ln pₛ, tracers), every non-advective term is affine in the
+    winds: Coriolis is linear, the explicit PGF/orography/humidity corrections
+    are constant, and the adiabatic and T_ref source terms are linear (via
+    σ̇ and ω/p). Advective terms like ζ(k ✕ v) are quadratic, so accidentally
+    classifying one as non-advective fails this test.
+    """
+    primitive, state = self._make_equation_and_state(
+        humidity=humidity, variable_t_ref=True
+    )
+
+    def with_winds(factor):
+      return state.replace(
+          vorticity=factor * state.vorticity,
+          divergence=factor * state.divergence,
+      )
+
+    n0 = primitive.explicit_nonadvective_terms(with_winds(0.0))
+    n1 = primitive.explicit_nonadvective_terms(with_winds(1.0))
+    n2 = primitive.explicit_nonadvective_terms(with_winds(2.0))
+    lhs = jax.tree.map(lambda a, b: a - b, n2, n0)
+    rhs = jax.tree.map(lambda a, b: 2 * (a - b), n1, n0)
+    assert_states_close(lhs, rhs, rtol=1e-4, atol=1e-6)
+
+  @parameterized.parameters(dict(humidity=False), dict(humidity=True))
+  def test_advective_terms_scaling_in_winds(self, humidity):
+    """Pins the classification: advection scales polynomially in (ζ, δ).
+
+    At fixed (T', ln pₛ, tracers), scaling the winds by 2 scales momentum
+    advection (vorticity flux, kinetic energy, vertical advection) by 4 and
+    scalar advection (T', ln pₛ, tracers) by 2, and all advective terms
+    vanish for zero winds. Non-advective terms like Coriolis (2✕), the
+    pressure gradient, orography or wind-independent humidity corrections
+    (1✕) would break these scalings.
+    """
+    primitive, state = self._make_equation_and_state(
+        humidity=humidity, variable_t_ref=True
+    )
+
+    def with_winds(factor):
+      return state.replace(
+          vorticity=factor * state.vorticity,
+          divergence=factor * state.divergence,
+      )
+
+    a0 = primitive.explicit_advective_terms(with_winds(0.0))
+    a1 = primitive.explicit_advective_terms(with_winds(1.0))
+    a2 = primitive.explicit_advective_terms(with_winds(2.0))
+    with self.subTest('vanishes for zero winds'):
+      for name in ['vorticity', 'divergence', 'temperature_variation',
+                   'log_surface_pressure']:
+        np.testing.assert_array_equal(
+            getattr(a0, name), np.zeros_like(getattr(a0, name)), err_msg=name
+        )
+      for name, tracer in a0.tracers.items():
+        np.testing.assert_array_equal(
+            tracer, np.zeros_like(tracer), err_msg=name
+        )
+    tol = dict(rtol=1e-4, atol=1e-6)
+    with self.subTest('momentum advection is quadratic'):
+      np.testing.assert_allclose(a2.vorticity, 4 * a1.vorticity, **tol)
+      np.testing.assert_allclose(a2.divergence, 4 * a1.divergence, **tol)
+    with self.subTest('scalar advection is linear'):
+      np.testing.assert_allclose(
+          a2.temperature_variation, 2 * a1.temperature_variation, **tol
+      )
+      np.testing.assert_allclose(
+          a2.log_surface_pressure, 2 * a1.log_surface_pressure, **tol
+      )
+      for name in a1.tracers:
+        np.testing.assert_allclose(
+            a2.tracers[name], 2 * a1.tracers[name], err_msg=name, **tol
+        )
+
+
+class SemiLagrangianPrimitiveEquationsTest(parameterized.TestCase):
+  """Tests for the semi-Lagrangian primitive equations (dry, sigma)."""
+
+  def setUp(self):
+    # Some test modules (e.g. time_integration_test) enable x64 globally at
+    # import time, which leaks into full-suite runs. These tests are
+    # calibrated in float32, and test_time_step_extension pins the *onset*
+    # of an Eulerian instability, which shifts with precision.
+    super().setUp()
+    self._x64_was_enabled = jax.config.jax_enable_x64
+    jax.config.update('jax_enable_x64', False)
+
+  def tearDown(self):
+    jax.config.update('jax_enable_x64', self._x64_was_enabled)
+    super().tearDown()
+
+  def _setup(self, grid, layers=8, perturbation=False, **kwargs):
+    physics_specs = units.SimUnits.from_si()
+    vertical = sigma_coordinates.SigmaCoordinates.equidistant(layers)
+    coords = coordinate_systems.CoordinateSystem(grid, vertical)
+    init_fn, aux_features = primitive_equations_states.steady_state_jw(
+        coords, physics_specs
+    )
+    state = init_fn()
+    if perturbation:
+      state = state + primitive_equations_states.baroclinic_perturbation_jw(
+          coords, physics_specs
+      )
+    orography = primitive_equations.truncated_modal_orography(
+        aux_features[xarray_utils.OROGRAPHY], coords
+    )
+    ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
+    equation = primitive_equations.SemiLagrangianPrimitiveEquations(
+        ref_temps, orography, coords, physics_specs, **kwargs
+    )
+    eulerian = primitive_equations.PrimitiveEquationsSigma(
+        ref_temps, orography, coords, physics_specs
+    )
+    return equation, eulerian, state
+
+  def _nondim_minutes(self, physics_specs, minutes):
+    return float(physics_specs.nondimensionalize(minutes * 60 * s_units.s))
+
+  def _l2(self, grid, x, y):
+    x, y = grid.to_nodal(x), grid.to_nodal(y)
+    return float(np.sqrt(np.square(x - y).sum() / np.square(y).sum()))
+
+  @parameterized.parameters(
+      dict(coriolis_mode='planetary_momentum'),
+      dict(coriolis_mode='explicit'),
+  )
+  def test_jw_steady_state_remains_steady(self, coriolis_mode):
+    """The JW steady state stays steady over a day of 30-minute steps.
+
+    This is a sensitive test of the vector transport + pressure-gradient
+    residual split: any misclassified momentum term unbalances the jet.
+    """
+    equation, eulerian, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), coriolis_mode=coriolis_mode
+    )
+    del eulerian  # unused
+    grid = equation.coords.horizontal
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    step_fn = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+    )
+    final = time_integration.repeated(step_fn, 48)(state0)
+    # measured drift ~1.1e-3, comparable to the Eulerian core at dt=10min
+    # (1.3e-3); dominated by the T21 spatial truncation of the initial
+    # balance, not by time stepping.
+    self.assertLess(
+        self._l2(
+            grid, final.temperature_variation, state0.temperature_variation
+        ),
+        3e-3,
+    )
+    max_divergence = np.abs(grid.to_nodal(final.divergence)).max()
+    self.assertLess(float(max_divergence), 2e-2)
+
+  def test_baroclinic_wave_consistency_with_eulerian(self):
+    """SL at dt=30min tracks the Eulerian core at dt=10min."""
+    equation, eulerian, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True
+    )
+    grid = equation.coords.horizontal
+    physics_specs = equation.physics_specs
+    sl_final = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(
+                equation, self._nondim_minutes(physics_specs, 30)
+            )
+        ),
+        48,
+    )(state0)
+    eulerian_final = time_integration.repeated(
+        jax.jit(
+            time_integration.imex_rk_sil3(
+                eulerian, self._nondim_minutes(physics_specs, 10)
+            )
+        ),
+        144,
+    )(state0)
+    # measured: T' 1.2e-3, ln(ps) 3.3e-6.
+    self.assertLess(
+        self._l2(
+            grid,
+            sl_final.temperature_variation,
+            eulerian_final.temperature_variation,
+        ),
+        5e-3,
+    )
+    self.assertLess(
+        self._l2(
+            grid,
+            sl_final.log_surface_pressure,
+            eulerian_final.log_surface_pressure,
+        ),
+        1e-4,
+    )
+
+  def _steep_mountain_setup(self):
+    """JW jet blowing over a 4 km mountain that is rough at truncation.
+
+    Returns (ref_temps, orography, coords, physics_specs, state0) with the
+    initial `ln pₛ` hydrostatically adjusted for the added mountain.
+    """
+    equation, _, state0 = self._setup(spherical_harmonic.Grid.T42())
+    coords = equation.coords
+    grid = coords.horizontal
+    physics_specs = equation.physics_specs
+    ref_temps = equation.reference_temperature
+    lon_mesh, sin_lat_mesh = grid.nodal_mesh
+    lat_mesh = np.arcsin(sin_lat_mesh)
+    lon0, lat0 = np.deg2rad(90.0), np.deg2rad(45.0)
+    angular_dist2 = (lon_mesh - lon0) ** 2 * np.cos(lat0) ** 2 + (
+        lat_mesh - lat0
+    ) ** 2
+    height = physics_specs.nondimensionalize(4000 * s_units.m)
+    # ~4 degree half-width vs ~2.8 degree grid spacing: strong power at
+    # the truncation scale, i.e. rough for the spectral representation.
+    bump_modal = grid.to_modal(
+        jnp.asarray(height * np.exp(-angular_dist2 / np.deg2rad(4.0) ** 2))
+    )
+    orography = equation.orography + bump_modal
+    lnps_adjustment = -(
+        physics_specs.g / (physics_specs.R * ref_temps[-1])
+    ) * grid.to_nodal(bump_modal)
+    state0.log_surface_pressure = grid.to_modal(
+        grid.to_nodal(state0.log_surface_pressure) + lnps_adjustment
+    )
+    return ref_temps, orography, coords, physics_specs, state0
+
+  @staticmethod
+  def _index_roughness(nodal):
+    """RMS second index-difference: grid-scale content of a nodal field."""
+    f = np.asarray(nodal).squeeze()
+    d2_lon = f - 0.5 * (np.roll(f, 1, 0) + np.roll(f, -1, 0))
+    d2_lat = f[:, 1:-1] - 0.5 * (f[:, 2:] + f[:, :-2])
+    return float(np.sqrt(np.mean(d2_lon[:, 1:-1] ** 2 + d2_lat**2)))
+
+  def test_limiter_bound_reference_constant_is_noop(self):
+    """A constant reference shifts both clip sides equally: exact no-op."""
+    grid = spherical_harmonic.Grid.T21()
+    vertical = sigma_coordinates.SigmaCoordinates.equidistant(8)
+    coords = coordinate_systems.CoordinateSystem(grid, vertical)
+    rng = np.random.RandomState(0)
+    field = jnp.asarray(rng.standard_normal((8,) + grid.nodal_shape))
+    u = jnp.asarray(0.3 * rng.standard_normal((8,) + grid.nodal_shape))
+    v = jnp.asarray(0.3 * rng.standard_normal((8,) + grid.nodal_shape))
+    sigma_dot = jnp.asarray(
+        0.2 * rng.standard_normal((9,) + grid.nodal_shape)
+    )
+    departure = semi_lagrangian.departure_points_3d(
+        u, v, sigma_dot, coords, dt=0.3
+    )
+    interpolator = semi_lagrangian.GridInterpolator(
+        grid, 'cubic', 'quasi_monotone'
+    )
+    base = semi_lagrangian.transport_scalar(
+        field, departure, vertical, interpolator
+    )
+    constant = semi_lagrangian.transport_scalar(
+        field, departure, vertical, interpolator,
+        limiter_bound_reference=jnp.full((8,), 7.5),
+    )
+    np.testing.assert_allclose(constant, base, atol=1e-5)
+    varying = semi_lagrangian.transport_scalar(
+        field, departure, vertical, interpolator,
+        limiter_bound_reference=jnp.linspace(0.0, 5.0, 8),
+    )
+    # a strongly varying profile moves the clip where vertical bracketing
+    # spans levels: results must differ somewhere.
+    self.assertGreater(
+        float(np.abs(np.asarray(varying) - np.asarray(base)).max()), 1e-6
+    )
+
+  def test_monotone_dynamics_consistency(self):
+    """Limited and unlimited dynamics agree on the baroclinic wave.
+
+    The quasi-monotone clip on winds, T′ and ln pₛ only engages near
+    sharp features, so at T21 the two configurations must stay close.
+    """
+    equation, _, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True
+    )
+    grid = equation.coords.horizontal
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    finals = {}
+    for monotone in (False, True):
+      eq = dataclasses.replace(equation, monotone_dynamics=monotone)
+      step = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(eq, dt)
+      )
+      finals[monotone] = time_integration.repeated(step, 24)(state0)
+      self.assertTrue(
+          np.isfinite(
+              grid.to_nodal(finals[monotone].temperature_variation)
+          ).all()
+      )
+    difference = self._l2(
+        grid,
+        finals[True].temperature_variation,
+        finals[False].temperature_variation,
+    )
+    self.assertLess(difference, 2e-2)
+    self.assertGreater(difference, 0.0)  # the limiter engages somewhere
+
+  def test_cubic_vertical_interpolation_consistency(self):
+    """Cubic and linear vertical transport agree on the baroclinic wave.
+
+    Vertical structures at T21L8 are well resolved, so the two vertical
+    orders must give nearby solutions; the difference measures the
+    vertical-interpolation diffusion that the cubic option removes.
+    """
+    equation, _, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True
+    )
+    grid = equation.coords.horizontal
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    finals = {}
+    for order in ('linear', 'cubic'):
+      eq = dataclasses.replace(
+          equation, vertical_interpolation_order=order
+      )
+      step = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(eq, dt)
+      )
+      finals[order] = time_integration.repeated(step, 24)(state0)
+      self.assertTrue(
+          np.isfinite(
+              grid.to_nodal(finals[order].temperature_variation)
+          ).all()
+      )
+    difference = self._l2(
+        grid,
+        finals['cubic'].temperature_variation,
+        finals['linear'].temperature_variation,
+    )
+    self.assertLess(difference, 2e-2)
+    self.assertGreater(difference, 0.0)  # the option changes the scheme
+
+  def test_terrain_smoothing_is_noop_over_flat_terrain(self):
+    """With zero orography the smoothed-variable path adds exact zeros."""
+    equation, _, state0 = self._setup(spherical_harmonic.Grid.T21())
+    flat = jnp.zeros_like(equation.orography)
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    finals = {}
+    for smoothed in (False, True):
+      eq = dataclasses.replace(
+          equation, orography=flat, terrain_smoothed_log_sp=smoothed
+      )
+      step = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(eq, dt)
+      )
+      finals[smoothed] = step(state0)
+    jax.tree.map(
+        lambda x, y: np.testing.assert_allclose(x, y, atol=1e-6),
+        finals[True],
+        finals[False],
+    )
+
+  def test_terrain_smoothed_variable_is_smooth(self):
+    """The interpolated variable ψ = ln pₛ + C carries no terrain signal.
+
+    This is the premise of the Ritchie & Tanguay treatment: the static
+    correction cancels the hydrostatically implied, grid-scale-rough
+    mountain part of `ln pₛ` before any interpolation.
+    """
+    ref_temps, orography, coords, physics_specs, state0 = (
+        self._steep_mountain_setup()
+    )
+    grid = coords.horizontal
+    eq = primitive_equations.SemiLagrangianPrimitiveEquations(
+        ref_temps, orography, coords, physics_specs,
+        terrain_smoothed_log_sp=True,
+    )
+    lnps_nodal = grid.to_nodal(state0.log_surface_pressure)
+    psi = lnps_nodal + grid.to_nodal(
+        primitive_equations._log_sp_terrain_correction_modal(eq)
+    )
+    # measured: 4.3e-3 raw vs 1.3e-4 smoothed (33x) for the 4 km mountain.
+    self.assertLess(
+        self._index_roughness(psi),
+        0.1 * self._index_roughness(lnps_nodal),
+    )
+
+  def test_terrain_smoothing_consistency_on_steep_terrain(self):
+    """Smoothed and raw transport agree over a day of steep-terrain steps.
+
+    Both are consistent discretizations of the same equations; at T42 the
+    truncated mountain response dominates and the two solutions must stay
+    close (measured T′ l2 = 3.2e-3 over two days at dt = 60 min).
+    """
+    ref_temps, orography, coords, physics_specs, state0 = (
+        self._steep_mountain_setup()
+    )
+    grid = coords.horizontal
+    dt = self._nondim_minutes(physics_specs, 60)
+    finals = {}
+    for smoothed in (False, True):
+      eq = primitive_equations.SemiLagrangianPrimitiveEquations(
+          ref_temps, orography, coords, physics_specs,
+          departure_iterations=2,
+          terrain_smoothed_log_sp=smoothed,
+      )
+      step = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(eq, dt)
+      )
+      finals[smoothed] = time_integration.repeated(step, 48)(state0)
+    for final in finals.values():
+      self.assertTrue(
+          np.isfinite(grid.to_nodal(final.temperature_variation)).all()
+      )
+    difference = self._l2(
+        grid,
+        finals[True].temperature_variation,
+        finals[False].temperature_variation,
+    )
+    self.assertLess(difference, 2e-2)
+    self.assertGreater(difference, 0.0)  # the flag changes the scheme
+
+  @absltest.skip('does_not_pass_on_tpus')
+  def test_time_step_extension(self):
+    """SL remains stable at time steps where the Eulerian core blows up."""
+    # At this extreme step the trajectory iteration operates near its
+    # convergence margin (dt·max‖∇V‖ < 1, plan §5): the default
+    # single warm-started iteration is built for operating-point steps and
+    # drifts 5x more here, so converged (two-iteration) trajectories are
+    # requested explicitly.
+    equation, eulerian, state0 = self._setup(
+        spherical_harmonic.Grid.T42(), departure_iterations=2
+    )
+    grid = equation.coords.horizontal
+    dt = self._nondim_minutes(equation.physics_specs, 180)
+    steps = 16  # two simulated days
+    sl_final = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+        ),
+        steps,
+    )(state0)
+    eulerian_final = time_integration.repeated(
+        jax.jit(time_integration.imex_rk_sil3(eulerian, dt)), steps
+    )(state0)
+    with self.subTest('Eulerian core is unstable at this time step'):
+      self.assertFalse(
+          np.isfinite(
+              grid.to_nodal(eulerian_final.temperature_variation)
+          ).all()
+      )
+    with self.subTest('semi-Lagrangian core remains stable'):
+      # measured drift 0.067: accuracy degrades at this step (the departure
+      # iteration approaches its convergence margin dt·max‖∇V‖ < 1, plan §5)
+      # but the solution remains bounded and qualitatively steady where the
+      # Eulerian core is NaN.
+      temperature = grid.to_nodal(sl_final.temperature_variation)
+      self.assertTrue(np.isfinite(temperature).all())
+      self.assertLess(
+          self._l2(
+              grid,
+              sl_final.temperature_variation,
+              state0.temperature_variation,
+          ),
+          0.1,
+      )
+
+  def test_eulerian_stepper_use_is_rejected(self):
+    """explicit_terms raises so Eulerian steppers cannot silently misuse."""
+    equation, _, state0 = self._setup(spherical_harmonic.Grid.T21())
+    with self.assertRaisesRegex(TypeError, 'semi-Lagrangian'):
+      equation.explicit_terms(state0)
+    step_fn = time_integration.imex_rk_sil3(equation, 0.01)
+    with self.assertRaisesRegex(TypeError, 'semi-Lagrangian'):
+      step_fn(state0)
+
+  @parameterized.parameters(
+      dict(coriolis_mode='planetary_momentum'),
+      dict(coriolis_mode='explicit'),
+  )
+  def test_jw_steady_state_stays_steady_backward_in_time(self, coriolis_mode):
+    """Reversed-time SL integration also holds the steady state.
+
+    A sign error in the time-reversed planetary-momentum bookkeeping or
+    Coriolis treatment would destroy steadiness immediately.
+    """
+    equation, _, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), coriolis_mode=coriolis_mode
+    )
+    grid = equation.coords.horizontal
+    reversed_equation = time_integration.TimeReversedSemiLagrangianODE(
+        equation
+    )
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    backward_step = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(
+            reversed_equation, dt
+        )
+    )
+    forward_step = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+    )
+    backward = time_integration.repeated(backward_step, 24)(state0)
+    forward = time_integration.repeated(forward_step, 24)(state0)
+    backward_drift = self._l2(
+        grid, backward.temperature_variation, state0.temperature_variation
+    )
+    forward_drift = self._l2(
+        grid, forward.temperature_variation, state0.temperature_variation
+    )
+    # backward integration is exactly as steady as forward (measured drifts
+    # agree to 0.5% at 24 steps); a sign error in the reversed planetary
+    # momentum would inflate the backward drift by orders of magnitude.
+    self.assertLess(backward_drift, 1.5 * forward_drift + 1e-4)
+
+  def test_semi_lagrangian_digital_filter_initialization(self):
+    """SL DFI runs and agrees with Eulerian DFI on the same window."""
+    sl_equation, eulerian, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True
+    )
+    grid = sl_equation.coords.horizontal
+    physics_specs = sl_equation.physics_specs
+    dt = self._nondim_minutes(physics_specs, 30)
+    time_span = self._nondim_minutes(physics_specs, 6 * 60)
+    common = dict(time_span=time_span, cutoff_period=time_span, dt=dt)
+    sl_dfi = jax.jit(
+        time_integration.digital_filter_initialization(
+            equation=sl_equation,
+            ode_solver=time_integration.semi_lagrangian_crank_nicolson_rk2,
+            filters=[],
+            **common,
+        )
+    )
+    eulerian_dfi = jax.jit(
+        time_integration.digital_filter_initialization(
+            equation=eulerian,
+            ode_solver=time_integration.imex_rk_sil3,
+            filters=[],
+            **common,
+        )
+    )
+    sl_filtered = sl_dfi(state0)
+    eulerian_filtered = eulerian_dfi(state0)
+    for field in ['temperature_variation', 'log_surface_pressure']:
+      actual = getattr(sl_filtered, field)
+      self.assertTrue(np.isfinite(np.asarray(actual)).all(), field)
+      self.assertLess(
+          self._l2(grid, actual, getattr(eulerian_filtered, field)),
+          2e-3,
+          field,
+      )
+
+  def test_warm_started_corrector_is_consistent(self):
+    """Warm- and cold-started RK2 correctors give nearly the same step.
+
+    The corrector's warm start only changes the initial guess of a
+    convergent fixed-point iteration, so over a day of baroclinic-wave
+    steps the two solutions must agree to well within the discretization
+    error (the residual difference is O((dt·∇V)²) per solve).
+    """
+    equation, _, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True,
+        departure_iterations=2,
+    )
+    grid = equation.coords.horizontal
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    finals = {}
+    for warm in (True, False):
+      step_fn = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(
+              equation, dt, warm_start_corrector=warm
+          )
+      )
+      finals[warm] = time_integration.repeated(step_fn, 48)(state0)
+    difference = self._l2(
+        grid,
+        finals[True].temperature_variation,
+        finals[False].temperature_variation,
+    )
+    # measured 2.5e-4: well below the case's ~1.1e-3 steady-state drift.
+    self.assertLess(difference, 1e-3)
+    self.assertGreater(difference, 0.0)  # the guess is actually used
+
+  def test_settls_warm_started_departures_are_consistent(self):
+    """SETTLS with and without carried departure points nearly agree."""
+    equation, _, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True,
+        departure_iterations=2,
+    )
+    grid = equation.coords.horizontal
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    finals = {}
+    for warm in (True, False):
+      init_fn = time_integration.semi_lagrangian_settls_init(
+          equation, dt, warm_start_departures=warm
+      )
+      step_fn = jax.jit(
+          time_integration.semi_lagrangian_settls(
+              equation, dt, warm_start_departures=warm
+          )
+      )
+      carry = init_fn(state0)
+      self.assertLen(carry[1], 3 if warm else 2)
+      finals[warm], _ = time_integration.repeated(step_fn, 47)(carry)
+    difference = self._l2(
+        grid,
+        finals[True].temperature_variation,
+        finals[False].temperature_variation,
+    )
+    # measured 2.4e-4, same scale as the RK2 warm-start difference above.
+    self.assertLess(difference, 1e-3)
+    self.assertGreater(difference, 0.0)
+
+  def test_settls_tracks_rk2_on_baroclinic_wave(self):
+    """The SETTLS stepper matches the RK2 stepper at half the per-step cost.
+
+    A one-day baroclinic-wave comparison of the two SL steppers, including
+    sim_time bookkeeping through the SETTLS bracket.
+    """
+    equation, _, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True
+    )
+    state0.sim_time = 0.0
+    grid = equation.coords.horizontal
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    rk2_final = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+        ),
+        48,
+    )(state0)
+    init_fn = time_integration.semi_lagrangian_settls_init(equation, dt)
+    step_fn = jax.jit(time_integration.semi_lagrangian_settls(equation, dt))
+    settls_final, _ = time_integration.repeated(step_fn, 47)(init_fn(state0))
+    self.assertLess(
+        self._l2(
+            grid,
+            settls_final.temperature_variation,
+            rk2_final.temperature_variation,
+        ),
+        2e-3,
+    )
+    self.assertTrue(
+        np.isfinite(grid.to_nodal(settls_final.temperature_variation)).all()
+    )
+    np.testing.assert_allclose(settls_final.sim_time, 48 * dt, rtol=1e-5)
+
+  def test_sim_time_advances_by_dt_per_step(self):
+    equation, _, state0 = self._setup(spherical_harmonic.Grid.T21())
+    state0.sim_time = 0.0
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    step_fn = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+    )
+    state = step_fn(step_fn(state0))
+    np.testing.assert_allclose(state.sim_time, 2 * dt, rtol=1e-6)
+
+  def test_transport_preserves_constant_tracer(self):
+    """A spatially constant tracer must remain constant under transport."""
+    equation, _, state0 = self._setup(
+        spherical_harmonic.Grid.T21(), perturbation=True
+    )
+    grid = equation.coords.horizontal
+    ones = jnp.zeros_like(state0.temperature_variation)
+    ones = spherical_harmonic.add_constant(ones, 1.0)
+    state0.tracers = {'constant': ones}
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    step_fn = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+    )
+    final = time_integration.repeated(step_fn, 4)(state0)
+    nodal_tracer = grid.to_nodal(final.tracers['constant'])
+    np.testing.assert_allclose(
+        nodal_tracer, np.ones_like(nodal_tracer), rtol=1e-4
+    )
+
+
+class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
+  """Moist dynamics, tracer limiting and differentiability of the SL core."""
+
+  def setUp(self):
+    # thresholds calibrated in float32; guard against the module-level x64
+    # enablement that other test files leak into full-suite runs.
+    super().setUp()
+    self._x64_was_enabled = jax.config.jax_enable_x64
+    jax.config.update('jax_enable_x64', False)
+
+  def tearDown(self):
+    jax.config.update('jax_enable_x64', self._x64_was_enabled)
+    super().tearDown()
+
+  def _setup(self, layers=8, humidity=False, **kwargs):
+    physics_specs = units.SimUnits.from_si()
+    grid = spherical_harmonic.Grid.T21()
+    vertical = sigma_coordinates.SigmaCoordinates.equidistant(layers)
+    coords = coordinate_systems.CoordinateSystem(grid, vertical)
+    init_fn, aux_features = primitive_equations_states.steady_state_jw(
+        coords, physics_specs
+    )
+    state = init_fn()
+    state = state + primitive_equations_states.baroclinic_perturbation_jw(
+        coords, physics_specs
+    )
+    if humidity:
+      state.tracers = {
+          'specific_humidity': primitive_equations_states.gaussian_scalar(
+              coords, physics_specs, amplitude=0.01
+          )
+      }
+    orography = primitive_equations.truncated_modal_orography(
+        aux_features[xarray_utils.OROGRAPHY], coords
+    )
+    ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
+    equation = primitive_equations.SemiLagrangianPrimitiveEquations(
+        ref_temps,
+        orography,
+        coords,
+        physics_specs,
+        humidity_key='specific_humidity' if humidity else None,
+        **kwargs,
+    )
+    return equation, state, ref_temps, orography
+
+  def _nondim_minutes(self, physics_specs, minutes):
+    return float(physics_specs.nondimensionalize(minutes * 60 * s_units.s))
+
+  def _l2(self, grid, x, y):
+    x, y = grid.to_nodal(x), grid.to_nodal(y)
+    return float(np.sqrt(np.square(x - y).sum() / np.square(y).sum()))
+
+  def test_nodal_humidity_couples_to_the_dynamics(self):
+    """A dynamics-coupled tracer may be stored nodally.
+
+    The coupling terms convert the nodal tracer to modal once per step, so
+    for a band-limited humidity field the nonadvective tendencies match
+    the modal-storage configuration.
+    """
+    moist, state, _, _ = self._setup(humidity=True)
+    grid = moist.coords.horizontal
+    nodal_moist = dataclasses.replace(
+        moist, nodal_tracers=('specific_humidity',)
+    )
+    q_modal = state.tracers['specific_humidity']
+    nodal_state = state.replace(
+        tracers={'specific_humidity': grid.to_nodal(q_modal)}
+    )
+    modal_tendency = moist.nonadvective_terms(state)
+    nodal_tendency = nodal_moist.nonadvective_terms(nodal_state)
+    for field in (
+        'vorticity',
+        'divergence',
+        'temperature_variation',
+        'log_surface_pressure',
+    ):
+      np.testing.assert_allclose(
+          getattr(nodal_tendency, field),
+          getattr(modal_tendency, field),
+          atol=1e-6,
+          err_msg=field,
+      )
+    # the tracer's own tendency is zero in both storages (advection-only),
+    # in the matching representation.
+    np.testing.assert_array_equal(
+        nodal_tendency.tracers['specific_humidity'],
+        jnp.zeros_like(nodal_state.tracers['specific_humidity']),
+    )
+    dt = self._nondim_minutes(moist.physics_specs, 30)
+    step = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(nodal_moist, dt)
+    )
+    final = step(nodal_state)
+    self.assertTrue(
+        np.isfinite(grid.to_nodal(final.temperature_variation)).all()
+    )
+    self.assertTrue(
+        np.isfinite(np.asarray(final.tracers['specific_humidity'])).all()
+    )
+
+  def test_moist_equations_reduce_to_dry_for_zero_humidity(self):
+    """With q = 0, moist SL tendencies match treating q as a passive tracer."""
+    moist, state, ref_temps, orography = self._setup(humidity=True)
+    state.tracers = {
+        'specific_humidity': jnp.zeros_like(state.temperature_variation)
+    }
+    dry = primitive_equations.SemiLagrangianPrimitiveEquations(
+        ref_temps, orography, moist.coords, moist.physics_specs
+    )
+    jax.tree.map(
+        lambda x, y: np.testing.assert_allclose(x, y, atol=1e-7),
+        moist.nonadvective_terms(state),
+        dry.nonadvective_terms(state),
+    )
+    dt = self._nondim_minutes(moist.physics_specs, 30)
+    step_moist = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(moist, dt)
+    )
+    step_dry = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(dry, dt)
+    )
+    jax.tree.map(
+        # jitted steps differ by XLA re-association noise (measured 6e-7).
+        lambda x, y: np.testing.assert_allclose(x, y, atol=3e-6),
+        step_moist(state),
+        step_dry(state),
+    )
+
+  def test_moist_baroclinic_consistency_with_eulerian(self):
+    """Moist SL at dt=30min tracks the moist Eulerian core at dt=10min."""
+    equation, state0, ref_temps, orography = self._setup(humidity=True)
+    grid = equation.coords.horizontal
+    physics_specs = equation.physics_specs
+    eulerian = primitive_equations.PrimitiveEquationsSigma(
+        ref_temps,
+        orography,
+        equation.coords,
+        physics_specs,
+        humidity_key='specific_humidity',
+    )
+    sl_final = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(
+                equation, self._nondim_minutes(physics_specs, 30)
+            )
+        ),
+        48,
+    )(state0)
+    eulerian_final = time_integration.repeated(
+        jax.jit(
+            time_integration.imex_rk_sil3(
+                eulerian, self._nondim_minutes(physics_specs, 10)
+            )
+        ),
+        144,
+    )(state0)
+    self.assertLess(
+        self._l2(
+            grid,
+            sl_final.temperature_variation,
+            eulerian_final.temperature_variation,
+        ),
+        5e-3,
+    )
+    self.assertLess(
+        self._l2(
+            grid,
+            sl_final.tracers['specific_humidity'],
+            eulerian_final.tracers['specific_humidity'],
+        ),
+        0.1,
+    )
+
+  def test_tracer_positivity_with_limiter(self):
+    """Pins the modal-storage positivity floor the limiter cannot beat.
+
+    Because the state stays modal, each step's modal round trip reintroduces
+    Gibbs ringing regardless of how good the transport is: for this barely
+    resolved tracer at T21 the undershoot is ~-6% of peak with or without
+    the limiter (measured -0.061 limited vs -0.069 unlimited). This is
+    precisely the plan §7 caveat motivating opt-in *nodal* tracer storage,
+    where the limiter's exact non-negativity survives (see
+    `test_nodal_tracer_positivity`). The limiter must still never make
+    things worse, never amplify the peak, and approximately conserve mass.
+    """
+    results = {}
+    for limited in [False, True]:
+      equation, state0, _, _ = self._setup(
+          monotone_tracers=limited
+      )
+      physics_specs = equation.physics_specs
+      state0.tracers = {
+          'tracer': primitive_equations_states.gaussian_scalar(
+              coords=equation.coords,
+              physics_specs=physics_specs,
+              perturbation_radius=0.1,
+          )
+      }
+      grid = equation.coords.horizontal
+      dt = self._nondim_minutes(physics_specs, 30)
+      step_fn = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+      )
+      final = time_integration.repeated(step_fn, 96)(state0)  # two days
+      nodal = np.asarray(grid.to_nodal(final.tracers['tracer']))
+      initial_nodal = np.asarray(grid.to_nodal(state0.tracers['tracer']))
+      mass = grid.integrate(nodal).sum()
+      initial_mass = grid.integrate(initial_nodal).sum()
+      results[limited] = dict(
+          min=nodal.min(),
+          max=nodal.max(),
+          mass_drift=abs(float(mass - initial_mass)) / float(initial_mass),
+      )
+    with self.subTest('limiter does not worsen the modal ringing floor'):
+      self.assertLess(results[True]['min'], 0.0)  # modal round trip
+      self.assertGreaterEqual(
+          results[True]['min'], results[False]['min'] - 1e-3
+      )
+    with self.subTest('no amplification of the maximum'):
+      self.assertLess(results[True]['max'], 1.05)
+    with self.subTest('mass approximately conserved'):
+      self.assertLess(results[True]['mass_drift'], 0.05)
+
+  def test_nodal_tracer_positivity(self):
+    """Nodal tracer storage delivers exact non-negativity for sharp tracers.
+
+    The companion test above measures a ~-6% undershoot floor for the same
+    tracer in modal storage; storing it nodally removes the modal round trip
+    entirely, so the quasi-monotone limiter's bounds hold exactly.
+    """
+    equation, state0, _, _ = self._setup(
+        monotone_tracers=True, nodal_tracers=('tracer',)
+    )
+    grid = equation.coords.horizontal
+    physics_specs = equation.physics_specs
+    modal_tracer = primitive_equations_states.gaussian_scalar(
+        coords=equation.coords,
+        physics_specs=physics_specs,
+        perturbation_radius=0.1,
+    )
+    nodal_tracer = jnp.maximum(grid.to_nodal(modal_tracer), 0.0)
+    state0.tracers = {'tracer': nodal_tracer}
+    dt = self._nondim_minutes(physics_specs, 30)
+    step_fn = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+    )
+    final = time_integration.repeated(step_fn, 96)(state0)  # two days
+    tracer = np.asarray(final.tracers['tracer'])
+    self.assertEqual(tracer.shape, equation.coords.nodal_shape)
+    with self.subTest('exactly non-negative'):
+      self.assertGreaterEqual(tracer.min(), 0.0)
+    with self.subTest('no new maximum'):
+      self.assertLessEqual(tracer.max(), float(np.asarray(nodal_tracer).max()))
+    with self.subTest('mass approximately conserved'):
+      mass = grid.integrate(tracer).sum()
+      initial_mass = grid.integrate(np.asarray(nodal_tracer)).sum()
+      self.assertLess(
+          abs(float(mass - initial_mass)) / float(initial_mass), 0.05
+      )
+
+  def test_nodal_tracer_consistent_with_modal_tracer(self):
+    """For a well-resolved tracer, both storage formats evolve alike."""
+    finals = {}
+    for nodal in [False, True]:
+      equation, state0, _, _ = self._setup(
+          nodal_tracers=('tracer',) if nodal else ()
+      )
+      grid = equation.coords.horizontal
+      physics_specs = equation.physics_specs
+      modal_tracer = primitive_equations_states.gaussian_scalar(
+          coords=equation.coords,
+          physics_specs=physics_specs,
+          perturbation_radius=0.3,
+      )
+      state0.tracers = {
+          'tracer': grid.to_nodal(modal_tracer) if nodal else modal_tracer
+      }
+      dt = self._nondim_minutes(physics_specs, 30)
+      step_fn = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(equation, dt)
+      )
+      final = time_integration.repeated(step_fn, 48)(state0)
+      tracer = final.tracers['tracer']
+      finals[nodal] = np.asarray(
+          grid.to_nodal(tracer) if not nodal else tracer
+      )
+    difference = np.sqrt(
+        np.square(finals[True] - finals[False]).sum()
+        / np.square(finals[False]).sum()
+    )
+    self.assertLess(float(difference), 0.05)
+
+  def test_step_filter_excluding_nodal_tracers(self):
+    equation, state0, _, _ = self._setup(nodal_tracers=('tracer',))
+    grid = equation.coords.horizontal
+    nodal_tracer = jnp.maximum(
+        grid.to_nodal(
+            primitive_equations_states.gaussian_scalar(
+                coords=equation.coords, physics_specs=equation.physics_specs
+            )
+        ),
+        0.0,
+    )
+    state0.tracers = {'tracer': nodal_tracer}
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    base_filter = time_integration.exponential_step_filter(grid, dt)
+    step_filter = primitive_equations.step_filter_excluding_nodal_tracers(
+        base_filter, ('tracer',)
+    )
+    filtered = step_filter(state0, state0)
+    with self.subTest('nodal tracer untouched'):
+      np.testing.assert_array_equal(filtered.tracers['tracer'], nodal_tracer)
+    with self.subTest('modal fields filtered'):
+      self.assertGreater(
+          float(
+              np.abs(
+                  np.asarray(
+                      filtered.temperature_variation
+                      - state0.temperature_variation
+                  )
+              ).max()
+          ),
+          0.0,
+      )
+
+  def test_held_suarez_composition(self):
+    """compose_equations preserves the SL interface; a forced run is stable."""
+    equation, state0, ref_temps, _ = self._setup()
+    coords = equation.coords
+    grid = coords.horizontal
+    physics_specs = equation.physics_specs
+    forcing = held_suarez.HeldSuarezForcingSigma(
+        coords, physics_specs, ref_temps
+    )
+    composed = time_integration.compose_equations([equation, forcing])
+    self.assertIsInstance(
+        composed, time_integration.SemiLagrangianImplicitExplicitODE
+    )
+    dt = self._nondim_minutes(physics_specs, 30)
+    step_fn = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(composed, dt)
+    )
+    final = time_integration.repeated(step_fn, 144)(state0)  # three days
+    temperature = np.asarray(
+        grid.to_nodal(final.temperature_variation)
+        + ref_temps[:, np.newaxis, np.newaxis]
+    )
+    self.assertTrue(np.isfinite(temperature).all())
+    # temperatures remain physical under Held-Suarez relaxation.
+    self.assertGreater(temperature.min(), 150.0)
+    self.assertLess(temperature.max(), 350.0)
+
+
+class SemiLagrangianHybridTest(parameterized.TestCase):
+  """Minimal validation of the hybrid-coordinate semi-Lagrangian equations.
+
+  The load-bearing test pins the hybrid class to the (well-validated) sigma
+  class in the sigma-like configuration (A = 0); genuinely hybrid levels get
+  reconstruction, consistency-with-Eulerian and rejection coverage.
+  """
+
+  def setUp(self):
+    super().setUp()
+    self._x64_was_enabled = jax.config.jax_enable_x64
+    jax.config.update('jax_enable_x64', False)
+
+  def tearDown(self):
+    jax.config.update('jax_enable_x64', self._x64_was_enabled)
+    super().tearDown()
+
+  def _l2(self, grid, x, y):
+    x, y = grid.to_nodal(x), grid.to_nodal(y)
+    return float(np.sqrt(np.square(x - y).sum() / np.square(y).sum()))
+
+  def _nondim_minutes(self, physics_specs, minutes):
+    return float(physics_specs.nondimensionalize(minutes * 60 * s_units.s))
+
+  def _hybrid_setup(self, hybrid_levels, layers=8, **kwargs):
+    physics_specs = units.SimUnits.from_si()
+    grid = spherical_harmonic.Grid.T21()
+    coords = coordinate_systems.CoordinateSystem(grid, hybrid_levels)
+    init_fn, aux_features = primitive_equations_states.steady_state_jw(
+        coords, physics_specs
+    )
+    state = init_fn()
+    state = state + primitive_equations_states.baroclinic_perturbation_jw(
+        coords, physics_specs
+    )
+    orography = primitive_equations.truncated_modal_orography(
+        aux_features[xarray_utils.OROGRAPHY], coords
+    )
+    ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
+    equation = primitive_equations.SemiLagrangianPrimitiveEquationsHybrid(
+        ref_temps, orography, coords, physics_specs, **kwargs
+    )
+    return equation, state, ref_temps, orography
+
+  def test_explicit_terms_split_reconstruction(self):
+    """Advective + non-advective terms reconstruct hybrid explicit_terms."""
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        8, sigma_exponent=1.5, stretch_exponent=0.5
+    )
+    equation, state, ref_temps, orography = self._hybrid_setup(hybrid_levels)
+    # the SL class disables explicit_terms; reconstruct against the Eulerian
+    # hybrid class, whose split methods the SL class inherits.
+    eulerian = primitive_equations.PrimitiveEquationsHybrid(
+        ref_temps, orography, equation.coords, equation.physics_specs
+    )
+    full = eulerian.explicit_terms(state)
+    advective = eulerian.explicit_advective_terms(state)
+    nonadvective = eulerian.explicit_nonadvective_terms(state)
+    reconstructed = jax.tree.map(lambda x, y: x + y, advective, nonadvective)
+    assert_states_close(full, reconstructed, rtol=1e-4, atol=1e-6)
+
+  def test_moist_reduces_to_dry_on_hybrid_levels(self):
+    """With q = 0, the moist hybrid SL class matches the dry one."""
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        8, sigma_exponent=1.5, stretch_exponent=0.5
+    )
+    moist, state, ref_temps, orography = self._hybrid_setup(
+        hybrid_levels, humidity_key='specific_humidity'
+    )
+    state.tracers = {
+        'specific_humidity': jnp.zeros_like(state.temperature_variation)
+    }
+    dry = primitive_equations.SemiLagrangianPrimitiveEquationsHybrid(
+        ref_temps, orography, moist.coords, moist.physics_specs
+    )
+    jax.tree.map(
+        lambda x, y: np.testing.assert_allclose(x, y, atol=1e-7),
+        moist.nonadvective_terms(state),
+        dry.nonadvective_terms(state),
+    )
+    dt = self._nondim_minutes(moist.physics_specs, 30)
+    step_moist = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(moist, dt)
+    )
+    step_dry = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(dry, dt)
+    )
+    # moist and dry steps are separately compiled programs, so float32
+    # reassociation differs with the XLA version (measured max 5.3e-6 on
+    # CI's linux wheels vs <1e-6 on macOS arm64).
+    jax.tree.map(
+        lambda x, y: np.testing.assert_allclose(x, y, atol=2e-5),
+        step_moist(state),
+        step_dry(state),
+    )
+
+  def test_moist_sigma_like_matches_moist_sigma_semi_lagrangian(self):
+    """With A = 0 levels, moist hybrid SL matches the moist sigma SL class.
+
+    The moist counterpart of `test_sigma_like_matches_sigma_semi_lagrangian`:
+    pins the previously untested hybrid ✕ semi-Lagrangian ✕ moist corner to
+    the well-tested moist sigma class.
+    """
+    layers = 8
+    physics_specs = units.SimUnits.from_si()
+    grid = spherical_harmonic.Grid.T21()
+    sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(layers)
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.from_sigma_levels(
+        sigma_levels
+    )
+    coords_sigma = coordinate_systems.CoordinateSystem(grid, sigma_levels)
+    coords_hybrid = coordinate_systems.CoordinateSystem(grid, hybrid_levels)
+    init_fn, aux_features = primitive_equations_states.steady_state_jw(
+        coords_sigma, physics_specs
+    )
+    state = init_fn()
+    state = state + primitive_equations_states.baroclinic_perturbation_jw(
+        coords_sigma, physics_specs
+    )
+    state.tracers = {
+        'specific_humidity': primitive_equations_states.gaussian_scalar(
+            coords_sigma, physics_specs, amplitude=0.01
+        )
+    }
+    orography = primitive_equations.truncated_modal_orography(
+        aux_features[xarray_utils.OROGRAPHY], coords_sigma
+    )
+    ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
+    sl_sigma = primitive_equations.SemiLagrangianPrimitiveEquations(
+        ref_temps,
+        orography,
+        coords_sigma,
+        physics_specs,
+        humidity_key='specific_humidity',
+    )
+    sl_hybrid = primitive_equations.SemiLagrangianPrimitiveEquationsHybrid(
+        ref_temps,
+        orography,
+        coords_hybrid,
+        physics_specs,
+        humidity_key='specific_humidity',
+    )
+    with self.subTest('non-advective terms match'):
+      # the humidity coupling enters the vorticity and divergence
+      # tendencies; the temperature entry carries the same
+      # Simmons-Burridge vs sigma discretization gap as the dry pinning
+      # test.
+      n_sigma = sl_sigma.nonadvective_terms(state)
+      n_hybrid = sl_hybrid.nonadvective_terms(state)
+      # measured: vorticity 1.3e-3 and divergence 1.5e-2 — the humidity
+      # coupling (virtual-temperature geopotential adjustment) inherits
+      # the Simmons-Burridge vs sigma vertical-integration gap, the same
+      # family as the 0.1 temperature tolerance below; the integrated
+      # 12-step comparison absorbs it.
+      for field, tol in [
+          ('vorticity', 5e-3),
+          ('divergence', 5e-2),
+          ('temperature_variation', 0.1),
+      ]:
+        self.assertLess(
+            self._l2(grid, getattr(n_hybrid, field), getattr(n_sigma, field)),
+            tol,
+            field,
+        )
+    with self.subTest('stepped run matches'):
+      dt = self._nondim_minutes(physics_specs, 30)
+      step_sigma = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(sl_sigma, dt)
+      )
+      step_hybrid = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(sl_hybrid, dt)
+      )
+      final_sigma = time_integration.repeated(step_sigma, 12)(state)
+      final_hybrid = time_integration.repeated(step_hybrid, 12)(state)
+      # measured: temperature 4e-3 (as in the dry pinning test) and
+      # vorticity 1.9e-2 — the per-tendency coupling gap accumulated over
+      # the 12 steps.
+      for field, tol in [
+          ('temperature_variation', 8e-3),
+          ('vorticity', 4e-2),
+      ]:
+        self.assertLess(
+            self._l2(
+                grid,
+                getattr(final_hybrid, field),
+                getattr(final_sigma, field),
+            ),
+            tol,
+            field,
+        )
+      self.assertLess(
+          self._l2(
+              grid,
+              final_hybrid.tracers['specific_humidity'],
+              final_sigma.tracers['specific_humidity'],
+          ),
+          8e-3,
+      )
+
+  def test_sigma_like_matches_sigma_semi_lagrangian(self):
+    """With A = 0 levels, the hybrid SL class matches the sigma SL class."""
+    layers = 8
+    physics_specs = units.SimUnits.from_si()
+    grid = spherical_harmonic.Grid.T21()
+    sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(layers)
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.from_sigma_levels(
+        sigma_levels
+    )
+    coords_sigma = coordinate_systems.CoordinateSystem(grid, sigma_levels)
+    coords_hybrid = coordinate_systems.CoordinateSystem(grid, hybrid_levels)
+    init_fn, aux_features = primitive_equations_states.steady_state_jw(
+        coords_sigma, physics_specs
+    )
+    state = init_fn()
+    state = state + primitive_equations_states.baroclinic_perturbation_jw(
+        coords_sigma, physics_specs
+    )
+    orography = primitive_equations.truncated_modal_orography(
+        aux_features[xarray_utils.OROGRAPHY], coords_sigma
+    )
+    ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
+    sl_sigma = primitive_equations.SemiLagrangianPrimitiveEquations(
+        ref_temps, orography, coords_sigma, physics_specs
+    )
+    sl_hybrid = primitive_equations.SemiLagrangianPrimitiveEquationsHybrid(
+        ref_temps, orography, coords_hybrid, physics_specs
+    )
+    with self.subTest('vertical nodes match sigma levels'):
+      np.testing.assert_allclose(
+          sl_hybrid._reference_vertical_nodes.centers, sigma_levels.centers, atol=1e-6
+      )
+    with self.subTest('nodal velocities match'):
+      v_sigma = sl_sigma.nodal_velocities(state)
+      v_hybrid = sl_hybrid.nodal_velocities(state)
+      for name in ['u', 'v', 'sigma_dot', 'u_mean', 'v_mean']:
+        np.testing.assert_allclose(
+            getattr(v_hybrid, name),
+            getattr(v_sigma, name),
+            atol=2e-6,
+            err_msg=name,
+        )
+    with self.subTest('non-advective terms match'):
+      # divergence agrees tightly; the temperature entry carries the known
+      # Simmons-Burridge vs sigma vertical-discretization difference in the
+      # adiabatic term (the Eulerian sigma-like equivalence test absorbs the
+      # same gap with atol=5e-2 on nondimensional tendencies).
+      n_sigma = sl_sigma.nonadvective_terms(state)
+      n_hybrid = sl_hybrid.nonadvective_terms(state)
+      for field, tol in [('divergence', 5e-2), ('temperature_variation', 0.1)]:
+        self.assertLess(
+            self._l2(grid, getattr(n_hybrid, field), getattr(n_sigma, field)),
+            tol,
+            field,
+        )
+    with self.subTest('stepped run matches'):
+      dt = self._nondim_minutes(physics_specs, 30)
+      step_sigma = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(sl_sigma, dt)
+      )
+      step_hybrid = jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(sl_hybrid, dt)
+      )
+      out_sigma = time_integration.repeated(step_sigma, 12)(state)
+      out_hybrid = time_integration.repeated(step_hybrid, 12)(state)
+      # measured 4.0e-3: the accumulated Simmons-Burridge vs sigma vertical
+      # discretization difference (mostly the adiabatic term), matching the
+      # Eulerian classes' behavior in the same configuration.
+      self.assertLess(
+          self._l2(
+              grid,
+              out_hybrid.temperature_variation,
+              out_sigma.temperature_variation,
+          ),
+          8e-3,
+      )
+
+  def test_baroclinic_wave_consistent_with_eulerian_hybrid(self):
+    """On genuinely hybrid levels, SL tracks the Eulerian hybrid core."""
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        8, sigma_exponent=1.5, stretch_exponent=0.5
+    )
+    sl_equation, state, ref_temps, orography = self._hybrid_setup(
+        hybrid_levels
+    )
+    physics_specs = sl_equation.physics_specs
+    grid = sl_equation.coords.horizontal
+    eulerian = primitive_equations.PrimitiveEquationsHybrid(
+        ref_temps, orography, sl_equation.coords, physics_specs
+    )
+    sl_final = time_integration.repeated(
+        jax.jit(
+            time_integration.semi_lagrangian_crank_nicolson_rk2(
+                sl_equation, self._nondim_minutes(physics_specs, 30)
+            )
+        ),
+        24,
+    )(state)
+    eulerian_final = time_integration.repeated(
+        jax.jit(
+            time_integration.imex_rk_sil3(
+                eulerian, self._nondim_minutes(physics_specs, 10)
+            )
+        ),
+        72,
+    )(state)
+    self.assertTrue(
+        np.isfinite(grid.to_nodal(sl_final.temperature_variation)).all()
+    )
+    # measured 1.0e-3 (24 SL steps at dt=30 min vs 72 Eulerian at 10 min).
+    self.assertLess(
+        self._l2(
+            grid,
+            sl_final.temperature_variation,
+            eulerian_final.temperature_variation,
+        ),
+        3e-3,
+    )
+
+  def test_eulerian_stepper_use_is_rejected(self):
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        8, sigma_exponent=1.5, stretch_exponent=0.5
+    )
+    equation, state, _, _ = self._hybrid_setup(hybrid_levels)
+    with self.assertRaisesRegex(TypeError, 'semi-Lagrangian'):
+      equation.explicit_terms(state)
 
 
 def interpolate_state_hybrid_to_sigma(
