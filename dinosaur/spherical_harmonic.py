@@ -471,7 +471,32 @@ class FastSphericalHarmonics(SphericalHarmonics):
     if self.reverse_einsum_arg_order is None:
       object.__setattr__(self, 'reverse_einsum_arg_order', model_parallelism)
 
-    if self.fourier_method is None:
+    if self.fourier_method is not None and self.fourier_method not in (
+        'matmul', 'fft'):
+      raise ValueError(f'unknown {self.fourier_method=}')
+
+    if self.stacked_fourier_transforms is None and (
+        self.fourier_method is None or self.fourier_method == 'matmul'):
+      # it's faster to avoid explicitly stacking outputs from Fourier
+      # transforms, but only if we don't have to do additional multiplications
+      # on the MXU.
+      unstacked_matmuls = math.ceil(self.longitude_wavenumbers / 128)
+      stacked_matmuls = 2 * math.ceil(self.longitude_wavenumbers / 256)
+      stack = stacked_matmuls <= unstacked_matmuls
+      object.__setattr__(self, 'stacked_fourier_transforms', stack)
+
+  @functools.cached_property
+  def resolved_fourier_method(self) -> str:
+    """Lazily resolves the fourier_method to a concrete value.
+
+    This avoids calling jax.default_backend() at class instantiation time,
+    which is important when instances are created at module scope (e.g.
+    jax.default_backend() cannot be called before the full environment is
+    initialized in google3).
+    """
+    if self.fourier_method is not None:
+      method = self.fourier_method
+    else:
       # cuFFT wins over the explicit DFT matmul on GPU; on TPU the matmul is
       # ~3x faster (measured at T170 on A100/H100 vs TPU v5e).
       method = (
@@ -481,36 +506,28 @@ class FastSphericalHarmonics(SphericalHarmonics):
               and self.nodal_padding[0] == 0)
           else 'matmul'
       )
-      object.__setattr__(self, 'fourier_method', method)
 
-    if self.fourier_method not in ('matmul', 'fft'):
-      raise ValueError(f'unknown {self.fourier_method=}')
-    if self.fourier_method == 'fft' and model_parallelism:
+    model_parallelism = self.spmd_mesh is not None and any(
+        self.spmd_mesh.shape[dim] > 1 for dim in 'zxy'
+    )
+    if method == 'fft' and model_parallelism:
       raise NotImplementedError(
           'fourier_method="fft" does not support model parallelism'
       )
-
-    if self.fourier_method == 'fft':
+    if method == 'fft':
       if self.stacked_fourier_transforms:
         raise ValueError(
             'stacked_fourier_transforms=True is incompatible with '
-            'fourier_method="fft"'
+            'fourier_method="fft". If you want to use FFT-based Fourier '
+            'transforms, set fourier_method="fft" explicitly instead of '
+            'relying on default backend detection.'
         )
-      object.__setattr__(self, 'stacked_fourier_transforms', False)
-    elif self.stacked_fourier_transforms is None:
-      # it's faster to avoid explicitly stacking outputs from Fourier
-      # transforms, but only if we don't have to do additional multiplications
-      # on the MXU.
-      unstacked_matmuls = math.ceil(self.longitude_wavenumbers / 128)
-      stacked_matmuls = 2 * math.ceil(self.longitude_wavenumbers / 256)
-      stack = stacked_matmuls <= unstacked_matmuls
-      object.__setattr__(self, 'stacked_fourier_transforms', stack)
-
-    if self.fourier_method == 'fft' and self.nodal_padding[0]:
+    if method == 'fft' and self.nodal_padding[0]:
       raise ValueError(
           'fourier_method="fft" does not support nodal padding in longitude; '
           f'got {self.nodal_padding[0]=} from {self.base_shape_multiple=}'
       )
+    return method
 
   @functools.cached_property
   def nodal_limits(self) -> tuple[int, int]:
@@ -608,7 +625,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
     nodal_pad_x, nodal_pad_y = self.nodal_padding
     modal_pad_x, modal_pad_y = self.modal_padding
 
-    if self.fourier_method == 'fft':
+    if self.resolved_fourier_method == 'fft':
       f = None  # the FFT path never uses the explicit Fourier matrix
     else:
       f = fourier.real_basis_with_zero_imag(
@@ -696,7 +713,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
     x = jax.named_call(_transform_einsum, name='inv_legendre')(
         'mjl,...sml->...smj', p, x, mesh, *einsum_args
     )
-    if self.fourier_method == 'fft':
+    if self.resolved_fourier_method == 'fft':
       x = self._inverse_fourier_fft(x)
     elif self.stacked_fourier_transforms:
       # note: on TPU, explicit matrix multiplication seems to be faster than
@@ -715,7 +732,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
     mesh = self.spmd_mesh
     einsum_args = (self.reverse_einsum_arg_order, self.transform_precision)
 
-    if self.fourier_method == 'fft':
+    if self.resolved_fourier_method == 'fft':
       # quadrature weights are folded into the forward FFT scale
       x = self._fourier_fft(x)
     else:

@@ -221,13 +221,13 @@ class GridTest(parameterized.TestCase):
   def testFourierMethodDefaultResolution(self):
     """The default fourier_method always resolves to a concrete method."""
     harmonics = spherical_harmonic.FastSphericalHarmonics(32, 33, 96, 48)
-    self.assertIn(harmonics.fourier_method, ['matmul', 'fft'])
+    self.assertIn(harmonics.resolved_fourier_method, ['matmul', 'fft'])
     # the fft path is incompatible with nodal padding, so padded shapes must
     # never resolve to it by default
     padded = spherical_harmonic.FastSphericalHarmonics(
         32, 33, 96, 48, base_shape_multiple=8
     )
-    self.assertEqual(padded.fourier_method, 'matmul')
+    self.assertEqual(padded.resolved_fourier_method, 'matmul')
 
   @parameterized.product(
       wavenumbers=(32, 137),
