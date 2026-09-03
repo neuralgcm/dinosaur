@@ -28,6 +28,28 @@ import numpy as np
 chex.set_n_cpu_devices(8)  # set at top level so it works in pytest
 
 
+class ResolveDotPrecisionTest(parameterized.TestCase):
+
+  @parameterized.parameters(
+      ('tensorfloat32', jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3),
+      ('bfloat16_3x', jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3),
+      ('high', jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3),
+      ('bfloat16', jax.lax.DotAlgorithmPreset.BF16_BF16_F32),
+      ('highest', 'highest'),
+      ('float32', 'float32'),
+      (('bfloat16', 'highest'), ('bfloat16', 'highest')),
+  )
+  def test_legacy_alias_normalization(self, precision, expected):
+    x = np.zeros((2, 2), np.float32)
+    resolved = jax_numpy_utils.resolve_dot_precision(precision, x, x)
+    self.assertEqual(resolved, expected)
+
+  def test_float64_resolves_to_highest(self):
+    x = np.zeros((2, 2), np.float64)
+    resolved = jax_numpy_utils.resolve_dot_precision(None, x, x)
+    self.assertEqual(resolved, jax.lax.Precision.HIGHEST)
+
+
 class CumsumTest(parameterized.TestCase):
 
   @parameterized.parameters({'axis': 0}, {'axis': 1}, {'axis': -1})

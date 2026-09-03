@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import dataclasses
-import functools
 import importlib
 
 import dinosaur
@@ -31,7 +30,7 @@ import numpy as np
 
 
 Array = typing.Array
-einsum = functools.partial(jnp.einsum, precision=lax.Precision.HIGHEST)
+einsum = jax_numpy_utils.precise_einsum
 # For consistency with commonly accepted notation, we use Greek letters within
 # some of the functions below.
 # pylint: disable=invalid-name
@@ -190,10 +189,12 @@ def centered_difference(
     )
 
   dx = jax_numpy_utils.diff(x, axis=axis)
-  dx_axes = range(dx.ndim)
+  # this is a pure broadcasting multiply (no contracted dimensions), so
+  # expressing it as an einsum would only pin an unnecessary dot algorithm
   inv_dη = 1 / coordinates.center_to_center
-  inv_dη_axes = [dx_axes[axis]]
-  return einsum(dx, dx_axes, inv_dη, inv_dη_axes, dx_axes, precision='float32')
+  shape = [1] * dx.ndim
+  shape[axis] = -1
+  return dx * inv_dη.reshape(shape)
 
 
 @jax.named_call

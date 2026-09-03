@@ -29,6 +29,126 @@ import numpy as np
 # pylint: disable=logging-fstring-interpolation
 
 
+# On GPU, 6-pass bfloat16 emulation is both faster (tensor cores) and more
+# accurate (exact bf16 x bf16 products, i.e., compensated arithmetic) than
+# plain float32 matrix multiplication. Measured on A100/H100: ~5x smaller
+# error than float32 at ~0.8x the runtime.
+FLOAT32_DOT_ALGORITHM = lax.DotAlgorithmPreset.BF16_BF16_F32_X6
+
+
+@functools.cache
+def _gpu_supports_bf16_dot_algorithms() -> bool:
+  """Whether GPU devices support the bfloat16 dot algorithm family.
+
+  bf16 (and tf32) dot algorithm presets require Ampere or newer GPUs;
+  pre-Ampere GPUs like the T4 (compute capability 7.5) reject them with
+  UNIMPLEMENTED errors.
+  """
+  capability = getattr(jax.devices()[0], 'compute_capability', None)
+  if capability is None:
+    return False
+  try:
+    return float(capability) >= 8.0
+  except ValueError:
+    return False
+
+
+# The legacy precision strings 'tensorfloat32', 'bfloat16_3x' and 'high' are
+# all aliases for Precision.HIGH, whose meaning is backend-dependent: 3-pass
+# bfloat16 emulation on TPU but single-pass tensorfloat32 (10-bit mantissa,
+# ~50x less accurate) on GPU. Downstream users (e.g., NeuralGCM) wrote these
+# strings on TPU expecting bfloat16_3x semantics, so all of them -- including
+# 'tensorfloat32', which notably does NOT become single-pass tensorfloat32 --
+# resolve to explicit 3-pass bfloat16 emulation, matching their historical
+# TPU behavior on every platform. 'bfloat16' is likewise mapped to true
+# single-pass bfloat16 rather than backend-dependent Precision.DEFAULT.
+# Dtype-relative values ('float32', 'highest', 'default', 'fastest',
+# per-operand tuples) pass through unchanged.
+_LEGACY_PRECISION_ALIASES = {
+    'high': lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
+    'tensorfloat32': lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
+    'bfloat16_3x': lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
+    'bfloat16': lax.DotAlgorithmPreset.BF16_BF16_F32,
+}
+
+
+def resolve_dot_precision(
+    precision: jax.lax.PrecisionLike,
+    *operands,
+    float32_algorithm: lax.DotAlgorithmPreset | None = None,
+    lhs_exact_in_bf16: bool = False,
+) -> jax.lax.PrecisionLike:
+  """Resolves `precision=None` to an explicit precision choice.
+
+  The legacy Precision.HIGH alias strings ('tensorfloat32', 'bfloat16_3x',
+  'high') are normalized to explicit 3-pass bfloat16 emulation -- their
+  historical TPU meaning -- so they behave identically on all platforms;
+  'bfloat16' becomes true single-pass bfloat16 (see
+  `_LEGACY_PRECISION_ALIASES`).
+
+  Explicit dot algorithms pin operand types, so they only apply to float32
+  inputs: float64 inputs (e.g., with x64 enabled) would be silently demoted.
+  Non-float32 inputs use Precision.HIGHEST, which is dtype-relative.
+
+  If `float32_algorithm` is provided, it is used for float32 inputs on every
+  platform. Otherwise float32 inputs resolve to BF16_BF16_F32_X6 on GPU
+  (faster and more accurate than float32 there) and Precision.HIGHEST
+  elsewhere: on TPU, mandating the explicit 6-pass algorithm measures ~50%
+  slower per model step than the equivalent-accuracy Precision.HIGHEST.
+
+  If `lhs_exact_in_bf16` is set (the left operand is exactly representable
+  in bfloat16, e.g. a binary matrix), TPUs use per-operand precision
+  ('bfloat16', 'highest'), which older XLA:TPU generations lower
+  asymmetrically (1x3 MXU passes instead of HIGHEST's 3x3) and which
+  measures identical to HIGHEST on v5e, so it can only help. Explicit
+  DotAlgorithms cannot express per-operand asymmetry on any current backend.
+
+  Pre-Ampere GPUs reject the bf16/tf32 dot algorithm families outright, so
+  bf16/tf32 algorithms (defaulted or explicitly requested) are downgraded to
+  Precision.HIGHEST there.
+  """
+  if isinstance(precision, str):
+    precision = _LEGACY_PRECISION_ALIASES.get(precision.lower(), precision)
+  if precision is None:
+    arrays = [x for x in operands if hasattr(x, 'dtype')]
+    if jnp.result_type(*arrays) == jnp.float32:
+      if lhs_exact_in_bf16 and jax.default_backend() == 'tpu':
+        precision = ('bfloat16', 'highest')
+      elif float32_algorithm is not None:
+        precision = float32_algorithm
+      elif jax.default_backend() == 'gpu':
+        precision = FLOAT32_DOT_ALGORITHM
+      else:
+        precision = jax.lax.Precision.HIGHEST
+    else:
+      precision = jax.lax.Precision.HIGHEST
+  if (
+      isinstance(precision, lax.DotAlgorithmPreset)
+      and precision.name.startswith(('BF16', 'TF32'))
+      and jax.default_backend() == 'gpu'
+      and not _gpu_supports_bf16_dot_algorithms()
+  ):
+    return jax.lax.Precision.HIGHEST
+  return precision
+
+
+def precise_einsum(*args, precision: jax.lax.PrecisionLike = None, **kwargs):
+  """einsum with a platform-independent explicit precision by default."""
+  precision = resolve_dot_precision(precision, *args)
+  return jnp.einsum(*args, precision=precision, **kwargs)
+
+
+def precise_dot(a: jax.Array, b: jax.Array) -> jax.Array:
+  """jnp.dot with precision resolved like `precise_einsum`.
+
+  Matrix-vector shaped products don't use tensor cores directly, but under
+  `vmap` they batch into matrix-matrix products, so they get the same
+  precision treatment as einsums (verified supported by XLA:GPU for
+  matvec/GEMV shapes).
+  """
+  return jnp.dot(a, b, precision=resolve_dot_precision(None, a, b))
+
+
 @jax.named_call
 def _single_device_dot_cumsum(
     x: jax.Array, axis: int, reverse: bool = False
@@ -43,16 +163,17 @@ def _single_device_dot_cumsum(
   i = jnp.arange(size)[:, jnp.newaxis]
   j = jnp.arange(size)[jnp.newaxis, :]
   op = jnp.greater_equal if reverse else jnp.less_equal
-  w = op(i, j).astype(np.float32)
+  w = op(i, j).astype(x.dtype)
   out_axes = list(range(x.ndim))
   out_axes[axis] = x.ndim
+  precision = resolve_dot_precision(None, w, x, lhs_exact_in_bf16=True)
   return jnp.einsum(
       w,
       [axis, x.ndim],
       x,
       list(range(x.ndim)),
       out_axes,
-      precision=('bfloat16', 'highest'),
+      precision=precision,
   )
 
 
@@ -193,7 +314,8 @@ def _allgather_matmul_twoway(
     split_axis: int,
     axis_name: str | tuple[str, str],
     reverse_arg_order: bool = False,
-    precision: str = 'float32',
+    *,
+    precision: jax.lax.PrecisionLike,
 ) -> jax.Array:
   """All-gather matmul using two way communication.
 
@@ -272,7 +394,8 @@ def _matmul_reducescatter_twoway(
     scatter_axis: int,
     axis_name: str | tuple[str, str],
     reverse_arg_order: bool = False,
-    precision: str = 'float32',
+    *,
+    precision: jax.lax.PrecisionLike,
 ) -> jax.Array:
   """All-gather matmul using two way communication.
 
@@ -403,7 +526,7 @@ def sharded_einsum(
     *,
     gather_inputs: bool | None = None,
     reverse_arg_order: bool = False,
-    precision: str = 'float32',
+    precision: jax.lax.PrecisionLike = None,
     mesh: jax.sharding.Mesh | None,
     rhs_spec: jax.sharding.PartitionSpec,
     out_spec: jax.sharding.PartitionSpec,
@@ -427,7 +550,8 @@ def sharded_einsum(
     reverse_arg_order: if True, call einsum on each chunk like `einsum(..., rhs,
       lhs)` instead of `einsum(..., lhs, rhs)`. This results in different XLA
       optimizations and can occasionally be somewhat faster.
-    precision: floating point precision to use for einsum.
+    precision: floating point precision to use for einsum; None resolves to an
+      explicit choice like `precise_einsum`.
     mesh: parallel mesh to use for implementing this operation, or `None`, which
       indicates no sharding.
     rhs_spec: sharding spec for `rhs`.
@@ -439,6 +563,7 @@ def sharded_einsum(
   """
   all_subscripts = _parse_einsum_subscripts(subscripts)
   lhs_subscripts, rhs_subscripts, out_subscripts = all_subscripts
+  precision = resolve_dot_precision(precision, lhs, rhs)
 
   if mesh is None:
     # validation complete; calculate non-sharded einsum if no mesh supplied

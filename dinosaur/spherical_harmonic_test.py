@@ -218,6 +218,50 @@ class GridTest(parameterized.TestCase):
     reconstructed_modal = transform(nodal)
     np.testing.assert_allclose(modal, reconstructed_modal, atol=1e-5)
 
+  def testFourierMethodDefaultResolution(self):
+    """The default fourier_method always resolves to a concrete method."""
+    harmonics = spherical_harmonic.FastSphericalHarmonics(32, 33, 96, 48)
+    self.assertIn(harmonics.fourier_method, ['matmul', 'fft'])
+    # the fft path is incompatible with nodal padding, so padded shapes must
+    # never resolve to it by default
+    padded = spherical_harmonic.FastSphericalHarmonics(
+        32, 33, 96, 48, base_shape_multiple=8
+    )
+    self.assertEqual(padded.fourier_method, 'matmul')
+
+  @parameterized.product(
+      wavenumbers=(32, 137),
+      latitude_spacing=('gauss', 'equiangular'),
+  )
+  def testFourierMethodsAgree(self, wavenumbers, latitude_spacing):
+    """FFT and matmul Fourier transforms produce identical results."""
+    grids = {
+        method: spherical_harmonic.Grid.with_wavenumbers(
+            wavenumbers,
+            latitude_spacing=latitude_spacing,
+            spherical_harmonics_impl=functools.partial(
+                spherical_harmonic.FastSphericalHarmonics,
+                transform_precision='float32',
+                fourier_method=method,
+            ),
+        )
+        for method in ['matmul', 'fft']
+    }
+    rng = np.random.default_rng(0)
+    nodal = rng.standard_normal((3,) + grids['matmul'].nodal_shape).astype(
+        np.float32
+    )
+    modal = {k: grid.to_modal(nodal) for k, grid in grids.items()}
+    np.testing.assert_allclose(
+        modal['matmul'], modal['fft'], atol=1e-5, rtol=1e-5
+    )
+    nodal_out = {
+        k: grid.to_nodal(modal['matmul']) for k, grid in grids.items()
+    }
+    np.testing.assert_allclose(
+        nodal_out['matmul'], nodal_out['fft'], atol=1e-5, rtol=1e-5
+    )
+
   @parameterized.product(
       wavenumbers=(32, 137, 255),
       latitude_spacing=('gauss', 'equiangular'),
@@ -249,6 +293,9 @@ class GridTest(parameterized.TestCase):
       impl=[
           spherical_harmonic.RealSphericalHarmonics,
           spherical_harmonic.FastSphericalHarmonics,
+          functools.partial(
+              spherical_harmonic.FastSphericalHarmonics, fourier_method='fft'
+          ),
       ],
   )
   def testDerivatives(

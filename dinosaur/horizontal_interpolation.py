@@ -20,6 +20,7 @@ https://gist.github.com/shoyer/c0f1ddf409667650a076c058f9a17276
 import dataclasses
 import functools
 
+from dinosaur import jax_numpy_utils
 from dinosaur import spherical_harmonic
 from dinosaur import typing
 
@@ -273,12 +274,8 @@ class ConservativeRegridder(Regridder):
         self.source_grid.latitudes, self.target_grid.latitudes
     )
     # Note, any NaN in input produces all NaN in output
-    return jnp.einsum(
-        'ab,cd,...bd->...ac',
-        lon_weights,
-        lat_weights,
-        field,
-        precision='float32',
+    return jax_numpy_utils.precise_einsum(
+        'ab,cd,...bd->...ac', lon_weights, lat_weights, field
     )
 
   def __call__(self, field: typing.Array) -> jnp.ndarray:

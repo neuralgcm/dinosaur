@@ -20,7 +20,6 @@ See https://en.wikipedia.org/wiki/Sigma_coordinate_system
 from __future__ import annotations
 
 import dataclasses
-import functools
 from typing import Callable
 
 from dinosaur import jax_numpy_utils
@@ -33,8 +32,7 @@ import numpy as np
 
 Array = typing.Array
 
-# All `einsum`s should be done at highest available precision.
-einsum = functools.partial(jnp.einsum, precision=lax.Precision.HIGHEST)
+einsum = jax_numpy_utils.precise_einsum
 
 
 def _slice_shape_along_axis(
@@ -192,10 +190,12 @@ def centered_difference(
     )
 
   dx = jax_numpy_utils.diff(x, axis=axis)
-  dx_axes = range(dx.ndim)
+  # this is a pure broadcasting multiply (no contracted dimensions), so
+  # expressing it as an einsum would only pin an unnecessary dot algorithm
   inv_d𝜎 = 1 / coordinates.center_to_center
-  inv_d𝜎_axes = [dx_axes[axis]]
-  return einsum(dx, dx_axes, inv_d𝜎, inv_d𝜎_axes, dx_axes, precision='float32')  # pytype: disable=bad-return-type
+  shape = [1] * dx.ndim
+  shape[axis] = -1
+  return dx * inv_d𝜎.reshape(shape)
 
 
 @jax.named_call
