@@ -180,11 +180,11 @@ def simmons_burridge_reference_tendencies(
       - physics_specs.g * grid.laplacian(equation.orography)
   )
   tendency = primitive_equations.State(
-      vorticity=vorticity_tendency,
-      divergence=divergence_tendency,
-      temperature_variation=temperature_tendency,
-      log_surface_pressure=grid.to_modal(-total / surface_pressure),
-      tracers={k: jnp.zeros_like(v) for k, v in state.tracers.items()},
+      vorticity=vorticity_tendency,  # pyrefly: ignore[unexpected-keyword]
+      divergence=divergence_tendency,  # pyrefly: ignore[unexpected-keyword]
+      temperature_variation=temperature_tendency,  # pyrefly: ignore[unexpected-keyword]
+      log_surface_pressure=grid.to_modal(-total / surface_pressure),  # pyrefly: ignore[unexpected-keyword]
+      tracers={k: jnp.zeros_like(v) for k, v in state.tracers.items()},  # pyrefly: ignore[unexpected-keyword]
   )
   return grid.clip_wavenumbers(tendency)
 
