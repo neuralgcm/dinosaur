@@ -206,6 +206,22 @@ class HybridCoordinatesTest(parameterized.TestCase):
     if minimum > 0:
       self.assertTrue((levels.layer_thickness(minimum - 1.0) <= 0).any())
 
+  def test_ecmwf137_interpolated_with_model_top(self):
+    """`p_top` drops the ECMWF interfaces above it before interpolating."""
+    levels = hybrid_coordinates.HybridCoordinates.ecmwf137_interpolated(
+        32, p_top=10.0
+    )
+    self.assertEqual(levels.layers, 32)
+    # the top interface is the first ECMWF interface at or below 10 hPa
+    # (for a standard surface pressure), and is a pure pressure level
+    self.assertGreaterEqual(levels.a_boundaries[0], 10.0)
+    self.assertLess(levels.a_boundaries[0], 12.0)
+    self.assertEqual(levels.b_boundaries[0], 0.0)
+    self.assertEqual(levels.b_boundaries[-1], 1.0)
+    self.assertTrue((levels.layer_thickness(1013.25) > 0).all())
+    default = hybrid_coordinates.HybridCoordinates.ecmwf137_interpolated(32)
+    self.assertEqual(default.a_boundaries[0], 0.0)
+
   def test_from_sigma_levels(self):
     sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(10)
     hybrid_levels = hybrid_coordinates.HybridCoordinates.from_sigma_levels(

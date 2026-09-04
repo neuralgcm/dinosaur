@@ -522,15 +522,39 @@ class HybridCoordinates:
   def ecmwf137_interpolated(
       cls,
       n_levels: int,
+      p_top: float | None = None,
   ) -> HybridCoordinates:
-    """Returns hybrid coordinates interpolated from ECMWF 137 levels."""
-    base = cls.ECMWF137()
+    """Returns hybrid coordinates interpolated from ECMWF 137 levels.
 
-    x_old = np.linspace(0, 1, base.layers + 1)
+    The A and B coefficients of the 138 ECMWF interfaces are linearly
+    interpolated in interface index to `n_levels + 1` interfaces.
+
+    Args:
+      n_levels: number of layers.
+      p_top: optional model top pressure in hPa. If given, the ECMWF
+        interfaces above `p_top` (for a standard surface pressure of
+        1013.25 hPa) are dropped before interpolating, so the top interface
+        is the first ECMWF interface at or below `p_top`. The full ECMWF
+        set extends to 0 hPa with a 0.02 hPa top layer; without an upper
+        sponge, a dynamical core with such a high top can become unstable
+        at high horizontal resolution, and `p_top` of order 1-10 hPa gives
+        a level set comparable to sigma coordinates.
+
+    Returns:
+      Hybrid coordinates with `n_levels` layers (A in hPa).
+    """
+    base = cls.ECMWF137()
+    a_base, b_base = base.a_boundaries, base.b_boundaries
+    if p_top is not None:
+      p_half = a_base + b_base * 1013.25
+      first = int(np.searchsorted(p_half, p_top))
+      a_base, b_base = a_base[first:], b_base[first:]
+
+    x_old = np.linspace(0, 1, len(a_base))
     x_new = np.linspace(0, 1, n_levels + 1)
 
-    a_new = np.interp(x_new, x_old, base.a_boundaries)
-    b_new = np.interp(x_new, x_old, base.b_boundaries)
+    a_new = np.interp(x_new, x_old, a_base)
+    b_new = np.interp(x_new, x_old, b_base)
 
     return cls(a_boundaries=a_new, b_boundaries=b_new)  # pyrefly: ignore[bad-argument-type]
 
