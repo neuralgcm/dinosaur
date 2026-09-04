@@ -2201,7 +2201,6 @@ class DiagnosticStateHybrid:
   divergence: Array
   temperature_variation: Array
   cos_lat_u: tuple[Array, Array]
-  mass_flux_explicit: Array
   mass_flux_full: Array
   cos_lat_grad_log_sp: Array
   u_dot_grad_log_sp: Array
@@ -2301,29 +2300,23 @@ def compute_diagnostic_state_hybrid(
 
   # D_k = div(v * dp) = dp * div(v) + v . grad(dp)
   # grad(dp) = grad(da + db * ps) = db * ps * grad(ln ps)
-  d_k_term1 = delta_p * nodal_divergence
-  d_k_term2 = delta_b * nodal_surface_pressure * nodal_u_dot_grad_log_sp
-  d_k_full = d_k_term1 + d_k_term2
-  d_k_explicit = d_k_term2  # Explicit part (advection)
-
+  d_k = (
+      delta_p * nodal_divergence
+      + delta_b * nodal_surface_pressure * nodal_u_dot_grad_log_sp
+  )
   # M_{k+1/2} = - sum_{r=1}^k D_r + B_{k+1/2} sum_{r=1}^N D_r
-  def compute_mass_flux(d_k):
-    sum_d = jnp.sum(d_k, axis=0, keepdims=True)
-    cumsum_d = jax_numpy_utils.cumsum(d_k, axis=0)
-    # pad top with 0
-    cumsum_d_padded = jnp.pad(cumsum_d, ((1, 0), (0, 0), (0, 0)))
-    b_boundaries = coords.vertical.b_boundaries[:, np.newaxis, np.newaxis]  # pyrefly: ignore[missing-attribute]
-    return -cumsum_d_padded + b_boundaries * sum_d
-
-  mass_flux_full = compute_mass_flux(d_k_full)
-  mass_flux_explicit = compute_mass_flux(d_k_explicit)
+  sum_d = jnp.sum(d_k, axis=0, keepdims=True)
+  cumsum_d = jax_numpy_utils.cumsum(d_k, axis=0)
+  # pad top with 0
+  cumsum_d_padded = jnp.pad(cumsum_d, ((1, 0), (0, 0), (0, 0)))
+  b_boundaries = coords.vertical.b_boundaries[:, np.newaxis, np.newaxis]  # pyrefly: ignore[missing-attribute]
+  mass_flux_full = -cumsum_d_padded + b_boundaries * sum_d
 
   return DiagnosticStateHybrid(
       vorticity=nodal_vorticity,  # pyrefly: ignore[unexpected-keyword]
       divergence=nodal_divergence,  # pyrefly: ignore[unexpected-keyword]
       temperature_variation=nodal_temperature_variation,  # pyrefly: ignore[unexpected-keyword]
       cos_lat_u=nodal_cos_lat_u,  # pyrefly: ignore[unexpected-keyword]
-      mass_flux_explicit=mass_flux_explicit,  # pyrefly: ignore[unexpected-keyword]
       mass_flux_full=mass_flux_full,  # pyrefly: ignore[unexpected-keyword]
       cos_lat_grad_log_sp=nodal_cos_lat_grad_log_sp,  # pyrefly: ignore[unexpected-keyword]
       u_dot_grad_log_sp=nodal_u_dot_grad_log_sp,  # pyrefly: ignore[bad-argument-type, unexpected-keyword]
@@ -2469,7 +2462,15 @@ def get_temperature_implicit_weights_hybrid(
     kappa: float,
     p_s_ref: float,
 ) -> np.ndarray:
-  """Returns weights used to compute implicit terms for the temperature."""
+  """Returns weights used to compute implicit terms for the temperature.
+
+  The implicit temperature tendency is `-H @ divergence`, where `H` is the
+  linearization, about a resting atmosphere with temperature
+  `reference_temperature` and surface pressure `p_s_ref`, of the two terms of
+  the Simmons & Burridge (1981) thermodynamic equation that are driven by the
+  divergence-induced mass flux: the adiabatic heating and the vertical
+  advection of the reference temperature.
+  """
   if (
       reference_temperature.ndim != 1
       or reference_temperature.shape[-1] != coordinates.layers
@@ -2479,38 +2480,46 @@ def get_temperature_implicit_weights_hybrid(
         f'got shape {reference_temperature.shape} and '
         f'{coordinates.layers} layers.'
     )
-  p = np.tril(np.ones([coordinates.layers, coordinates.layers]))
-  alpha_k, _ = _get_vertical_discretization_coeffs_numpy(coordinates, p_s_ref)
-  alpha = alpha_k[..., np.newaxis]
-
-  p_alpha = p * alpha
-  p_alpha_shifted = np.roll(p_alpha, 1, axis=0)
-  p_alpha_shifted[0] = 0
-
+  # With the S&B discretization the divergence enters through
+  # Dᵐ_s = Δp_s D_s, via
+  #   (ω/p)_r ⊃ -(ln(p_{r+½}/p_{r-½}) Σ_{s<r} Dᵐ_s + α_r Dᵐ_r) / Δp_r
+  #   M_{r+½} ⊃ Σ_s (B_{r+½} - P(r - s)) Dᵐ_s
+  # where M is the interface mass flux, P the indicator of non-negative
+  # arguments and the vertical advection has the same centered form as
+  # `hybrid_vertical_advection`. Entry [r, s] of H is therefore
+  #   H[r, s] / Δp_s = κ T_r (α_r δ_rs + ln(p_{r+½}/p_{r-½}) P(r - s - 1)) / Δp_r
+  #                    - ((P(r - s) - B_{r+½}) (T_{r+1} - T_r)
+  #                       + (P(r - s - 1) - B_{r-½}) (T_r - T_{r-1})) / (2 Δp_r)
+  # with all coefficients evaluated at p_s_ref and the temperature differences
+  # taken as zero at the top and bottom boundaries.
+  layers = coordinates.layers
+  alpha, log_p_ratio = _get_vertical_discretization_coeffs_numpy(
+      coordinates, p_s_ref
+  )
   delta_p_ref = (
       coordinates.pressure_thickness + coordinates.sigma_thickness * p_s_ref
   )
-
-  h0 = (
+  # The indicator functions in matrix form: `p[r, s] = P(r - s)` and
+  # `p_strict[r, s] = P(r - s - 1)`.
+  p = np.tril(np.ones([layers, layers]))
+  p_strict = np.tril(np.ones([layers, layers]), k=-1)
+  # Adiabatic heating of the reference temperature.
+  heating = (
       kappa
-      * reference_temperature[..., np.newaxis]
-      * (p_alpha + p_alpha_shifted)
-      / delta_p_ref[..., np.newaxis]
+      * reference_temperature[:, np.newaxis]
+      * (np.diag(alpha) + log_p_ratio[:, np.newaxis] * p_strict)
+      / delta_p_ref[:, np.newaxis]
   )
-  temp_diff = np.diff(reference_temperature)
-  thickness_sum = delta_p_ref[:-1] + delta_p_ref[1:]
-  k0 = np.concatenate((temp_diff / thickness_sum, [0]), axis=0)[..., np.newaxis]
-  # This part of the vertical advection scheme for T_ref should depend on sigma
-  # for the definition of vertical velocity.
-  # The implicit vertical velocity (eta-dot) is proportional to the vertical
-  # integral of divergence weighted by d(sigma), not d(p)/p_s_ref.
-  # Therefore, we use `sigma_thickness` for the cumulative sum.
-  thickness_cumulative = np.cumsum(coordinates.sigma_thickness)[..., np.newaxis]
-  k1 = p - thickness_cumulative
-  k = k0 * k1
+  # Vertical advection of the reference temperature by the interface mass
+  # flux, `-(M_{r+½} (T_{r+1} - T_r) + M_{r-½} (T_r - T_{r-1})) / (2 Δp_r)`.
+  b_lower = coordinates.b_boundaries[1:][:, np.newaxis]  # B_{r+½}
+  temp_diff = np.concatenate([np.diff(reference_temperature), [0.0]])
+  k = 0.5 * temp_diff[:, np.newaxis] * (p - b_lower)
+  # `k_shifted[r, s] = k[r - 1, s]`, padded with zeros at `r = 0`.
   k_shifted = np.roll(k, 1, axis=0)
   k_shifted[0] = 0
-  return (h0 - k - k_shifted) * delta_p_ref
+  advection = (k + k_shifted) / delta_p_ref[:, np.newaxis]
+  return (heating - advection) * delta_p_ref[np.newaxis, :]
 
 
 def get_temperature_implicit_hybrid(
@@ -2530,12 +2539,19 @@ def get_temperature_implicit_hybrid(
   if method == 'dense':
     return _vertical_matvec(weights, divergence)
   elif method == 'sparse':
+    # Off the diagonal, `weights[r, s] = c_r Δp_s` with `c_r` depending only
+    # on the row and on whether `s < r` or `s > r`, so the matrix-vector
+    # product reduces to cumulative sums of the thickness-weighted divergence.
+    delta_p_ref = (
+        coordinates.pressure_thickness + coordinates.sigma_thickness * p_s_ref
+    )
     diag_weights = np.diag(weights)
-    up_weights = np.concatenate([[0], weights[1:, 0]])
-    down_weights = np.concatenate([weights[:-1, -1], [0]])
+    up_weights = np.concatenate([[0], weights[1:, 0] / delta_p_ref[0]])
+    down_weights = np.concatenate([weights[:-1, -1] / delta_p_ref[-1], [0]])
+    weighted_divergence = delta_p_ref[:, np.newaxis, np.newaxis] * divergence
     up_divergence = (
-        jax_numpy_utils.cumsum(divergence, axis=0, sharding=sharding)
-        - divergence
+        jax_numpy_utils.cumsum(weighted_divergence, axis=0, sharding=sharding)
+        - weighted_divergence
     )
     result = (
         up_weights[:, np.newaxis, np.newaxis] * up_divergence
@@ -2543,8 +2559,10 @@ def get_temperature_implicit_hybrid(
     )
     if (down_weights != 0).any():
       down_divergence = (
-          jax_numpy_utils.reverse_cumsum(divergence, axis=0, sharding=sharding)
-          - divergence
+          jax_numpy_utils.reverse_cumsum(
+              weighted_divergence, axis=0, sharding=sharding
+          )
+          - weighted_divergence
       )
       result += down_weights[:, np.newaxis, np.newaxis] * down_divergence
     return result
@@ -2691,9 +2709,16 @@ def hybrid_vertical_advection(
 class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
   """Primitive Equations solved on terrain following hybrid coordinates.
 
-  Note: this implementation has not been thoroughly verified and is added for
-  research purposes. If you notice any inconsistencies or issues with this
-  solver, please open an issues.
+  The vertical discretization follows Simmons & Burridge (1981): interface
+  mass fluxes and the energy-conserving forms of the hydrostatic equation,
+  pressure-gradient force and adiabatic heating, all evaluated at the actual
+  surface pressure. The implicit terms linearize the divergence-driven parts
+  about a resting atmosphere at `reference_surface_pressure`; the explicit
+  terms carry the remainder, so that the two sum to the full tendency at any
+  surface pressure. Both properties are pinned by
+  `primitive_equations_hybrid_x64_test.py`, which compares against an
+  independent transcription of the S&B tendencies and checks conservation of
+  their discrete total energy to round-off.
   """
 
   vertical_advection: Callable[..., jax.Array] = dataclasses.field(
@@ -2766,22 +2791,28 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
       v_dot_grad_ln_p: Array,
       nodal_surface_pressure: Array,
   ) -> Array:
-    """Computes nodal terms of the form `T*omega/p` in temperature tendency."""
-    # integrand is divergence of mass flux: g_term * dp
-    levels = self.nondim_levels
-    integrand = g_term * levels.layer_thickness(nodal_surface_pressure)
-    f = jax_numpy_utils.cumsum(
-        integrand, axis=0, sharding=self.coords.dycore_sharding
-    )
-    alpha_k, _ = _get_vertical_discretization_coeffs_numpy(
-        self.nondim_levels, self.p_s_ref
-    )
-    alpha = alpha_k[:, np.newaxis, np.newaxis]
+    """Computes nodal terms of the form `T*omega/p` in temperature tendency.
 
+    Uses the discretization of Simmons & Burridge (1981), whose weights are
+    those of the discrete hydrostatic equation
+    (`get_geopotential_weights_hybrid`), so that the energy conversion term
+    exactly cancels the work done by the pressure-gradient force.
+    """
+    levels = self.nondim_levels
     dp = levels.layer_thickness(nodal_surface_pressure)
-    padding = [(1, 0), (0, 0), (0, 0)]
-    # Discretization of the vertical integral term in omega/p equation
-    g_part = (alpha * f + jnp.pad(alpha * f, padding)[:-1, ...]) / dp
+    # S&B eq. (2.13), with Dᵐ_j = ∇·(v_j Δp_j) = g_term_j Δp_j:
+    #   (ω/p)_k = (v·∇ln p)_k
+    #             - (ln(p_{k+½}/p_{k-½}) Σ_{j<k} Dᵐ_j + α_k Dᵐ_k) / Δp_k
+    mass_divergence = g_term * dp
+    cumulative = jax_numpy_utils.cumsum(
+        mass_divergence, axis=0, sharding=self.coords.dycore_sharding
+    )
+    alpha, log_p_ratio = _get_vertical_discretization_coeffs(
+        levels, nodal_surface_pressure
+    )
+    g_part = (
+        log_p_ratio * (cumulative - mass_divergence) + alpha * mass_divergence
+    ) / dp
     return temperature_field * (v_dot_grad_ln_p - g_part)
 
   @jax.named_call
@@ -2880,15 +2911,17 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
       include_advection: bool = True,
       include_reference: bool = True,
   ) -> Array | float:
-    """Computes explicit vertical tendency of the temperature.
+    """Computes the full vertical tendency of the temperature.
 
     The `include_*` arguments mirror the sigma-coordinate class: vertical
     advection of T' is advective (handled via trajectories by
     semi-Lagrangian solvers), while the reference-temperature source term
     is not (T_ref is a fixed function of the level, not a transported
-    field).
+    field). Unlike the sigma-coordinate class, the reference-temperature
+    term uses the full mass flux: its divergence-driven part is compensated
+    by `_implicit_temperature_complement`, since the implicit linearization
+    at the reference surface pressure is not exact on hybrid levels.
     """
-    mass_flux_explicit = aux_state.mass_flux_explicit
     mass_flux_full = aux_state.mass_flux_full
     temperature_variation = aux_state.temperature_variation
     delta_p = aux_state.layer_pressure_thickness
@@ -2899,7 +2932,7 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
       )
     if include_reference and np.unique(self.T_ref.ravel()).size > 1:
       tendency += self._vertical_tendency(
-          mass_flux_explicit, self.T_ref, pressure_thickness=delta_p
+          mass_flux_full, self.T_ref, pressure_thickness=delta_p
       )
     return tendency
 
@@ -2907,7 +2940,13 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
   def nodal_temperature_adiabatic_tendency(
       self, aux_state: DiagnosticStateHybrid, nodal_surface_pressure: Array
   ) -> Array:
-    """Computes explicit temperature tendency due to adiabatic processes."""
+    """Computes the full temperature tendency due to adiabatic processes.
+
+    Unlike the sigma-coordinate class, this includes the divergence-driven
+    heating of the reference temperature: `_implicit_temperature_complement`
+    removes its linearization, so that explicit plus implicit terms
+    reproduce the Simmons & Burridge tendency at any surface pressure.
+    """
     levels = self.nondim_levels
     # Consistent full-level pressure definition for energy conservation.
     # We use the same weights as in the PGF calculation
@@ -2935,53 +2974,53 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
     # `g_term` for `_t_omega_over_p_hybrid` is `∇·(vΔp) / Δp`.
     # `∇·(vΔp) = Δp(∇·v) + v·(∇Δp)`.
     # `v·(∇Δp) = v·(∇(ΔB p_s)) = (v·∇ln(p_s)) * p_s * ΔB`.
-    dp_k = levels.layer_thickness(nodal_surface_pressure)
-    # This term `integrand_g` is the `g_term` passed to the helper.
-    integrand_g = aux_state.divergence + (
+    g_term = aux_state.divergence + (
         aux_state.u_dot_grad_log_sp
         * nodal_surface_pressure
         * levels.sigma_thickness[:, np.newaxis, np.newaxis]
-        / dp_k
+        / dp
     )
-    # Split g into explicit (udg part) and implicit (divergence part)
-    g_explicit = integrand_g - aux_state.divergence
-    g_full = integrand_g
-
-    mean_t_part = self._t_omega_over_p_hybrid(
-        self.T_ref,
-        g_explicit,
-        scaled_v_dot_grad_log_sp,
-        nodal_surface_pressure,
-    )
-    if self.humidity_key is None:
-      variation_t_part = self._t_omega_over_p_hybrid(
-          aux_state.temperature_variation,
-          g_full,
-          scaled_v_dot_grad_log_sp,
-          nodal_surface_pressure,
-      )
-      return self.physics_specs.kappa * (mean_t_part + variation_t_part)
-    else:
+    temperature = self.T_ref + aux_state.temperature_variation
+    if self.humidity_key is not None:
+      # Tv / (1 + (Cp_vapor / Cp - 1) q): the moist thermodynamic equation
+      # heats with the virtual temperature and the moist heat capacity.
       gas_const_ratio = self.physics_specs.R_vapor / self.physics_specs.R
       heat_capacity_ratio = self.physics_specs.Cp_vapor / self.physics_specs.Cp
       q = self._get_specific_humidity(aux_state)
-      variation_temperature_component = aux_state.temperature_variation * (
+      temperature = temperature * (
           (1 + (gas_const_ratio - 1) * q) / (1 + (heat_capacity_ratio - 1) * q)
       )
-      humidity_reference_component = self.T_ref * (
-          ((gas_const_ratio - heat_capacity_ratio) * q)
-          / (1 + (heat_capacity_ratio - 1) * q)
-      )
-      variation_and_humidity_terms = (
-          variation_temperature_component + humidity_reference_component
-      )
-      variation_and_Tv_part = self._t_omega_over_p_hybrid(
-          variation_and_humidity_terms,
-          g_full,
-          scaled_v_dot_grad_log_sp,
-          nodal_surface_pressure,
-      )
-      return self.physics_specs.kappa * (mean_t_part + variation_and_Tv_part)
+    return self.physics_specs.kappa * self._t_omega_over_p_hybrid(
+        temperature, g_term, scaled_v_dot_grad_log_sp, nodal_surface_pressure
+    )
+
+  @jax.named_call
+  def _implicit_temperature_complement(self, state: State) -> Array:
+    """Returns the negative of the implicit temperature term, `H @ D`.
+
+    The explicit temperature tendency is assembled as the full Simmons &
+    Burridge tendency plus this term, so that explicit and implicit terms sum
+    to the full tendency whatever the surface pressure. The implicit term
+    linearizes the divergence-driven adiabatic heating and reference-
+    temperature advection about the reference surface pressure, which is
+    exact only for sigma-like levels (A = 0).
+    """
+    return -get_temperature_implicit_hybrid(
+        state.divergence,  # pyrefly: ignore[bad-argument-type]
+        self.nondim_levels,
+        self.reference_temperature,
+        self.physics_specs.kappa,
+        self.p_s_ref,
+        method=self._resolved_vertical_matmul_method(),
+        sharding=self.coords.dycore_sharding,
+    )
+
+  def _resolved_vertical_matmul_method(self) -> str:
+    method = self.vertical_matmul_method
+    if method is None:
+      mesh = self.coords.spmd_mesh
+      method = 'sparse' if mesh is not None and mesh.shape['z'] > 1 else 'dense'
+    return method
 
   @jax.named_call
   def nodal_log_pressure_tendency(
@@ -3120,6 +3159,7 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
     temperature_tendency = (
         to_modal_fn(dT_dt_horizontal_nodal + dT_dt_vertical + dT_dt_adiabatic)
         + dT_dt_horizontal_modal
+        + self._implicit_temperature_complement(state)
     )
     log_surface_pressure_tendency = to_modal_fn(log_sp_tendency)[
         jnp.newaxis, ...
@@ -3294,7 +3334,10 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
             + orography_tendency
             + geopotential_tendency_residual
         ),
-        temperature_variation=to_modal_fn(dT_dt_reference + dT_dt_adiabatic),
+        temperature_variation=(
+            to_modal_fn(dT_dt_reference + dT_dt_adiabatic)
+            + self._implicit_temperature_complement(state)
+        ),
         log_surface_pressure=to_modal_fn(log_sp_residual)[jnp.newaxis, ...],
         tracers=jax.tree_util.tree_map(jnp.zeros_like, state.tracers),
         sim_time=None if state.sim_time is None else 1.0,
@@ -3375,11 +3418,7 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
   @jax.named_call
   def implicit_terms(self, state: State) -> State:
     """Returns the implicit terms of the primitive equations."""
-    method = self.vertical_matmul_method
-    if method is None:
-      mesh = self.coords.spmd_mesh
-      method = 'sparse' if mesh is not None and mesh.shape['z'] > 1 else 'dense'
-
+    method = self._resolved_vertical_matmul_method()
     geopotential_diff = get_geopotential_diff_hybrid(
         state.temperature_variation,  # pyrefly: ignore[bad-argument-type]
         self.nondim_levels,
@@ -3558,10 +3597,10 @@ class SemiLagrangianPrimitiveEquationsHybrid(
   pressure-gradient linearization residuals and the ΔA residual in the
   `log_surface_pressure` tendency (see `explicit_nonadvective_terms`).
 
-  Note: as with the Eulerian `PrimitiveEquationsHybrid`, this class is less
-  thoroughly validated than its sigma-coordinate counterpart; it is pinned
-  to `SemiLagrangianPrimitiveEquations` in the sigma-like (A = 0)
-  configuration, but genuinely hybrid behavior has only smoke coverage.
+  Note: the Eulerian hybrid core is pinned to the Simmons & Burridge
+  discretization, but the semi-Lagrangian transport on genuinely hybrid
+  levels is validated only for consistency with it (and with
+  `SemiLagrangianPrimitiveEquations` in the sigma-like, A = 0 configuration).
   """
 
   coriolis_mode: str = dataclasses.field(
