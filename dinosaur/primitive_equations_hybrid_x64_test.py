@@ -73,12 +73,15 @@ def simmons_burridge_reference_tendencies(
   surface_pressure = jnp.exp(grid.to_nodal(state.log_surface_pressure))
 
   def coefficients(ps):
-    """Layer thickness, ln(p_{k+1/2} / p_{k-1/2}), alpha_k and the weight
-    of grad(ln ps) in the discrete grad(ln p_k) (S&B eqs. 2.10-2.11)."""
+    """Returns the S&B layer coefficients for surface pressure `ps`."""
+    # layer thickness, ln(p_{k+1/2} / p_{k-1/2}), alpha_k, and the weight of
+    # grad(ln ps) in the discrete grad(ln p_k) (S&B eqs. 2.10-2.11)
     p_half = a[:, np.newaxis, np.newaxis] + b[:, np.newaxis, np.newaxis] * ps
     dp = p_half[1:] - p_half[:-1]
     p_top = p_half[:-1]
-    # the log ratio is unused for a p = 0 model top, where alpha_1 = 1.
+    # The log ratio is unused for a p = 0 model top, where this adopts the
+    # model's `alpha_1 = 1` convention (S&B and the IFS use ln 2 instead), so
+    # the top-layer convention itself is not checked by this reference.
     safe_ratio = p_half[1:] / jnp.where(p_top > 0, p_top, 1.0)
     dlnp = jnp.where(p_top > 0, jnp.log(safe_ratio), 0.0)
     alpha = 1 - p_top / dp * dlnp
@@ -109,6 +112,24 @@ def simmons_burridge_reference_tendencies(
       - (dlnp * (cumulative - mass_divergence) + alpha * mass_divergence) / dp
   )
   temperature = equation.T_ref + aux.temperature_variation
+  if equation.humidity_key is None:
+    virtual_temperature = heating_temperature = temperature
+  else:
+    # virtual temperature (less condensate) in the hydrostatic and
+    # pressure-gradient terms; the moist thermodynamic equation heats with
+    # the virtual temperature and the moist heat capacity.
+    q = aux.tracers[equation.humidity_key]
+    condensate = sum(aux.tracers[k] for k in equation.cloud_keys or ())
+    gas_const_ratio = physics_specs.R_vapor / physics_specs.R
+    heat_capacity_ratio = physics_specs.Cp_vapor / physics_specs.Cp
+    virtual_temperature = temperature * (
+        1 + (gas_const_ratio - 1) * q - condensate
+    )
+    heating_temperature = (
+        temperature
+        * (1 + (gas_const_ratio - 1) * q)
+        / (1 + (heat_capacity_ratio - 1) * q)
+    )
   nodal, modal = equation.horizontal_scalar_advection(
       aux.temperature_variation, aux_state=aux
   )
@@ -116,17 +137,19 @@ def simmons_burridge_reference_tendencies(
       grid.to_modal(
           nodal
           + vertical_advection(temperature)
-          + kappa * temperature * omega_over_p
+          + kappa * heating_temperature * omega_over_p
       )
       + modal
   )
   # hydrostatic geopotential above the surface (S&B eq. 2.9) and the
   # coefficient of grad(ln ps) in the pressure-gradient force (eq. 2.11)
-  t_dlnp = temperature * dlnp
+  t_dlnp = virtual_temperature * dlnp
   geopotential = R * (
-      jnp.cumsum(t_dlnp[::-1], axis=0)[::-1] - t_dlnp + alpha * temperature
+      jnp.cumsum(t_dlnp[::-1], axis=0)[::-1]
+      - t_dlnp
+      + alpha * virtual_temperature
   )
-  pgf_coefficient = R * temperature / dp * weight * surface_pressure
+  pgf_coefficient = R * virtual_temperature / dp * weight * surface_pressure
   dp_ref, _, _, weight_ref = coefficients(equation.p_s_ref)
   pgf_coefficient_ref = (
       R * equation.T_ref / dp_ref * weight_ref * equation.p_s_ref
@@ -161,6 +184,7 @@ def simmons_burridge_reference_tendencies(
       divergence=divergence_tendency,
       temperature_variation=temperature_tendency,
       log_surface_pressure=grid.to_modal(-total / surface_pressure),
+      tracers={k: jnp.zeros_like(v) for k, v in state.tracers.items()},
   )
   return grid.clip_wavenumbers(tendency)
 
@@ -211,7 +235,16 @@ def total_energy_tendency(
   return float(grid.integrate(column)), float(grid.integrate(energy))
 
 
-def hybrid_test_state(coords, physics_specs, smooth_divergence=False):
+MOISTURE_KEYS = (
+    'specific_humidity',
+    'specific_cloud_liquid_water_content',
+    'specific_cloud_ice_water_content',
+)
+
+
+def hybrid_test_state(
+    coords, physics_specs, smooth_divergence=False, moist=False
+):
   """A baroclinic-wave state with a mountain in ln(ps) and divergent flow.
 
   Args:
@@ -221,6 +254,8 @@ def hybrid_test_state(coords, physics_specs, smooth_divergence=False):
       symmetric pattern, so that the cubic products in the energy budget are
       integrated exactly by the Gaussian quadrature; otherwise it is
       proportional to the (spectrally rich) vorticity.
+    moist: if True, the state carries specific humidity and cloud tracers
+      (smooth, positive, decreasing with height).
 
   Returns:
     A tuple (state, features) with a modal `State` whose surface pressure
@@ -252,8 +287,22 @@ def hybrid_test_state(coords, physics_specs, smooth_divergence=False):
     divergence = state.divergence + amplitude * grid.to_modal(nodal)
   else:
     divergence = state.divergence + 0.2 * state.vorticity
+  tracers = {}
+  if moist:
+    layers = coords.vertical.layers
+    profile = np.linspace(0.05, 1.0, layers)[:, np.newaxis, np.newaxis]
+    humidity = 0.02 * profile * np.exp(-((lat / 0.5) ** 2)) * (
+        1 + 0.3 * np.cos(2 * lon)
+    )
+    tracers = {
+        'specific_humidity': grid.to_modal(humidity),
+        'specific_cloud_liquid_water_content': grid.to_modal(0.1 * humidity),
+        'specific_cloud_ice_water_content': grid.to_modal(0.01 * humidity),
+    }
   state = state.replace(
-      log_surface_pressure=grid.to_modal(log_sp), divergence=divergence
+      log_surface_pressure=grid.to_modal(log_sp),
+      divergence=divergence,
+      tracers=tracers,
   )
   return grid.clip_wavenumbers(state), features
 
@@ -278,11 +327,16 @@ LEVELS = dict(
 
 class SimmonsBurridgeReferenceTest(parameterized.TestCase):
 
-  def _equation(self, levels):
+  def _equation(self, levels, moist=False):
     grid = spherical_harmonic.Grid.with_wavenumbers(21)
     coords = coordinate_systems.CoordinateSystem(grid, levels)
     physics_specs = units.SimUnits.from_si()
-    state, features = hybrid_test_state(coords, physics_specs)
+    state, features = hybrid_test_state(coords, physics_specs, moist=moist)
+    moisture = (
+        dict(humidity_key=MOISTURE_KEYS[0], cloud_keys=MOISTURE_KEYS[1:])
+        if moist
+        else {}
+    )
     equation = primitive_equations.PrimitiveEquationsHybrid(
         features[xarray_utils.REF_TEMP_KEY],
         primitive_equations.truncated_modal_orography(
@@ -290,20 +344,27 @@ class SimmonsBurridgeReferenceTest(parameterized.TestCase):
         ),
         coords,
         physics_specs,
+        **moisture,
     )
     return equation, state
 
   @parameterized.named_parameters(
-      dict(testcase_name=name, levels_fn=fn) for name, fn in LEVELS.items()
+      *(dict(testcase_name=name, levels_fn=fn) for name, fn in LEVELS.items()),
+      dict(
+          testcase_name='ecmwf_like_moist',
+          levels_fn=LEVELS['ecmwf_like'],
+          moist=True,
+      ),
   )
-  def test_total_tendency_matches_reference(self, levels_fn):
+  def test_total_tendency_matches_reference(self, levels_fn, moist=False):
     """explicit_terms + implicit_terms reproduces the S&B (1981) tendencies.
 
     The state has a mountain in the surface pressure (so the reference-
     pressure linearization residuals are exercised), divergent flow and a
-    level-dependent reference temperature.
+    level-dependent reference temperature; the moist case couples humidity
+    and cloud tracers to the dynamics.
     """
-    equation, state = self._equation(levels_fn())
+    equation, state = self._equation(levels_fn(), moist=moist)
     grid = equation.coords.horizontal
     expected = simmons_burridge_reference_tendencies(state, equation)
     actual = grid.clip_wavenumbers(
@@ -418,10 +479,10 @@ class TotalEnergyConservationTest(parameterized.TestCase):
 
     Both vertical discretizations (Simmons & Burridge on hybrid levels and
     the sigma-coordinate scheme) conserve this discrete total energy, and the
-    spectral transform method integrates its tendency exactly for a state
-    whose nonlinear products are resolved by the quadrature, so it must
-    vanish to round-off (about 1e-9 per day relative to the total energy at
-    this resolution, versus 1e-7 to 1e-4 for an inconsistent discretization).
+    spectral transform method integrates its tendency to quadrature error
+    for a state whose nonlinear products are smooth, so it must nearly vanish
+    (about 1e-9 per day relative to the total energy at this resolution,
+    versus 1e-7 to 1e-4 for an inconsistent discretization).
     """
     grid = spherical_harmonic.Grid.with_wavenumbers(21)
     physics_specs = units.SimUnits.from_si()
