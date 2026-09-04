@@ -561,12 +561,17 @@ def get_temperature_implicit_sigma(
   if method == 'dense':
     return _vertical_matvec(weights, divergence)
   elif method == 'sparse':
+    # Off the diagonal, `weights[r, s] = c_r Δ𝜎_s` with `c_r` depending only
+    # on the row and on whether `s < r` or `s > r`, so the matrix-vector
+    # product reduces to cumulative sums of the thickness-weighted divergence.
+    thickness = coordinates.layer_thickness
     diag_weights = np.diag(weights)
-    up_weights = np.concatenate([[0], weights[1:, 0]])
-    down_weights = np.concatenate([weights[:-1, -1], [0]])
+    up_weights = np.concatenate([[0], weights[1:, 0] / thickness[0]])
+    down_weights = np.concatenate([weights[:-1, -1] / thickness[-1], [0]])
+    weighted_divergence = thickness[:, np.newaxis, np.newaxis] * divergence
     up_divergence = (
-        jax_numpy_utils.cumsum(divergence, axis=0, sharding=sharding)
-        - divergence
+        jax_numpy_utils.cumsum(weighted_divergence, axis=0, sharding=sharding)
+        - weighted_divergence
     )
     result = (
         up_weights[:, np.newaxis, np.newaxis] * up_divergence
@@ -575,8 +580,10 @@ def get_temperature_implicit_sigma(
     if (down_weights != 0).any():
       # down_weights is only non-zero for non-constant reference temperature
       down_divergence = (
-          jax_numpy_utils.reverse_cumsum(divergence, axis=0, sharding=sharding)
-          - divergence
+          jax_numpy_utils.reverse_cumsum(
+              weighted_divergence, axis=0, sharding=sharding
+          )
+          - weighted_divergence
       )
       result += down_weights[:, np.newaxis, np.newaxis] * down_divergence
     return result

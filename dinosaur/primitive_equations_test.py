@@ -406,17 +406,25 @@ class PrimitiveEquationsSigmaImplicitTest(parameterized.TestCase):
       dict(
           testcase_name='variable_reference_temperature',
           reference_temperature=np.linspace(100, 200, 5),
+          coordinates=sigma_coordinates.SigmaCoordinates.equidistant(5),
       ),
       dict(
           testcase_name='constant_reference_temperature',
           reference_temperature=100 * np.ones(5),
+          coordinates=sigma_coordinates.SigmaCoordinates.equidistant(5),
+      ),
+      dict(
+          testcase_name='non_equidistant_levels',
+          reference_temperature=np.linspace(100, 200, 5),
+          coordinates=sigma_coordinates.SigmaCoordinates(
+              np.array([0.0, 0.05, 0.2, 0.5, 0.8, 1.0])
+          ),
       ),
   )
   def test_get_temperature_implicit_sigma_both_ways(
-      self, reference_temperature
+      self, reference_temperature, coordinates
   ):
     divergence = np.random.RandomState(0).randn(5, 1, 1)
-    coordinates = sigma_coordinates.SigmaCoordinates.equidistant(5)
     kappa = 2 / 7
     result_matvec = primitive_equations.get_temperature_implicit_sigma(
         divergence, coordinates, reference_temperature, kappa, method='dense'
