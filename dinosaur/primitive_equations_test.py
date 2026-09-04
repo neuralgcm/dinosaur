@@ -2388,6 +2388,27 @@ class PrimitiveEquationsHybridTest(parameterized.TestCase):
               implicit_inverse_method=method,
           )
 
+  def test_vertical_advection_field_is_backward_compatible(self):
+    """The default `vertical_advection` is accepted; custom ones are rejected."""
+    levels = hybrid_coordinates.HybridCoordinates.ecmwf137_interpolated(5)
+    coords = coordinate_systems.CoordinateSystem(
+        spherical_harmonic.Grid.with_wavenumbers(16), levels
+    )
+    l, _ = coords.horizontal.modal_mesh
+    args = (
+        280 * np.ones(levels.layers),
+        np.zeros_like(l),
+        coords,
+        units.SimUnits.from_si(),
+    )
+    primitive_equations.PrimitiveEquationsHybrid(
+        *args, vertical_advection=hybrid_coordinates.centered_vertical_advection
+    )
+    with self.assertRaisesRegex(ValueError, 'vertical_advection'):
+      primitive_equations.PrimitiveEquationsHybrid(
+          *args, vertical_advection=lambda w, x, coordinates: x
+      )
+
   def test_stationarity_sigma_like(self):
     """Tests that isothermal rest state is stationary."""
     wavenumbers = 42
