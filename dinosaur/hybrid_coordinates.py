@@ -445,8 +445,22 @@ class HybridCoordinates:
     Returns:
       The minimum surface pressure in the units of `a_boundaries`, or 0 if the
       layers are positive for any surface pressure.
+
+    Raises:
+      ValueError: if no surface pressure makes all layers positive, i.e. if
+        `B` decreases somewhere or a pure pressure layer has no thickness.
     """
     da, db = self.pressure_thickness, self.sigma_thickness
+    if (db < 0).any():
+      raise ValueError(
+          f'expected non-decreasing b_boundaries, got {self.b_boundaries}'
+      )
+    if ((db == 0) & (da <= 0)).any():
+      raise ValueError(
+          'expected positive thickness for layers with constant B, got '
+          f'a_boundaries={self.a_boundaries} and '
+          f'b_boundaries={self.b_boundaries}'
+      )
     positive = db > 0
     if not positive.any():
       return 0.0
@@ -532,9 +546,10 @@ class HybridCoordinates:
     Args:
       n_levels: number of layers.
       p_top: optional model top pressure in hPa. If given, the ECMWF
-        interfaces above `p_top` (for a standard surface pressure of
-        1013.25 hPa) are dropped before interpolating, so the top interface
-        is the first ECMWF interface at or below `p_top`. The full ECMWF
+        interfaces with pressure below `p_top` (for a standard surface
+        pressure of 1013.25 hPa) are dropped before interpolating, so the
+        top interface is the first one with pressure at or above `p_top`
+        (10.4 hPa for `p_top=10`). The full ECMWF
         set extends to 0 hPa with a 0.02 hPa top layer; without an upper
         sponge, a dynamical core with such a high top can become unstable
         at high horizontal resolution, and `p_top` of order 1-10 hPa gives

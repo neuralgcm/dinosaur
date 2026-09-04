@@ -206,6 +206,21 @@ class HybridCoordinatesTest(parameterized.TestCase):
     if minimum > 0:
       self.assertTrue((levels.layer_thickness(minimum - 1.0) <= 0).any())
 
+  def test_minimum_surface_pressure_rejects_invalid_layers(self):
+    """Layers that no surface pressure can make positive are an error."""
+    with self.subTest('decreasing B'):
+      with self.assertRaisesRegex(ValueError, 'non-decreasing'):
+        _ = hybrid_coordinates.HybridCoordinates(
+            a_boundaries=np.array([0.0, 100.0, 0.0]),
+            b_boundaries=np.array([0.0, 0.6, 0.5]),
+        ).minimum_surface_pressure
+    with self.subTest('pure pressure layer without thickness'):
+      with self.assertRaisesRegex(ValueError, 'positive'):
+        _ = hybrid_coordinates.HybridCoordinates(
+            a_boundaries=np.array([0.0, 100.0, 100.0, 0.0]),
+            b_boundaries=np.array([0.0, 0.0, 0.0, 1.0]),
+        ).minimum_surface_pressure
+
   def test_ecmwf137_interpolated_with_model_top(self):
     """`p_top` drops the ECMWF interfaces above it before interpolating."""
     levels = hybrid_coordinates.HybridCoordinates.ecmwf137_interpolated(
