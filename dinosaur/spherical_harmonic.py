@@ -75,26 +75,46 @@ class _SphericalHarmonicBasis:
     w: nodal quadrature weights.
   """
 
-  # The large Fourier and Legendre matrices are stored as jax (device) arrays
-  # because as of jax 0.11, jnp.einsum embeds a fresh copy of a numpy operand
-  # at every call site instead of deduplicating (~1.7GB of duplicated
-  # constants when lowering a T170 model step, versus ~50MB deduplicated);
-  # jax.Array operands are deduplicated by identity. `f` is None for
-  # implementations that do not use an explicit Fourier matrix.
-  f: jax.Array | None
-  p: jax.Array
+  # The large Fourier and Legendre matrices can be stored either as jax (device)
+  # arrays or as numpy arrays. jax.Array operands are de-duplicated by identity
+  # in jnp.einsum (important for FastSphericalHarmonics). numpy arrays allow XLA
+  # constant-folding but may be duplicated at each call site during lowering
+  # (acceptable for RealSphericalHarmonics where total size is smaller).
+  # `f` is None for implementations that do not use an explicit Fourier matrix.
+  f: np.ndarray | jax.Array | None
+  p: np.ndarray | jax.Array
   w: np.ndarray
 
 
 def _make_basis(
-    f: np.ndarray | None, p: np.ndarray, w: np.ndarray
+    f: np.ndarray | None,
+    p: np.ndarray,
+    w: np.ndarray,
+    *,
+    as_jax_arrays: bool = True,
 ) -> _SphericalHarmonicBasis:
-  # ensure_compile_time_eval yields concrete arrays even if the basis is
-  # first evaluated inside a traced function (caching a tracer would leak)
-  with jax.ensure_compile_time_eval():
-    return _SphericalHarmonicBasis(
-        f=None if f is None else jnp.asarray(f), p=jnp.asarray(p), w=w
-    )
+  """Builds a _SphericalHarmonicBasis from numpy arrays.
+
+  Args:
+    f: Fourier matrix, or None for FFT-based implementations.
+    p: Legendre transform coefficients.
+    w: Nodal quadrature weights (always kept as numpy).
+    as_jax_arrays: if True (default), ``f`` and ``p`` are converted to
+      ``jax.Array`` so that ``jnp.einsum`` can de-duplicate them by identity.
+      If False they are kept as numpy arrays, which allows XLA constant folding
+      but may be duplicated at each einsum call site during lowering.
+
+  Returns:
+    A _SphericalHarmonicBasis instance.
+  """
+  if as_jax_arrays:
+    # ensure_compile_time_eval yields concrete arrays even if the basis is
+    # first evaluated inside a traced function (caching a tracer would leak)
+    with jax.ensure_compile_time_eval():
+      return _SphericalHarmonicBasis(
+          f=None if f is None else jnp.asarray(f), p=jnp.asarray(p), w=w
+      )
+  return _SphericalHarmonicBasis(f=f, p=p, w=w)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -116,6 +136,11 @@ class SphericalHarmonics:
       'gauss' is passed, then Gauss-Legendre nodes are used. If 'equiangular' or
       'equiangular_with_poles' is passed, then the nodes are equally spaced in
       latitude (without or with points at the poles, respectively).
+    basis_as_jax_arrays: controls whether the Fourier / Legendre basis matrices
+      are stored as ``jax.Array`` (de-duplicated by identity in ``jnp.einsum``)
+      or as numpy arrays (eligible for XLA constant-folding, but may be
+      duplicated at each call site during lowering). ``None`` (default) lets
+      each subclass choose its own preferred default.
   """
 
   longitude_wavenumbers: int = 0
@@ -123,6 +148,7 @@ class SphericalHarmonics:
   longitude_nodes: int = 0
   latitude_nodes: int = 0
   latitude_spacing: str = 'gauss'
+  basis_as_jax_arrays: bool | None = None
 
   @property
   def nodal_axes(self) -> tuple[np.ndarray, np.ndarray]:
@@ -281,7 +307,12 @@ class RealSphericalHarmonics(SphericalHarmonics):
     # When m = 0, the associated Legendre polynomial is paired only with the
     # constant component of the Fourier matrix, so we only need one copy.
     p = p[1:]
-    return _make_basis(f, p, w)
+    as_jax_arrays = (
+        self.basis_as_jax_arrays
+        if self.basis_as_jax_arrays is not None
+        else False  # default to numpy arrays.
+    )
+    return _make_basis(f, p, w, as_jax_arrays=as_jax_arrays)
 
   def inverse_transform(self, x):
     p = self.basis.p
@@ -646,7 +677,12 @@ class FastSphericalHarmonics(SphericalHarmonics):
     )
     p = np.pad(p, [(0, modal_pad_x // 2), (0, nodal_pad_y), (0, modal_pad_y)])
 
-    return _make_basis(f, p, w)
+    as_jax_arrays = (
+        self.basis_as_jax_arrays
+        if self.basis_as_jax_arrays is not None
+        else False
+    )
+    return _make_basis(f, p, w, as_jax_arrays=as_jax_arrays)
 
   @functools.cached_property
   def _fft_forward_scale(self) -> jax.Array:
@@ -843,6 +879,10 @@ class Grid:
     spmd_mesh: mesh to use for parallelism in the single program multiple device
       (SPMD) paradigm with distributed JAX arrays, if any. Required if using
       model parallelism.
+    basis_as_jax_arrays: controls whether the Fourier / Legendre basis matrices
+      are stored as ``jax.Array`` or as numpy arrays. See
+      ``SphericalHarmonics.basis_as_jax_arrays`` for details. ``None`` (default)
+      defers to the subclass default.
   """
 
   longitude_wavenumbers: int = 0
@@ -854,6 +894,7 @@ class Grid:
   radius: float | None = None
   spherical_harmonics_impl: SphericalHarmonicsImpl = RealSphericalHarmonics
   spmd_mesh: jax.sharding.Mesh | None = None
+  basis_as_jax_arrays: bool | None = None
 
   def __post_init__(self):
     if self.radius is None:
@@ -1080,6 +1121,7 @@ class Grid:
         longitude_nodes=self.longitude_nodes,
         latitude_nodes=self.latitude_nodes,
         latitude_spacing=self.latitude_spacing,
+        basis_as_jax_arrays=self.basis_as_jax_arrays,
         **kwargs,
     )
 
