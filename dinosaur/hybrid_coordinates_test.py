@@ -177,6 +177,66 @@ class HybridCoordinatesTest(parameterized.TestCase):
     self.assertAlmostEqual(levels.a_boundaries[-1], 0.0)
     self.assertAlmostEqual(levels.b_boundaries[-1], 1.0)
 
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='analytic_defaults',
+          levels=hybrid_coordinates.HybridCoordinates.analytic_levels(32),
+          expected_range=(600.0, 700.0),
+      ),
+      dict(
+          testcase_name='ecmwf137',
+          levels=hybrid_coordinates.HybridCoordinates.ECMWF137(),
+          expected_range=(200.0, 320.0),
+      ),
+      dict(
+          testcase_name='sigma_like',
+          levels=hybrid_coordinates.HybridCoordinates.from_sigma_levels(
+              sigma_coordinates.SigmaCoordinates.equidistant(8)
+          ),
+          expected_range=(0.0, 0.0),
+      ),
+  )
+  def test_minimum_surface_pressure(self, levels, expected_range):
+    """Layers are all positive exactly above `minimum_surface_pressure`."""
+    minimum = levels.minimum_surface_pressure
+    low, high = expected_range
+    self.assertGreaterEqual(minimum, low)
+    self.assertLessEqual(minimum, high)
+    self.assertTrue((levels.layer_thickness(minimum + 1.0) > 0).all())
+    if minimum > 0:
+      self.assertTrue((levels.layer_thickness(minimum - 1.0) <= 0).any())
+
+  def test_minimum_surface_pressure_rejects_invalid_layers(self):
+    """Layers that no surface pressure can make positive are an error."""
+    with self.subTest('decreasing B'):
+      with self.assertRaisesRegex(ValueError, 'non-decreasing'):
+        _ = hybrid_coordinates.HybridCoordinates(
+            a_boundaries=np.array([0.0, 100.0, 0.0]),
+            b_boundaries=np.array([0.0, 0.6, 0.5]),
+        ).minimum_surface_pressure
+    with self.subTest('pure pressure layer without thickness'):
+      with self.assertRaisesRegex(ValueError, 'positive'):
+        _ = hybrid_coordinates.HybridCoordinates(
+            a_boundaries=np.array([0.0, 100.0, 100.0, 0.0]),
+            b_boundaries=np.array([0.0, 0.0, 0.0, 1.0]),
+        ).minimum_surface_pressure
+
+  def test_ecmwf137_interpolated_with_model_top(self):
+    """`p_top` drops the ECMWF interfaces above it before interpolating."""
+    levels = hybrid_coordinates.HybridCoordinates.ecmwf137_interpolated(
+        32, p_top=10.0
+    )
+    self.assertEqual(levels.layers, 32)
+    # the top interface is the first ECMWF interface at or below 10 hPa
+    # (for a standard surface pressure), and is a pure pressure level
+    self.assertGreaterEqual(levels.a_boundaries[0], 10.0)
+    self.assertLess(levels.a_boundaries[0], 12.0)
+    self.assertEqual(levels.b_boundaries[0], 0.0)
+    self.assertEqual(levels.b_boundaries[-1], 1.0)
+    self.assertTrue((levels.layer_thickness(1013.25) > 0).all())
+    default = hybrid_coordinates.HybridCoordinates.ecmwf137_interpolated(32)
+    self.assertEqual(default.a_boundaries[0], 0.0)
+
   def test_from_sigma_levels(self):
     sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(10)
     hybrid_levels = hybrid_coordinates.HybridCoordinates.from_sigma_levels(
