@@ -2721,9 +2721,6 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
   their discrete total energy to round-off.
   """
 
-  vertical_advection: Callable[..., jax.Array] = dataclasses.field(
-      default=hybrid_coordinates.centered_vertical_advection, kw_only=True
-  )
   reference_surface_pressure: typing.Quantity = dataclasses.field(
       default=(101325.0 * scales.units.pascal), kw_only=True  # pyrefly: ignore[unsupported-operation]
   )
@@ -2733,6 +2730,11 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
 
   def __post_init__(self):
     super().__post_init__()
+    if self.implicit_inverse_method != 'split':
+      raise ValueError(
+          'only implicit_inverse_method="split" is implemented on hybrid '
+          f'levels, got {self.implicit_inverse_method!r}'
+      )
     nondim_reference_surface_pressure = self.physics_specs.nondimensionalize(
         self.reference_surface_pressure
     )
@@ -2758,13 +2760,10 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
 
   @jax.named_call
   def _vertical_tendency(
-      self, w: Array, x: Array, pressure_thickness: Array | None = None
+      self, w: Array, x: Array, pressure_thickness: Array
   ) -> Array:
-    """Computes vertical nodal tendency of `x`."""
-    if pressure_thickness is not None:
-      return hybrid_vertical_advection(w, x, pressure_thickness)
-    else:
-      return self.vertical_advection(w, x, self.coords.vertical)
+    """Computes vertical nodal tendency of `x` due to interface mass flux `w`."""
+    return hybrid_vertical_advection(w, x, pressure_thickness)
 
   def _get_geopotential_diff(
       self,
