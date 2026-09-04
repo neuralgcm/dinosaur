@@ -159,14 +159,19 @@ def centered_difference(
     coordinates: HybridCoordinates,
     axis: int = -3,
 ) -> Array:
-  """Derivative of `x` with respect to `η` along specified `axis`.
+  """Derivative of `x` with respect to the sigma coefficient `B` along `axis`.
 
   The derivative is approximated as
 
-  (∂x / ∂η)[n + ½] ≈ (x[n + 1] - x[n]) / (η[n + 1] - η[n])
+  (∂x / ∂B)[n + ½] ≈ (x[n + 1] - x[n]) / (B[n + 1] - B[n])
 
-  So, the derivatives will be located on the 'boundaries' between layers and
-  will consist of one fewer values than `x`.
+  with `B` evaluated at layer centers, so the derivatives will be located on
+  the 'boundaries' between layers and will consist of one fewer values than
+  `x`. This is only meaningful where `B` increases between layers, i.e. for
+  sigma-like coordinates; it is undefined (division by zero) in the pure
+  pressure region of genuinely hybrid levels, where the primitive equations
+  use the mass-flux form `primitive_equations.hybrid_vertical_advection`
+  instead.
 
   Args:
     x: an array of values with `x.shape[axis] == coordinates.layers`. These
@@ -206,7 +211,13 @@ def centered_vertical_advection(
     w_boundary_values: tuple[Array, Array] | None = None,
     dx_dη_boundary_values: tuple[Array, Array] | None = None,
 ) -> jnp.ndarray:
-  """Compute vertical advection using 2nd order finite differences."""
+  """Compute vertical advection using 2nd order finite differences.
+
+  Computes `-(w * ∂x/∂B)[n]` at layer centers with averaging, like
+  `sigma_coordinates.centered_vertical_advection` with the sigma coefficient
+  `B` as the vertical coordinate; see `centered_difference` for the
+  restriction to sigma-like levels.
+  """
   if w_boundary_values is None:
     w_slc_shape = _slice_shape_along_axis(w, axis)  # pyrefly: ignore[bad-argument-type]
     w_boundary_values = (
@@ -313,11 +324,16 @@ class HybridCoordinates:
     Args:
         n_levels: Number of vertical layers (resulting in n_levels + 1
           interfaces).
-        p_top: The pressure at the top of the model (in Pascals).
+        p_top: The pressure at the top of the model, in the same units as
+          `p0` (hPa by default).
         p0: Reference surface pressure (P0) for defining A coefficients.
         sigma_exponent: Controls the "hybridization". 1.0 = Pure Sigma (terrain
           following everywhere). >1.0 = Hybrid (becomes more isobaric aloft).
-          Typical values are 3.0 to 5.0 for Earth-like atmospheres.
+          Typical values are 3.0 to 5.0 for Earth-like atmospheres. Note that
+          the near-surface layers invert where the surface pressure drops
+          below `p0 * (1 - 1 / sigma_exponent)` (about 650 hPa with the
+          defaults, i.e. over the highest terrain on Earth); see
+          `minimum_surface_pressure`.
         stretch_exponent: Controls vertical resolution spacing. 1.0 = Linear
           spacing. >1.0 = Concentrates levels near the surface (PBL).
     """
@@ -415,6 +431,26 @@ class HybridCoordinates:
     """Returns the eta values for a given pressure."""
     etas = self.a_centers / p_surface + self.b_centers
     return etas
+
+  @property
+  def minimum_surface_pressure(self) -> float:
+    """Smallest surface pressure at which all layers have positive thickness.
+
+    A layer with `ΔA_k + ΔB_k * p_s <= 0` is inverted, and the primitive
+    equations divide by layer thickness. Terrain-following coefficients that
+    decrease too quickly with height (large `sigma_exponent` in
+    `analytic_levels`) can invert layers over high terrain; operational level
+    sets (`ECMWF137`, `UFS127`) stay valid to well below 400 hPa.
+
+    Returns:
+      The minimum surface pressure in the units of `a_boundaries`, or 0 if the
+      layers are positive for any surface pressure.
+    """
+    da, db = self.pressure_thickness, self.sigma_thickness
+    positive = db > 0
+    if not positive.any():
+      return 0.0
+    return max(0.0, float((-da[positive] / db[positive]).max()))
 
   @property
   def pressure_thickness(self) -> np.ndarray:

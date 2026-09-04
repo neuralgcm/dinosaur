@@ -177,6 +177,35 @@ class HybridCoordinatesTest(parameterized.TestCase):
     self.assertAlmostEqual(levels.a_boundaries[-1], 0.0)
     self.assertAlmostEqual(levels.b_boundaries[-1], 1.0)
 
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='analytic_defaults',
+          levels=hybrid_coordinates.HybridCoordinates.analytic_levels(32),
+          expected_range=(600.0, 700.0),
+      ),
+      dict(
+          testcase_name='ecmwf137',
+          levels=hybrid_coordinates.HybridCoordinates.ECMWF137(),
+          expected_range=(200.0, 320.0),
+      ),
+      dict(
+          testcase_name='sigma_like',
+          levels=hybrid_coordinates.HybridCoordinates.from_sigma_levels(
+              sigma_coordinates.SigmaCoordinates.equidistant(8)
+          ),
+          expected_range=(0.0, 0.0),
+      ),
+  )
+  def test_minimum_surface_pressure(self, levels, expected_range):
+    """Layers are all positive exactly above `minimum_surface_pressure`."""
+    minimum = levels.minimum_surface_pressure
+    low, high = expected_range
+    self.assertGreaterEqual(minimum, low)
+    self.assertLessEqual(minimum, high)
+    self.assertTrue((levels.layer_thickness(minimum + 1.0) > 0).all())
+    if minimum > 0:
+      self.assertTrue((levels.layer_thickness(minimum - 1.0) <= 0).any())
+
   def test_from_sigma_levels(self):
     sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(10)
     hybrid_levels = hybrid_coordinates.HybridCoordinates.from_sigma_levels(
