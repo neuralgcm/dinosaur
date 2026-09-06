@@ -159,14 +159,19 @@ def centered_difference(
     coordinates: HybridCoordinates,
     axis: int = -3,
 ) -> Array:
-  """Derivative of `x` with respect to `η` along specified `axis`.
+  """Derivative of `x` with respect to the sigma coefficient `B` along `axis`.
 
   The derivative is approximated as
 
-  (∂x / ∂η)[n + ½] ≈ (x[n + 1] - x[n]) / (η[n + 1] - η[n])
+  (∂x / ∂B)[n + ½] ≈ (x[n + 1] - x[n]) / (B[n + 1] - B[n])
 
-  So, the derivatives will be located on the 'boundaries' between layers and
-  will consist of one fewer values than `x`.
+  with `B` evaluated at layer centers, so the derivatives will be located on
+  the 'boundaries' between layers and will consist of one fewer values than
+  `x`. This is only meaningful where `B` increases between layers, i.e. for
+  sigma-like coordinates; it is undefined (division by zero) in the pure
+  pressure region of genuinely hybrid levels, where the primitive equations
+  use the mass-flux form `primitive_equations.hybrid_vertical_advection`
+  instead.
 
   Args:
     x: an array of values with `x.shape[axis] == coordinates.layers`. These
@@ -206,7 +211,13 @@ def centered_vertical_advection(
     w_boundary_values: tuple[Array, Array] | None = None,
     dx_dη_boundary_values: tuple[Array, Array] | None = None,
 ) -> jnp.ndarray:
-  """Compute vertical advection using 2nd order finite differences."""
+  """Compute vertical advection using 2nd order finite differences.
+
+  Computes `-(w * ∂x/∂B)[n]` at layer centers with averaging, like
+  `sigma_coordinates.centered_vertical_advection` with the sigma coefficient
+  `B` as the vertical coordinate; see `centered_difference` for the
+  restriction to sigma-like levels.
+  """
   if w_boundary_values is None:
     w_slc_shape = _slice_shape_along_axis(w, axis)  # pyrefly: ignore[bad-argument-type]
     w_boundary_values = (
@@ -313,11 +324,16 @@ class HybridCoordinates:
     Args:
         n_levels: Number of vertical layers (resulting in n_levels + 1
           interfaces).
-        p_top: The pressure at the top of the model (in Pascals).
+        p_top: The pressure at the top of the model, in the same units as
+          `p0` (hPa by default).
         p0: Reference surface pressure (P0) for defining A coefficients.
         sigma_exponent: Controls the "hybridization". 1.0 = Pure Sigma (terrain
           following everywhere). >1.0 = Hybrid (becomes more isobaric aloft).
-          Typical values are 3.0 to 5.0 for Earth-like atmospheres.
+          Typical values are 3.0 to 5.0 for Earth-like atmospheres. Note that
+          the near-surface layers invert where the surface pressure drops
+          below `p0 * (1 - 1 / sigma_exponent)` (about 650 hPa with the
+          defaults, i.e. over the highest terrain on Earth); see
+          `minimum_surface_pressure`.
         stretch_exponent: Controls vertical resolution spacing. 1.0 = Linear
           spacing. >1.0 = Concentrates levels near the surface (PBL).
     """
@@ -417,6 +433,40 @@ class HybridCoordinates:
     return etas
 
   @property
+  def minimum_surface_pressure(self) -> float:
+    """Smallest surface pressure at which all layers have positive thickness.
+
+    A layer with `ΔA_k + ΔB_k * p_s <= 0` is inverted, and the primitive
+    equations divide by layer thickness. Terrain-following coefficients that
+    decrease too quickly with height (large `sigma_exponent` in
+    `analytic_levels`) can invert layers over high terrain; operational level
+    sets (`ECMWF137`, `UFS127`) stay valid to well below 400 hPa.
+
+    Returns:
+      The minimum surface pressure in the units of `a_boundaries`, or 0 if the
+      layers are positive for any surface pressure.
+
+    Raises:
+      ValueError: if no surface pressure makes all layers positive, i.e. if
+        `B` decreases somewhere or a pure pressure layer has no thickness.
+    """
+    da, db = self.pressure_thickness, self.sigma_thickness
+    if (db < 0).any():
+      raise ValueError(
+          f'expected non-decreasing b_boundaries, got {self.b_boundaries}'
+      )
+    if ((db == 0) & (da <= 0)).any():
+      raise ValueError(
+          'expected positive thickness for layers with constant B, got '
+          f'a_boundaries={self.a_boundaries} and '
+          f'b_boundaries={self.b_boundaries}'
+      )
+    positive = db > 0
+    if not positive.any():
+      return 0.0
+    return max(0.0, float((-da[positive] / db[positive]).max()))
+
+  @property
   def pressure_thickness(self) -> np.ndarray:
     """Returns thickness of pressure part of hybrid coordinates."""
     return np.diff(self.a_boundaries)
@@ -486,15 +536,40 @@ class HybridCoordinates:
   def ecmwf137_interpolated(
       cls,
       n_levels: int,
+      p_top: float | None = None,
   ) -> HybridCoordinates:
-    """Returns hybrid coordinates interpolated from ECMWF 137 levels."""
-    base = cls.ECMWF137()
+    """Returns hybrid coordinates interpolated from ECMWF 137 levels.
 
-    x_old = np.linspace(0, 1, base.layers + 1)
+    The A and B coefficients of the 138 ECMWF interfaces are linearly
+    interpolated in interface index to `n_levels + 1` interfaces.
+
+    Args:
+      n_levels: number of layers.
+      p_top: optional model top pressure in hPa. If given, the ECMWF
+        interfaces with pressure below `p_top` (for a standard surface
+        pressure of 1013.25 hPa) are dropped before interpolating, so the
+        top interface is the first one with pressure at or above `p_top`
+        (10.4 hPa for `p_top=10`). The full ECMWF
+        set extends to 0 hPa with a 0.02 hPa top layer; without an upper
+        sponge, a dynamical core with such a high top can become unstable
+        at high horizontal resolution, and `p_top` of order 1-10 hPa gives
+        a level set comparable to sigma coordinates.
+
+    Returns:
+      Hybrid coordinates with `n_levels` layers (A in hPa).
+    """
+    base = cls.ECMWF137()
+    a_base, b_base = base.a_boundaries, base.b_boundaries
+    if p_top is not None:
+      p_half = a_base + b_base * 1013.25
+      first = int(np.searchsorted(p_half, p_top))
+      a_base, b_base = a_base[first:], b_base[first:]
+
+    x_old = np.linspace(0, 1, len(a_base))
     x_new = np.linspace(0, 1, n_levels + 1)
 
-    a_new = np.interp(x_new, x_old, base.a_boundaries)
-    b_new = np.interp(x_new, x_old, base.b_boundaries)
+    a_new = np.interp(x_new, x_old, a_base)
+    b_new = np.interp(x_new, x_old, b_base)
 
     return cls(a_boundaries=a_new, b_boundaries=b_new)  # pyrefly: ignore[bad-argument-type]
 

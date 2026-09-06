@@ -473,12 +473,15 @@ def baroclinic_perturbation_jw(
   lat = np.arcsin(sin_lat)
   levels = coords.vertical
   if isinstance(levels, hybrid_coordinates.HybridCoordinates):
-    # perturbation is independent of levels, so we use a fixed ref pressure.
+    # The perturbation is independent of height, so any reference surface
+    # pressure gives the same result; use the 1000 hPa of the test case.
     nondim_levels = hybrid_coordinates.HybridCoordinates(
         physics_specs.nondimensionalize(levels.a_boundaries * hpa_quantity),  # pyrefly: ignore[bad-argument-type]
         levels.b_boundaries,
     )
-    etas = nondim_levels.get_eta(1000.0)
+    etas = nondim_levels.get_eta(
+        physics_specs.nondimensionalize(1000 * hpa_quantity)
+    )
   elif isinstance(levels, sigma_coordinates.SigmaCoordinates):
     etas = levels.centers
   else:

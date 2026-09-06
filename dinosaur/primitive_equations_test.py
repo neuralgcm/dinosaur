@@ -406,17 +406,25 @@ class PrimitiveEquationsSigmaImplicitTest(parameterized.TestCase):
       dict(
           testcase_name='variable_reference_temperature',
           reference_temperature=np.linspace(100, 200, 5),
+          coordinates=sigma_coordinates.SigmaCoordinates.equidistant(5),
       ),
       dict(
           testcase_name='constant_reference_temperature',
           reference_temperature=100 * np.ones(5),
+          coordinates=sigma_coordinates.SigmaCoordinates.equidistant(5),
+      ),
+      dict(
+          testcase_name='non_equidistant_levels',
+          reference_temperature=np.linspace(100, 200, 5),
+          coordinates=sigma_coordinates.SigmaCoordinates(
+              np.array([0.0, 0.05, 0.2, 0.5, 0.8, 1.0])
+          ),
       ),
   )
   def test_get_temperature_implicit_sigma_both_ways(
-      self, reference_temperature
+      self, reference_temperature, coordinates
   ):
     divergence = np.random.RandomState(0).randn(5, 1, 1)
-    coordinates = sigma_coordinates.SigmaCoordinates.equidistant(5)
     kappa = 2 / 7
     result_matvec = primitive_equations.get_temperature_implicit_sigma(
         divergence, coordinates, reference_temperature, kappa, method='dense'
@@ -2335,45 +2343,25 @@ class PrimitiveEquationsHybridTest(parameterized.TestCase):
 
   @parameterized.parameters(
       dict(
-          grid=spherical_harmonic.Grid.with_wavenumbers(16),
-          layers=5,
-          implicit_inverse_method='split',
-          seed=0,
+          levels=hybrid_coordinates.HybridCoordinates.from_sigma_levels(
+              sigma_coordinates.SigmaCoordinates.equidistant(5)
+          ),
       ),
-      dict(
-          grid=spherical_harmonic.Grid.with_wavenumbers(16),
-          layers=5,
-          implicit_inverse_method='blockwise',
-          seed=0,
-      ),
-      dict(
-          grid=spherical_harmonic.Grid.with_wavenumbers(16),
-          layers=5,
-          implicit_inverse_method='stacked',
-          seed=0,
-      ),
+      dict(levels=hybrid_coordinates.HybridCoordinates.ecmwf137_interpolated(5)),
   )
-  def test_implicit_inverse_sigma_like(
-      self, grid, layers, implicit_inverse_method, seed
-  ):
+  def test_implicit_inverse(self, levels):
     """`implicit_inverse` computes (1 - step_size · implicit_terms)⁻¹."""
-    sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(layers)
-    hybrid_levels = hybrid_coordinates.HybridCoordinates.from_sigma_levels(
-        sigma_levels
-    )
-    coords = coordinate_systems.CoordinateSystem(grid, hybrid_levels)
+    grid = spherical_harmonic.Grid.with_wavenumbers(16)
+    layers = levels.layers
+    coords = coordinate_systems.CoordinateSystem(grid, levels)
     physics_specs = units.SimUnits.from_si()
-    state = random_state(coords, jax.random.PRNGKey(seed))
+    state = random_state(coords, jax.random.PRNGKey(0))
     reference_temperature = 280 * np.ones(layers)
     l, _ = coords.horizontal.modal_mesh
     modal_orography = np.zeros_like(l)
     step_size = 0.1
     primitive = primitive_equations.PrimitiveEquationsHybrid(
-        reference_temperature,
-        modal_orography,
-        coords,
-        physics_specs,
-        implicit_inverse_method=implicit_inverse_method,
+        reference_temperature, modal_orography, coords, physics_specs
     )
     implicit_terms = primitive.implicit_terms(state)
     primitive_equations.validate_state_shape(implicit_terms, coords)
@@ -2381,6 +2369,45 @@ class PrimitiveEquationsHybridTest(parameterized.TestCase):
     inverted_state = jitted_inverse(state - step_size * implicit_terms)
     primitive_equations.validate_state_shape(inverted_state, coords)
     assert_states_close(state, inverted_state, atol=1e-5)
+
+  def test_rejects_unsupported_implicit_inverse_method(self):
+    """Only the direct ('split') inverse is implemented on hybrid levels."""
+    levels = hybrid_coordinates.HybridCoordinates.ecmwf137_interpolated(5)
+    coords = coordinate_systems.CoordinateSystem(
+        spherical_harmonic.Grid.with_wavenumbers(16), levels
+    )
+    l, _ = coords.horizontal.modal_mesh
+    for method in ['blockwise', 'stacked']:
+      with self.subTest(method):
+        with self.assertRaisesRegex(ValueError, 'implicit_inverse_method'):
+          primitive_equations.PrimitiveEquationsHybrid(
+              280 * np.ones(levels.layers),
+              np.zeros_like(l),
+              coords,
+              units.SimUnits.from_si(),
+              implicit_inverse_method=method,
+          )
+
+  def test_vertical_advection_field_is_backward_compatible(self):
+    """The default `vertical_advection` is accepted; custom ones are rejected."""
+    levels = hybrid_coordinates.HybridCoordinates.ecmwf137_interpolated(5)
+    coords = coordinate_systems.CoordinateSystem(
+        spherical_harmonic.Grid.with_wavenumbers(16), levels
+    )
+    l, _ = coords.horizontal.modal_mesh
+    args = (
+        280 * np.ones(levels.layers),
+        np.zeros_like(l),
+        coords,
+        units.SimUnits.from_si(),
+    )
+    primitive_equations.PrimitiveEquationsHybrid(
+        *args, vertical_advection=hybrid_coordinates.centered_vertical_advection
+    )
+    with self.assertRaisesRegex(ValueError, 'vertical_advection'):
+      primitive_equations.PrimitiveEquationsHybrid(
+          *args, vertical_advection=lambda w, x, coordinates: x
+      )
 
   def test_stationarity_sigma_like(self):
     """Tests that isothermal rest state is stationary."""
