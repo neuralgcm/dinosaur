@@ -38,13 +38,12 @@ ArrayOrArrayTuple = typing.ArrayOrArrayTuple
 
 einsum = jax_numpy_utils.precise_einsum
 
-# The default algorithm for spherical harmonic transform matmuls: 3-pass
-# bfloat16 emulation (~2^-21 relative error), which is supported on CPU, GPU
-# and TPU, and runs on tensor cores / MXU at a fraction of the cost of full
-# float32 emulation. On TPU this matches the historical behavior of
-# Precision.HIGH; on GPU it is far more accurate than the historical
+# The default algorithm for spherical harmonic transform matmuls.
+# Setting to None allows `resolve_dot_precision` to use platform-optimal
+# Precision.HIGHEST on TPU (with native multi-pass),
+# BF16_BF16_F32_X6 on GPU which is far more accurate than the historical
 # single-pass tensorfloat32.
-FAST_TRANSFORM_DOT_ALGORITHM = jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3
+FAST_TRANSFORM_DOT_ALGORITHM = None
 
 
 LATITUDE_SPACINGS = dict(
