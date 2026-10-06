@@ -162,7 +162,9 @@ def equation_of_time(orbital_phase: Numeric) -> jnp.ndarray:
   b = orbital_phase - SPRING_EQUINOX
   added_minutes = 9.87 * jnp.sin(2 * b) - 7.53 * jnp.cos(b) - 1.5 * jnp.sin(b)
   # Output normalized as a correction to synodic_phase
-  return 2 * jnp.pi * added_minutes / MINUTES_PER_DAY
+  return added_minutes * (
+      np.float32(2 * jnp.pi) * np.float32(1 / MINUTES_PER_DAY)
+  )
 
 
 def get_hour_angle(
@@ -238,6 +240,7 @@ class SolarRadiation:
       coords: coordinate_systems.CoordinateSystem,
       physics_specs: primitive_equations.PrimitiveEquationsSpecs,
       reference_datetime: datetime.datetime | np.datetime64,
+      dt: float | None = None,
   ):
     """Initialize SolarRadiation.
 
@@ -246,6 +249,7 @@ class SolarRadiation:
       physics_specs: object holding physical constants and definition of custom
         units to use for initialization of the state.
       reference_datetime: datetime corresponding to nondimensionalized time = 0.
+      dt: optional nondimensional timestep used to pre-multiply orbital_rate.
     """
     if isinstance(reference_datetime, np.datetime64):
       reference_datetime = datetime64_to_datetime(reference_datetime)
@@ -259,6 +263,7 @@ class SolarRadiation:
         physics_specs.nondimensionalize,
         OrbitalTime(2 * jnp.pi / units.year, 2 * jnp.pi / units.day),  # pyrefly: ignore[bad-argument-count, unsupported-operation]
     )
+    self.dt = dt
 
     self.total_solar_irradiance = physics_specs.nondimensionalize(
         TOTAL_SOLAR_IRRADIANCE
@@ -274,7 +279,14 @@ class SolarRadiation:
 
   def time_to_orbital_time(self, time: Numeric) -> OrbitalTime:
     """Returns the OribtalTime corresponding to the specified nondim time."""
-    orbital_time = self.reference_orbital_time + self.orbital_rate * time
+    if self.dt is not None:
+      steps = jnp.round(time / np.float32(self.dt))
+      rate_per_step = jax.tree_util.tree_map(
+          lambda r: np.float32(r) * np.float32(self.dt), self.orbital_rate
+      )
+      orbital_time = self.reference_orbital_time + rate_per_step * steps
+    else:
+      orbital_time = self.reference_orbital_time + self.orbital_rate * time
     # Reduce the magnitude of the result to avoid loss of precision errors
     # downstream. Avoid jnp.fmod, which is not very precise on float32.
     orbital_time -= orbital_time // (2 * jnp.pi) * (2 * jnp.pi)
@@ -306,12 +318,14 @@ class SolarRadiation:
       coords: coordinate_systems.CoordinateSystem,
       physics_specs: primitive_equations.PrimitiveEquationsSpecs,
       reference_datetime: datetime.datetime | np.datetime64,
+      dt: float | None = None,
   ) -> SolarRadiation:
     """Initialize SolarRadiation for normalized solar radiation."""
     this = cls(
         coords=coords,
         physics_specs=physics_specs,
         reference_datetime=reference_datetime,
+        dt=dt,
     )
     scale = this.total_solar_irradiance + this.solar_irradiance_variation
     this.total_solar_irradiance /= scale
