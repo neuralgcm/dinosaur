@@ -18,6 +18,7 @@ import functools
 from absl.testing import absltest
 import chex
 from dinosaur import coordinate_systems
+from dinosaur import hybrid_coordinates
 from dinosaur import primitive_equations
 from dinosaur import primitive_equations_states
 from dinosaur import pytree_utils
@@ -31,6 +32,11 @@ import jax
 from jax import config  # pylint: disable=g-importing-member
 import jax.numpy as jnp
 import numpy as np
+
+try:
+  chex.set_n_cpu_devices(8)  # set at top level so standalone pytest works
+except RuntimeError:
+  pass
 
 
 def make_coords(
@@ -233,8 +239,267 @@ class IntegrationTest(absltest.TestCase):
           real_out_nodal, fast_out_nodal, rtol=1e-4, range_tol=1e-5
       )
 
+  def test_semi_lagrangian_distributed_consistency(self):
+    physics_specs = units.SimUnits.from_si()
+    num_layers = 16
+    nodal_tracer_names = ('nodal_a', 'nodal_b', 'nodal_c')
+
+    def build_sl_coords(mesh):
+      return coordinate_systems.CoordinateSystem(
+          spherical_harmonic.Grid.T31(
+              spherical_harmonics_impl=spherical_harmonic.FastSphericalHarmonics,
+              radius=physics_specs.radius,
+          ),
+          sigma_coordinates.SigmaCoordinates.equidistant(num_layers),
+          spmd_mesh=mesh,
+      )
+
+    coords = build_sl_coords(None)
+    init_state_fn, aux_features = primitive_equations_states.steady_state_jw(
+        coords, physics_specs
+    )
+    init_state = init_state_fn() + (
+        primitive_equations_states.baroclinic_perturbation_jw(
+            coords, physics_specs
+        )
+    )
+    base_modal_tracer = primitive_equations_states.gaussian_scalar(
+        coords, physics_specs
+    )
+    base_nodal_tracer = jnp.maximum(
+        coords.horizontal.to_nodal(base_modal_tracer), 0.0
+    )
+    init_state.tracers = {
+        'specific_humidity': base_modal_tracer,
+        'modal_passive': 0.5 * base_modal_tracer,
+        'nodal_a': base_nodal_tracer,
+        'nodal_b': 0.3 * jnp.roll(base_nodal_tracer, shift=8, axis=1),
+        'nodal_c': 0.7 * jnp.roll(base_nodal_tracer, shift=4, axis=2),
+    }
+    init_state.sim_time = 0.0
+
+    # Non-zero unpadded nodal orography exercises terrain_smoothed_log_sp and
+    # automatic nodal padding handling.
+    lon_m, sin_lat_m = coords.horizontal.nodal_mesh
+    mountain_height = physics_specs.nondimensionalize(500 * scales.units.meter)
+    nodal_orography = (
+        mountain_height
+        * np.exp(
+            -(
+                ((lon_m[:96, :48] - 2.0) / 0.5) ** 2
+                + (sin_lat_m[:96, :48] / 0.3) ** 2
+            )
+        )
+    ).astype(np.float32)
+    ref_temps = aux_features[xarray_utils.REF_TEMP_KEY]
+    dt = physics_specs.nondimensionalize(30 * scales.units.minute)
+
+    def make_sl_sim_fn(c, method=None):
+      orog = primitive_equations.truncated_modal_orography(nodal_orography, c)
+      eq = primitive_equations.SemiLagrangianPrimitiveEquations(
+          ref_temps,
+          orog,
+          c,
+          physics_specs,
+          humidity_key='specific_humidity',
+          nodal_tracers=nodal_tracer_names,
+          monotone_tracers=True,
+          monotone_dynamics=True,
+          vertical_interpolation_order='cubic',
+          interpolation_method=method,
+      )
+      step_fn = time_integration.semi_lagrangian_crank_nicolson_rk2(
+          eq, time_step=dt
+      )
+      sim_fn = time_integration.repeated(step_fn, 2)
+      return jax.jit(lambda s: c.with_dycore_sharding(sim_fn(c.with_dycore_sharding(s))))
+
+    def pad_sl_state(state, dist_coords):
+      mpad_x, mpad_y = dist_coords.horizontal.modal_padding
+      npad_x, npad_y = dist_coords.horizontal.nodal_padding
+      pad_modal = lambda x: jnp.pad(x, [(0, 0), (0, mpad_x), (0, mpad_y)])
+      pad_nodal = lambda x: jnp.pad(x, [(0, 0), (0, npad_x), (0, npad_y)])
+      modal_part = state.replace(
+          tracers={
+              k: v for k, v in state.tracers.items() if k not in nodal_tracer_names
+          }
+      )
+      padded = pytree_utils.tree_map_over_nonscalars(pad_modal, modal_part)
+      padded_nodal = {
+          k: pad_nodal(state.tracers[k]) for k in nodal_tracer_names
+      }
+      return padded.replace(tracers={**padded.tracers, **padded_nodal})
+
+    def to_unpadded_nodal(state, dist_coords=None):
+      if dist_coords is not None:
+        mpad_x, mpad_y = dist_coords.horizontal.modal_padding
+        npad_x, npad_y = dist_coords.horizontal.nodal_padding
+        trim_m = lambda x: x[..., : -mpad_x or None, : -mpad_y or None]
+        trim_n = lambda x: x[..., : -npad_x or None, : -npad_y or None]
+      else:
+        trim_m = lambda x: x
+        trim_n = lambda x: x
+      modal_only = state.replace(
+          tracers={
+              k: v for k, v in state.tracers.items() if k not in nodal_tracer_names
+          }
+      )
+      nodal_state = coords.horizontal.to_nodal(
+          pytree_utils.tree_map_over_nonscalars(trim_m, modal_only)
+      )
+      nodal_tr = {
+          k: trim_n(state.tracers[k]) for k in nodal_tracer_names
+      }
+      return nodal_state.replace(tracers={**nodal_state.tracers, **nodal_tr})
+
+    ref_gather_out = to_unpadded_nodal(
+        make_sl_sim_fn(coords, method='gather')(init_state)
+    )
+    ref_matmul_out = to_unpadded_nodal(
+        make_sl_sim_fn(coords, method='matmul')(init_state)
+    )
+    with self.subTest('gather vs matmul unsharded'):
+      assert_states_close(
+          ref_gather_out, ref_matmul_out, rtol=2e-4, range_tol=2e-4, atol=1e-5
+      )
+
+    mesh_shapes = [
+        ('vertical_halo_ppermute', (2, 1, 1)),
+        ('horizontal_halo_ppermute', (1, 2, 4)),
+        ('full_3d_sharding', (2, 2, 2)),
+        ('lat_8_way_sharding', (1, 1, 8)),
+    ]
+    for name, shape in mesh_shapes:
+      with self.subTest(name):
+        n_dev = int(np.prod(shape))
+        mesh = jax.sharding.Mesh(
+            np.array(jax.devices()[:n_dev]).reshape(shape),
+            axis_names=['z', 'x', 'y'],
+        )
+        dist_coords = build_sl_coords(mesh)
+        dist_init = pad_sl_state(init_state, dist_coords)
+        dist_out = make_sl_sim_fn(dist_coords)(dist_init)
+        dist_nodal = to_unpadded_nodal(dist_out, dist_coords)
+        assert_states_close(
+            ref_matmul_out, dist_nodal, rtol=1e-5, range_tol=1e-5, atol=1e-6
+        )
+        for tr_name in nodal_tracer_names:
+          self.assertGreaterEqual(
+              float(np.min(np.asarray(dist_nodal.tracers[tr_name]))), -1e-7
+          )
+
+  def test_semi_lagrangian_hybrid_distributed_and_grad(self):
+    physics_specs = units.SimUnits.from_si()
+    num_layers = 16
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        num_layers, p_top=10.0
+    )
+
+    def build_hybrid_coords(mesh):
+      return coordinate_systems.CoordinateSystem(
+          spherical_harmonic.Grid.T31(
+              spherical_harmonics_impl=spherical_harmonic.FastSphericalHarmonics,
+              radius=physics_specs.radius,
+          ),
+          hybrid_levels,
+          spmd_mesh=mesh,
+      )
+
+    coords = build_hybrid_coords(None)
+    init_state_fn, features = primitive_equations_states.steady_state_jw(
+        coords, physics_specs
+    )
+    init_state = init_state_fn() + (
+        primitive_equations_states.baroclinic_perturbation_jw(
+            coords, physics_specs
+        )
+    )
+    q_modal = primitive_equations_states.gaussian_scalar(coords, physics_specs)
+    aerosol = jnp.maximum(coords.horizontal.to_nodal(q_modal), 0.0)
+    init_state.tracers = {
+        'specific_humidity': q_modal,
+        'aerosol_0': aerosol,
+        'aerosol_1': 0.5 * aerosol,
+    }
+    init_state.sim_time = 0.0
+    nodal_orography = features[xarray_utils.OROGRAPHY][:96, :48]
+    ref_temps = features[xarray_utils.REF_TEMP_KEY]
+    dt = physics_specs.nondimensionalize(30 * scales.units.minute)
+
+    def make_step_and_loss(c):
+      orog = primitive_equations.truncated_modal_orography(nodal_orography, c)
+      eq = primitive_equations.SemiLagrangianPrimitiveEquationsHybrid(
+          ref_temps,
+          orog,
+          c,
+          physics_specs,
+          humidity_key='specific_humidity',
+          nodal_tracers=('aerosol_0', 'aerosol_1'),
+          monotone_tracers=True,
+          vertical_interpolation_order='cubic',
+          interpolation_method='matmul',
+      )
+      step_fn = time_integration.semi_lagrangian_crank_nicolson_rk2(
+          eq, time_step=dt
+      )
+
+      def run_step(s):
+        return c.with_dycore_sharding(step_fn(c.with_dycore_sharding(s)))
+
+      def loss_fn(aerosol_in):
+        s = init_state if c.spmd_mesh is None else dist_init
+        s = s.replace(tracers={**s.tracers, 'aerosol_0': aerosol_in})
+        out = run_step(s)
+        return jnp.sum(out.tracers['aerosol_0'] ** 2)
+
+      return jax.jit(run_step), jax.jit(jax.grad(loss_fn))
+
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()[:8]).reshape((2, 2, 2)),
+        axis_names=['z', 'x', 'y'],
+    )
+    dist_coords = build_hybrid_coords(mesh)
+    mpad_x, mpad_y = dist_coords.horizontal.modal_padding
+    pad_m = lambda x: jnp.pad(x, [(0, 0), (0, mpad_x), (0, mpad_y)])
+    modal_only = init_state.replace(
+        tracers={'specific_humidity': init_state.tracers['specific_humidity']}
+    )
+    dist_init = pytree_utils.tree_map_over_nonscalars(pad_m, modal_only)
+    dist_init = dist_init.replace(
+        tracers={
+            **dist_init.tracers,
+            'aerosol_0': init_state.tracers['aerosol_0'],
+            'aerosol_1': init_state.tracers['aerosol_1'],
+        }
+    )
+
+    ref_step, ref_grad_fn = make_step_and_loss(coords)
+    dist_step, dist_grad_fn = make_step_and_loss(dist_coords)
+
+    ref_out = ref_step(init_state)
+    dist_out = dist_step(dist_init)
+    np.testing.assert_allclose(
+        coords.horizontal.to_nodal(ref_out.temperature_variation),
+        coords.horizontal.to_nodal(
+            dist_out.temperature_variation[..., : -mpad_x or None, : -mpad_y or None]
+        ),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        ref_out.tracers['aerosol_0'],
+        dist_out.tracers['aerosol_0'],
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+    grad_ref = ref_grad_fn(init_state.tracers['aerosol_0'])
+    grad_dist = dist_grad_fn(dist_init.tracers['aerosol_0'])
+    self.assertTrue(np.all(np.isfinite(np.asarray(grad_dist))))
+    self.assertGreater(float(np.max(np.abs(np.asarray(grad_dist)))), 0.0)
+    np.testing.assert_allclose(grad_dist, grad_ref, rtol=1e-4, atol=1e-5)
+
 
 if __name__ == '__main__':
-  chex.set_n_cpu_devices(8)
   config.update('jax_traceback_filtering', 'off')
   absltest.main()

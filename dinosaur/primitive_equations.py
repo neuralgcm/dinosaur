@@ -673,6 +673,23 @@ def div_sec_lat(
   return grid.div_cos_lat((m_component, n_component), clip=False)
 
 
+def _pad_nodal_orography(
+    orography: Array, grid: spherical_harmonic.Grid
+) -> Array:
+  """Zero-pads unpadded nodal `orography` when `grid.nodal_padding != (0, 0)`."""
+  expected_shape = grid.nodal_shape
+  unpadded_shape = (grid.longitude_nodes, grid.latitude_nodes)
+  if orography.shape == expected_shape:
+    return orography
+  if orography.shape == unpadded_shape:
+    pad_x, pad_y = grid.nodal_padding
+    return jnp.pad(orography, [(0, pad_x), (0, pad_y)])
+  raise ValueError(
+      f'Expected nodal orography with shape={expected_shape} or '
+      f'{unpadded_shape}; got {orography.shape}'
+  )
+
+
 def truncated_modal_orography(
     orography: Array,
     coords: coordinate_systems.CoordinateSystem,
@@ -680,9 +697,7 @@ def truncated_modal_orography(
 ) -> Array:
   """Returns modal orography with `n` highest wavenumbers truncated."""
   grid = coords.horizontal
-  expected_shape = grid.nodal_shape
-  if orography.shape != expected_shape:
-    raise ValueError(f'Expected nodal orography with shape={expected_shape}')
+  orography = _pad_nodal_orography(orography, grid)
   return grid.clip_wavenumbers(grid.to_modal(orography), n=wavenumbers_to_clip)
 
 
@@ -695,9 +710,7 @@ def filtered_modal_orography(
   """Returns modal `orography` interpolated to `coords` and filtered."""
   if input_coords is None:
     input_coords = coords
-  expected_shape = input_coords.horizontal.nodal_shape
-  if orography.shape != expected_shape:
-    raise ValueError(f'Expected nodal orography with shape={expected_shape}')
+  orography = _pad_nodal_orography(orography, input_coords.horizontal)
   interpolate_fn = coordinate_systems.get_spectral_interpolate_fn(
       input_coords, coords, expect_same_vertical=False
   )
@@ -1861,6 +1874,9 @@ def _semi_lagrangian_departure_points(
           iterations=equation.departure_iterations,
           vertical_nodes=vertical_nodes,
           initial_guess=None if no_guess else initial_guess.full,
+          method=equation.interpolation_method,
+          max_lat_shift=equation.max_lat_shift,
+          max_vertical_shift=equation.max_vertical_shift,
       ),
       horizontal=semi_lagrangian.horizontal_departure_points(
           velocities.u_mean,
@@ -1869,6 +1885,8 @@ def _semi_lagrangian_departure_points(
           dt,
           iterations=equation.departure_iterations,
           initial_guess=None if no_guess else initial_guess.horizontal,
+          method=equation.interpolation_method,
+          max_lat_shift=equation.max_lat_shift,
       ),
   )
 
@@ -1886,7 +1904,11 @@ def _semi_lagrangian_transport(
       'quasi_monotone' if equation.monotone_dynamics else None
   )
   interpolator = semi_lagrangian.GridInterpolator(
-      grid, equation.interpolation_order, dynamics_limiter
+      grid,
+      equation.interpolation_order,
+      dynamics_limiter,
+      method=equation.interpolation_method,
+      max_lat_shift=equation.max_lat_shift,
   )
   u, v = spherical_harmonic.vor_div_to_uv_nodal(
       grid, state.vorticity, state.divergence, clip=False
@@ -1899,6 +1921,7 @@ def _semi_lagrangian_transport(
       interpolator,
       planetary_rotation_rate=equation._planetary_rotation_rate,
       vertical_order=equation.vertical_interpolation_order,
+      max_vertical_shift=equation.max_vertical_shift,
   )
   vorticity, divergence = spherical_harmonic.uv_nodal_to_vor_div_modal(
       grid, u, v, clip=False
@@ -1916,6 +1939,7 @@ def _semi_lagrangian_transport(
           if dynamics_limiter
           else None
       ),
+      max_vertical_shift=equation.max_vertical_shift,
   )
   log_sp_nodal = grid.to_nodal(state.log_surface_pressure)
   if equation.terrain_smoothed_log_sp:
@@ -1931,28 +1955,63 @@ def _semi_lagrangian_transport(
   )
   if equation.terrain_smoothed_log_sp:
     log_surface_pressure = log_surface_pressure - correction
+
+  modal_names = [
+      name for name in state.tracers if name not in equation.nodal_tracers
+  ]
+  nodal_names = [
+      name for name in state.tracers if name in equation.nodal_tracers
+  ]
   modal_tracers = {}
   nodal_tracers = {}
-  transport_tracer = functools.partial(
-      semi_lagrangian.transport_scalar,
-      departure=departure.full,
-      vertical=vertical_nodes,
-      interpolator=semi_lagrangian.GridInterpolator(
-          grid,
-          equation.interpolation_order,
-          limiter='quasi_monotone' if equation.monotone_tracers else None,
-      ),
-      vertical_order=equation.vertical_interpolation_order,
-  )
-  for name, value in state.tracers.items():
-    if name in equation.nodal_tracers:
+  if modal_names or nodal_names:
+    tracer_interpolator = semi_lagrangian.GridInterpolator(
+        grid,
+        equation.interpolation_order,
+        limiter='quasi_monotone' if equation.monotone_tracers else None,
+        method=equation.interpolation_method,
+        max_lat_shift=equation.max_lat_shift,
+    )
+    tracer_batches = []
+    if modal_names:
+      if len(modal_names) == 1:
+        modal_nodal_batch = grid.to_nodal(state.tracers[modal_names[0]])[
+            jnp.newaxis, ...
+        ]
+      else:
+        modal_nodal_batch = grid.to_nodal(
+            jnp.stack([state.tracers[k] for k in modal_names], axis=0)
+        )
+      tracer_batches.append(modal_nodal_batch)
+    if nodal_names:
       # nodal tracers never touch the spectral basis: transport their grid
       # values directly (no modal round trip, no wavenumber clipping).
-      nodal_tracers[name] = transport_tracer(value)
-    else:
-      modal_tracers[name] = grid.to_modal(
-          transport_tracer(grid.to_nodal(value))
+      tracer_batches.append(
+          jnp.stack([state.tracers[k] for k in nodal_names], axis=0)
       )
+    all_tracers_nodal = (
+        tracer_batches[0]
+        if len(tracer_batches) == 1
+        else jnp.concatenate(tracer_batches, axis=0)
+    )
+    transported_all = semi_lagrangian.transport_scalar(
+        all_tracers_nodal,
+        departure=departure.full,
+        vertical=vertical_nodes,
+        interpolator=tracer_interpolator,
+        vertical_order=equation.vertical_interpolation_order,
+        max_vertical_shift=equation.max_vertical_shift,
+    )
+    n_modal = len(modal_names)
+    if n_modal == 1:
+      modal_tracers[modal_names[0]] = grid.to_modal(transported_all[0])
+    elif n_modal > 1:
+      modal_back = grid.to_modal(transported_all[:n_modal])
+      for idx, name in enumerate(modal_names):
+        modal_tracers[name] = modal_back[idx]
+    for idx, name in enumerate(nodal_names):
+      nodal_tracers[name] = transported_all[n_modal + idx]
+
   transported = State(
       vorticity=vorticity,
       divergence=divergence,
@@ -2073,6 +2132,12 @@ class SemiLagrangianPrimitiveEquations(
       operating points (approaching the convergence margin
       dt·max‖∇V‖ < 1) also need at least 2: the warm start cannot rescue
       a barely-contracting iteration.
+    interpolation_method: 'gather', 'matmul', or None (auto-selects 'matmul'
+      on TPU or when `coords.spmd_mesh` is set, and 'gather' otherwise).
+    max_lat_shift: maximum meridional displacement in latitude grid cells for
+      windowed 'matmul' interpolation (None disables latitude windowing).
+    max_vertical_shift: maximum vertical displacement in levels for windowed
+      'matmul' interpolation (None disables vertical windowing).
   """
 
 
@@ -2091,6 +2156,11 @@ class SemiLagrangianPrimitiveEquations(
       default='linear', kw_only=True
   )
   monotone_dynamics: bool = dataclasses.field(default=False, kw_only=True)
+  interpolation_method: semi_lagrangian.InterpolationMethod | None = (
+      dataclasses.field(default=None, kw_only=True)
+  )
+  max_lat_shift: int | None = dataclasses.field(default=6, kw_only=True)
+  max_vertical_shift: int | None = dataclasses.field(default=6, kw_only=True)
 
   def __post_init__(self):
     super().__post_init__()
@@ -2098,6 +2168,7 @@ class SemiLagrangianPrimitiveEquations(
       raise ValueError(f'unknown {self.coriolis_mode=}')
     if self.vertical_interpolation_order not in ('linear', 'cubic'):
       raise ValueError(f'unknown {self.vertical_interpolation_order=}')
+    semi_lagrangian._validate_interpolation_method(self.interpolation_method)
 
   @property
   def _planetary_rotation_rate(self) -> float | None:
@@ -3613,6 +3684,11 @@ class SemiLagrangianPrimitiveEquationsHybrid(
       default='linear', kw_only=True
   )
   monotone_dynamics: bool = dataclasses.field(default=False, kw_only=True)
+  interpolation_method: semi_lagrangian.InterpolationMethod | None = (
+      dataclasses.field(default=None, kw_only=True)
+  )
+  max_lat_shift: int | None = dataclasses.field(default=6, kw_only=True)
+  max_vertical_shift: int | None = dataclasses.field(default=6, kw_only=True)
 
   def __post_init__(self):
     super().__post_init__()
@@ -3620,6 +3696,7 @@ class SemiLagrangianPrimitiveEquationsHybrid(
       raise ValueError(f'unknown {self.coriolis_mode=}')
     if self.vertical_interpolation_order not in ('linear', 'cubic'):
       raise ValueError(f'unknown {self.vertical_interpolation_order=}')
+    semi_lagrangian._validate_interpolation_method(self.interpolation_method)
 
   @property
   def _planetary_rotation_rate(self) -> float | None:
