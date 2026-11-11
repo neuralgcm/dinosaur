@@ -16,6 +16,8 @@
 
 
 import functools
+import math
+import re
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -872,6 +874,67 @@ class MatmulInterpolationTest(parameterized.TestCase):
 
     with self.assertRaisesRegex(ValueError, 'unknown interpolation method'):
       semi_lagrangian.GridInterpolator(grid, method='bogus')  # pytype: disable=wrong-arg-types
+
+  def test_matmul_t63_tpu_tile_memory_bound(self):
+    grid = spherical_harmonic.Grid.T63()
+    coords = coordinate_systems.CoordinateSystem(
+        grid, sigma_coordinates.SigmaCoordinates.equidistant(47)
+    )
+    layers = coords.vertical.layers
+    u = jnp.zeros((layers,) + grid.nodal_shape, dtype=jnp.float32)
+    v = jnp.zeros((layers,) + grid.nodal_shape, dtype=jnp.float32)
+    sigma_dot = jnp.zeros((layers + 1,) + grid.nodal_shape, dtype=jnp.float32)
+    tracers = jnp.zeros((10, layers) + grid.nodal_shape, dtype=jnp.float32)
+    interp = semi_lagrangian.GridInterpolator(
+        grid, 'cubic', 'quasi_monotone', method='matmul'
+    )
+
+    @jax.jit
+    def step_transport(u_in, v_in, sd_in, tr_in):
+      dep = semi_lagrangian.departure_points_3d(
+          u_in, v_in, sd_in, coords, dt=600.0, method='matmul'
+      )
+      u_out, v_out = semi_lagrangian.transport_wind(
+          u_in, v_in, dep, coords.vertical, interp, vertical_order='cubic'
+      )
+      tr_out = semi_lagrangian.transport_scalar(
+          tr_in, dep, coords.vertical, interp, vertical_order='cubic'
+      )
+      return u_out, v_out, tr_out
+
+    compiled = step_transport.lower(u, v, sigma_dot, tracers).compile()
+    mem = compiled.memory_analysis()
+    # Unpadded HLO temporary workspace for T63 L47 + 10 tracers must stay <750MB
+    # (vs >2.1GB when pre-extracting multi-level latitude windows).
+    self.assertLess(mem.temp_size_in_bytes, 750 * 1024 * 1024)
+
+    # Every post-optimization HLO buffer must also stay <200MB under TPU (8, 128)
+    # subminor/minor physical tile padding (guards against trailing small-channel
+    # dims that blow up 128x on TPU).
+    layout_re = re.compile(r'\b(f32|bf16|s32|u32|pred)\[([0-9,]+)\]\{([0-9,]+)\}')
+    dtype_bytes = {'f32': 4, 'bf16': 2, 's32': 4, 'u32': 4, 'pred': 1}
+    max_tpu_bytes = 0
+    for match in layout_re.finditer(compiled.as_text()):
+      dt, dims_s, lay_s = match.groups()
+      dims = [int(x) for x in dims_s.split(',')]
+      lay = [int(x) for x in lay_s.split(',')]
+      item = dtype_bytes[dt]
+      if len(dims) == 1:
+        tpu_bytes = math.ceil(dims[0] / 128) * 128 * item
+      else:
+        d_minor = dims[lay[0]]
+        d_sub = dims[lay[1]]
+        rest = math.prod(
+            dims[i] for i in range(len(dims)) if i not in (lay[0], lay[1])
+        )
+        tpu_bytes = (
+            rest
+            * (math.ceil(d_sub / 8) * 8)
+            * (math.ceil(d_minor / 128) * 128)
+            * item
+        )
+      max_tpu_bytes = max(max_tpu_bytes, tpu_bytes)
+    self.assertLess(max_tpu_bytes, 200 * 1024 * 1024)
 
 
 if __name__ == '__main__':
