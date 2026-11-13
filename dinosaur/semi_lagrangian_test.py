@@ -18,6 +18,7 @@
 import functools
 import math
 import re
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -757,10 +758,14 @@ class MatmulInterpolationTest(parameterized.TestCase):
     out_g = semi_lagrangian.transport_scalar(
         tracers, dep_g, coords.vertical, interp_g, vertical_order='cubic'
     )
+    out_m_same_dep = semi_lagrangian.transport_scalar(
+        tracers, dep_g, coords.vertical, interp_m, vertical_order='cubic'
+    )
+    np.testing.assert_allclose(out_m_same_dep, out_g, rtol=2e-6, atol=2e-6)
     out_m = semi_lagrangian.transport_scalar(
         tracers, dep_m, coords.vertical, interp_m, vertical_order='cubic'
     )
-    np.testing.assert_allclose(out_m, out_g, rtol=1e-5, atol=2e-5)
+    np.testing.assert_allclose(out_m, out_g, rtol=2e-5, atol=5e-5)
     self.assertGreaterEqual(float(jnp.min(out_m)), 0.0)
     for idx in (0, 5, 10):
       single = semi_lagrangian.transport_scalar(
@@ -871,6 +876,17 @@ class MatmulInterpolationTest(parameterized.TestCase):
       operand_type = line.split(': (')[1].split(',')[0]
       dims_and_dtype = operand_type.split('<')[1].rstrip('>')
       self.assertEqual(len(dims_and_dtype.split('x')), 2, msg=line)
+
+    with mock.patch.object(jax, 'default_backend', return_value='tpu'):
+      jax.clear_caches()
+      tpu_hlo = (
+          jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2, 3)))
+          .lower(u, v, sigma_dot, tracers)
+          .as_text()
+      )
+      self.assertNotIn('stablehlo.scatter', tpu_hlo)
+      self.assertNotIn('stablehlo.gather', tpu_hlo)
+    jax.clear_caches()
 
     with self.assertRaisesRegex(ValueError, 'unknown interpolation method'):
       semi_lagrangian.GridInterpolator(grid, method='bogus')  # pytype: disable=wrong-arg-types

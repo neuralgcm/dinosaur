@@ -1913,33 +1913,57 @@ def _semi_lagrangian_transport(
   u, v = spherical_harmonic.vor_div_to_uv_nodal(
       grid, state.vorticity, state.divergence, clip=False
   )
-  u, v = semi_lagrangian.transport_wind(
-      u,
-      v,
-      departure.full,
-      vertical_nodes,
-      interpolator,
-      planetary_rotation_rate=equation._planetary_rotation_rate,
-      vertical_order=equation.vertical_interpolation_order,
-      max_vertical_shift=equation.max_vertical_shift,
-  )
+  t_nodal = grid.to_nodal(state.temperature_variation)
+  if not dynamics_limiter:
+    lon_mesh, sin_lat_mesh = grid.nodal_mesh
+    wind = semi_lagrangian.cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
+    wt_in = jnp.concatenate([wind, t_nodal[jnp.newaxis, ...]], axis=0)
+    wt_dep = semi_lagrangian.interpolate_3d(
+        wt_in,
+        grid,
+        departure.full.lon,
+        departure.full.sin_lat,
+        departure.full.sigma,
+        sigma_nodes=vertical_nodes.centers,
+        order=interpolator.order,
+        limiter=None,
+        vertical_order=equation.vertical_interpolation_order,
+        method=interpolator.method,
+        max_lat_shift=interpolator.max_lat_shift,
+        max_vertical_shift=equation.max_vertical_shift,
+    )
+    u, v = semi_lagrangian._finish_wind_transport(
+        wt_dep[:3],
+        departure.full,
+        grid,
+        rotate=True,
+        planetary_rotation_rate=equation._planetary_rotation_rate,
+    )
+    temperature_variation = semi_lagrangian._zero_nodal_padding(wt_dep[3], grid)
+  else:
+    u, v = semi_lagrangian.transport_wind(
+        u,
+        v,
+        departure.full,
+        vertical_nodes,
+        interpolator,
+        planetary_rotation_rate=equation._planetary_rotation_rate,
+        vertical_order=equation.vertical_interpolation_order,
+        max_vertical_shift=equation.max_vertical_shift,
+    )
+    temperature_variation = semi_lagrangian.transport_scalar(
+        t_nodal,
+        departure.full,
+        vertical_nodes,
+        interpolator,
+        vertical_order=equation.vertical_interpolation_order,
+        # with monotone dynamics, express the bound in full temperature:
+        # a T′ bound across levels with different T_ref is gauge-dependent.
+        limiter_bound_reference=jnp.asarray(equation.reference_temperature),
+        max_vertical_shift=equation.max_vertical_shift,
+    )
   vorticity, divergence = spherical_harmonic.uv_nodal_to_vor_div_modal(
       grid, u, v, clip=False
-  )
-  temperature_variation = semi_lagrangian.transport_scalar(
-      grid.to_nodal(state.temperature_variation),
-      departure.full,
-      vertical_nodes,
-      interpolator,
-      vertical_order=equation.vertical_interpolation_order,
-      # with monotone dynamics, express the bound in full temperature:
-      # a T′ bound across levels with different T_ref is gauge-dependent.
-      limiter_bound_reference=(
-          jnp.asarray(equation.reference_temperature)
-          if dynamics_limiter
-          else None
-      ),
-      max_vertical_shift=equation.max_vertical_shift,
   )
   log_sp_nodal = grid.to_nodal(state.log_surface_pressure)
   if equation.terrain_smoothed_log_sp:

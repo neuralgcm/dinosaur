@@ -237,6 +237,48 @@ def _lagrange_weights_tuple(
   )
 
 
+def _uniform_lagrange_weights_tuple(
+    alpha: jax.Array, order: str
+) -> tuple[jax.Array, ...]:
+  """Closed-form Lagrange weights on unit-spaced stencil offsets for `alpha` in [0, 1)."""
+  if order == 'linear':
+    return (1.0 - alpha, alpha)
+  if order == 'cubic':
+    am1 = alpha - 1.0
+    am2 = alpha - 2.0
+    ap1 = alpha + 1.0
+    return (
+        (-1.0 / 6.0) * alpha * am1 * am2,
+        0.5 * ap1 * am1 * am2,
+        -0.5 * ap1 * alpha * am2,
+        (1.0 / 6.0) * ap1 * alpha * am1,
+    )
+  raise ValueError(f'unknown interpolation {order=}')
+
+
+def _take_1d(values_1d: jax.Array, idx: jax.Array) -> jax.Array:
+  """1-D table lookup using MXU `one_hot` dot on TPU to avoid scalar VPU gathers."""
+  if jax.default_backend() == 'tpu' and values_1d.shape[0] <= 512:
+    oh = jax.nn.one_hot(idx, values_1d.shape[0], dtype=values_1d.dtype)
+    dot_prec = jax_numpy_utils.resolve_dot_precision(
+        None, oh, values_1d, lhs_exact_in_bf16=True
+    )
+    return jnp.dot(oh, values_1d, precision=dot_prec)
+  return values_1d[idx]
+
+
+def _resolve_rhs_binary_dot_precision(
+    lhs: jax.Array, rhs: jax.Array
+) -> jax.lax.PrecisionLike:
+  """Precision for `dot(lhs, rhs)` when `rhs` is an exact binary (0/1) matrix."""
+  if (
+      jax.default_backend() == 'tpu'
+      and jnp.result_type(lhs, rhs) == jnp.float32
+  ):
+    return ('highest', 'bfloat16')
+  return jax_numpy_utils.resolve_dot_precision(None, lhs, rhs)
+
+
 def _lagrange_weights(x: Array, nodes: Array) -> jnp.ndarray:
   """Computes Lagrange interpolation weights.
 
@@ -414,16 +456,16 @@ def _horizontal_stencil_tuple(
   phi = jnp.arctan2(sin_lat, cos_lat)
 
   # Longitude nodes are uniform, so the bracketing index is a floor divide.
-  # Weights are computed with unwrapped (real line) node coordinates; only
-  # gather indices are wrapped.
+  # Weights are computed in closed form from the fractional cell coordinate;
+  # only gather indices are wrapped.
   n_lon = grid.longitude_nodes
   lon0 = float(grid.nodal_axes[0][0])
   lon_spacing = 2 * np.pi / n_lon
-  lon_cell = jnp.floor((lon - lon0) / lon_spacing).astype(jnp.int32)
-  lon_nodes = tuple(
-      (lon_cell + int(off)) * lon_spacing + lon0 for off in offsets
+  u_lon = (lon - lon0) / lon_spacing
+  lon_cell = jnp.floor(u_lon).astype(jnp.int32)
+  lon_weights = _uniform_lagrange_weights_tuple(
+      u_lon - lon_cell.astype(u_lon.dtype), order
   )
-  lon_weights = _lagrange_weights_tuple(lon, lon_nodes)
   lon_indices = tuple((lon_cell + int(off)) % n_lon for off in offsets)
 
   # Latitude nodes are non-uniform; searchsorted locates the bracketing ring
@@ -437,8 +479,44 @@ def _horizontal_stencil_tuple(
       lat_cell, -int(offsets[0]), phi_extended.size - 1 - int(offsets[-1])
   )
   lat_indices = tuple(lat_cell + int(off) for off in offsets)
-  lat_nodes = tuple(phi_ext_jax[idx] for idx in lat_indices)
-  lat_weights = _lagrange_weights_tuple(phi, lat_nodes)
+  if jax.default_backend() == 'tpu' and phi_extended.size <= 512:
+    n_starts = phi_extended.size - len(offsets) + 1
+    oh_lat = jax.nn.one_hot(lat_indices[0], n_starts, dtype=phi.dtype)
+    dot_prec = jax_numpy_utils.resolve_dot_precision(
+        None, oh_lat, oh_lat, lhs_exact_in_bf16=True
+    )
+    if order == 'linear':
+      lin_np = np.stack(
+          [phi_extended[:-1], 1.0 / np.diff(phi_extended)], axis=-1
+      )
+      packed = jnp.dot(
+          oh_lat, jnp.asarray(lin_np, dtype=phi.dtype), precision=dot_prec
+      )
+      frac = (phi - packed[..., 0]) * packed[..., 1]
+      lat_weights = (1.0 - frac, frac)
+    else:
+      nodes_np = [phi_extended[a : a + n_starts] for a in range(4)]
+      inv_den_np = [
+          1.0 / math.prod(nodes_np[i] - nodes_np[j] for j in range(4) if j != i)
+          for i in range(4)
+      ]
+      cub_np = np.stack([*nodes_np, *inv_den_np], axis=-1)
+      packed = jnp.dot(
+          oh_lat, jnp.asarray(cub_np, dtype=phi.dtype), precision=dot_prec
+      )
+      d0 = phi - packed[..., 0]
+      d1 = phi - packed[..., 1]
+      d2 = phi - packed[..., 2]
+      d3 = phi - packed[..., 3]
+      lat_weights = (
+          d1 * d2 * d3 * packed[..., 4],
+          d0 * d2 * d3 * packed[..., 5],
+          d0 * d1 * d3 * packed[..., 6],
+          d0 * d1 * d2 * packed[..., 7],
+      )
+  else:
+    lat_nodes = tuple(phi_ext_jax[idx] for idx in lat_indices)
+    lat_weights = _lagrange_weights_tuple(phi, lat_nodes)
 
   return (
       lon_indices,
@@ -741,7 +819,10 @@ def _matmul_2d_local(
   n_lat = grid.latitude_nodes
   n_lat_ext = n_lat + 2 * _HALO_WIDTH
   nx_loc, ny_loc = lon_q.shape
-  w_lat_size = min(n_lat_ext, 2 * max_lat_shift + 4)
+  eff_lat_shift = max(1, max_lat_shift)
+  s_lat = 2 if order == 'linear' else 4
+  w_lat_size = min(n_lat_buf, min(n_lat_ext, 2 * eff_lat_shift + s_lat))
+  lat_start_offset = (2 if order == 'linear' else 1) - eff_lat_shift
 
   (
       lon_indices,
@@ -760,9 +841,11 @@ def _matmul_2d_local(
     win_lat_start = jnp.zeros_like(j_global)
   else:
     win_lat_start = jnp.clip(
-        j_global + 1 - max_lat_shift, 0, n_lat_ext - w_lat_size
+        j_global + lat_start_offset, 0, n_lat_ext - w_lat_size
     )
-  buf_lat_start = win_lat_start - buf_lat_origin
+  buf_lat_start = jnp.clip(
+      win_lat_start - buf_lat_origin, 0, n_lat_buf - w_lat_size
+  )
   # Place `w_lat_size` before `ny_loc` so `(c_cur, w_lat_size)` is already
   # contiguous after `dot(f_2d, m_lat_2d_t)` — avoiding 4-D transposes and
   # keeping `w_lat_size` in axis=-1 (minor) for TPU tile alignment.
@@ -774,9 +857,10 @@ def _matmul_2d_local(
   )  # [w_lat_size, ny_loc, n_lat_buf]
   m_lat_2d_t = m_lat_win.reshape(w_lat_size * ny_loc, n_lat_buf).T
 
-  dot_prec_bf16 = jax_numpy_utils.resolve_dot_precision(
+  dot_prec_lhs_bf16 = jax_numpy_utils.resolve_dot_precision(
       None, m_lat_win, f_buf, lhs_exact_in_bf16=True
   )
+  dot_prec_rhs_bf16 = _resolve_rhs_binary_dot_precision(f_buf, m_lat_2d_t)
   dot_prec_f32 = jax_numpy_utils.resolve_dot_precision(None, f_buf, f_buf)
 
   w_lon_mat = sum(
@@ -792,14 +876,20 @@ def _matmul_2d_local(
   )  # [ny_loc, nx_loc, w_lat_size]
 
   if limiter is not None:
-    w_lat_cell_size = min(n_lat_ext - 1, max(1, w_lat_size - 1))
+    w_lat_cell_size = min(
+        n_lat_buf - 1, min(n_lat_ext - 1, 2 * eff_lat_shift + 2)
+    )
     if w_lat_cell_size == n_lat_ext - 1:
       win_lat_cell_start = jnp.zeros_like(j_global)
     else:
       win_lat_cell_start = jnp.clip(
-          win_lat_start, 0, (n_lat_ext - 1) - w_lat_cell_size
+          j_global + 1 - eff_lat_shift, 0, (n_lat_ext - 1) - w_lat_cell_size
       )
-    buf_lat_cell_start = win_lat_cell_start - buf_lat_origin
+    buf_lat_cell_start = jnp.clip(
+        win_lat_cell_start - buf_lat_origin,
+        0,
+        (n_lat_buf - 1) - w_lat_cell_size,
+    )
     m_lat_cell_win = jax.nn.one_hot(
         jnp.arange(w_lat_cell_size, dtype=jnp.int32)[:, jnp.newaxis]
         + buf_lat_cell_start[jnp.newaxis, :],
@@ -820,7 +910,7 @@ def _matmul_2d_local(
     c_cur = f_chunk.shape[0]
     f_2d = f_chunk.transpose(1, 0, 2).reshape(n_lon * c_cur, n_lat_buf)
     f_lat_win = (
-        jnp.dot(f_2d, m_lat_2d_t, precision=dot_prec_bf16)
+        jnp.dot(f_2d, m_lat_2d_t, precision=dot_prec_rhs_bf16)
         .reshape(n_lon, c_cur * w_lat_size, ny_loc)
         .transpose(2, 0, 1)
     )  # [ny_loc, n_lon, c_cur * w_lat_size]
@@ -846,12 +936,12 @@ def _matmul_2d_local(
           n_lon * 2 * c_cur, n_lat_buf - 1
       )
       b_lat_win = (
-          jnp.dot(b_2d, m_lat_cell_2d_t, precision=dot_prec_bf16)
+          jnp.dot(b_2d, m_lat_cell_2d_t, precision=dot_prec_rhs_bf16)
           .reshape(n_lon, 2 * c_cur * w_lat_cell_size, ny_loc)
           .transpose(2, 0, 1)
       )
       b_lon = jnp.einsum(
-          'jim,jmk->jik', p_lon_mat, b_lat_win, precision=dot_prec_bf16
+          'jim,jmk->jik', p_lon_mat, b_lat_win, precision=dot_prec_lhs_bf16
       )
       b_val = (
           (
@@ -1246,12 +1336,73 @@ def _vertical_stencil_tuple(
     jnp.ndarray,
 ]:
   """Returns tuple-unrolled (level_indices, level_weights, bracket_offset, level_cell)."""
+  if vertical_order not in ('linear', 'cubic'):
+    raise ValueError(f'unknown {vertical_order=}')
   sigma = jnp.asarray(sigma)
   sigma_nodes = jnp.asarray(sigma_nodes, dtype=sigma.dtype)
   num_levels = sigma_nodes.shape[0]
   sigma = jnp.clip(sigma, sigma_nodes[0], sigma_nodes[-1])
   level_cell = _searchsorted_right_minus_one(sigma_nodes, sigma)
   level_cell = jnp.clip(level_cell, 0, num_levels - 2)
+  if jax.default_backend() == 'tpu' and num_levels <= 512:
+    if vertical_order == 'linear':
+      lin_tbl = jnp.stack(
+          [sigma_nodes[:-1], 1.0 / (sigma_nodes[1:] - sigma_nodes[:-1])],
+          axis=-1,
+      )
+      oh_cell = jax.nn.one_hot(level_cell, num_levels - 1, dtype=sigma.dtype)
+      dot_prec = jax_numpy_utils.resolve_dot_precision(
+          None, oh_cell, lin_tbl, lhs_exact_in_bf16=True
+      )
+      packed = jnp.dot(oh_cell, lin_tbl, precision=dot_prec)
+      fraction = (sigma - packed[..., 0]) * packed[..., 1]
+      return (
+          (level_cell, level_cell + 1),
+          (1.0 - fraction, fraction),
+          jnp.zeros_like(level_cell),
+          level_cell,
+      )
+    start = jnp.clip(level_cell - 1, 0, num_levels - 4)
+    level_indices = tuple(start + a for a in range(4))
+    n_starts = num_levels - 3
+    nodes_cols = [sigma_nodes[a : a + n_starts] for a in range(4)]
+    inv_denoms = [
+        1.0
+        / math.prod(nodes_cols[i] - nodes_cols[j] for j in range(4) if j != i)
+        for i in range(4)
+    ]
+    cub_tbl = jnp.stack([*nodes_cols, *inv_denoms], axis=-1)
+    oh_start = jax.nn.one_hot(start, n_starts, dtype=sigma.dtype)
+    dot_prec = jax_numpy_utils.resolve_dot_precision(
+        None, oh_start, cub_tbl, lhs_exact_in_bf16=True
+    )
+    packed = jnp.dot(oh_start, cub_tbl, precision=dot_prec)
+    d0 = sigma - packed[..., 0]
+    d1 = sigma - packed[..., 1]
+    d2 = sigma - packed[..., 2]
+    d3 = sigma - packed[..., 3]
+    cubic_weights = (
+        d1 * d2 * d3 * packed[..., 4],
+        d0 * d2 * d3 * packed[..., 5],
+        d0 * d1 * d3 * packed[..., 6],
+        d0 * d1 * d2 * packed[..., 7],
+    )
+    frac_low = (sigma - sigma_nodes[0]) / (sigma_nodes[1] - sigma_nodes[0])
+    frac_high = (sigma - sigma_nodes[-2]) / (sigma_nodes[-1] - sigma_nodes[-2])
+    fraction = jnp.where(level_cell == 0, frac_low, frac_high)
+    bracket_offset = level_cell - start
+    boundary_cell = (level_cell == 0) | (level_cell == num_levels - 2)
+    level_weights = tuple(
+        jnp.where(
+            boundary_cell,
+            jnp.where(bracket_offset == a, 1.0 - fraction, 0.0)
+            + jnp.where(bracket_offset + 1 == a, fraction, 0.0),
+            cubic_weights[a],
+        )
+        for a in range(4)
+    )
+    return level_indices, level_weights, bracket_offset, level_cell
+
   below = sigma_nodes[level_cell]
   above = sigma_nodes[level_cell + 1]
   fraction = (sigma - below) / (above - below)
@@ -1262,8 +1413,6 @@ def _vertical_stencil_tuple(
         jnp.zeros_like(level_cell),
         level_cell,
     )
-  if vertical_order != 'cubic':
-    raise ValueError(f'unknown {vertical_order=}')
   start = jnp.clip(level_cell - 1, 0, num_levels - 4)
   level_indices = tuple(start + a for a in range(4))
   level_nodes = tuple(sigma_nodes[idx] for idx in level_indices)
@@ -1526,7 +1675,7 @@ def _matmul_3d_points(
       lo_q, hi_q = b_val[:c_total], b_val[c_total:]
       if ref_centered is not None:
         ref_q = sum(
-            w * ref_centered[idx]
+            w * _take_1d(ref_centered, idx)
             for idx, w in zip(level_indices, level_weights)
         )
         val = (
@@ -1582,8 +1731,16 @@ def _matmul_3d_local(
   num_channels, l_buf, _, n_lat_buf = f_buf.shape
   l_q_loc, nx_loc, ny_loc = lon_q.shape
 
-  w_lat_size = min(n_lat_ext, 2 * max_lat_shift + 4)
-  w_z_size = min(l_src, 2 * max_vertical_shift + 4)
+  eff_lat_shift = max(1, max_lat_shift)
+  eff_z_shift = max(1, max_vertical_shift)
+  s_lat = 2 if order == 'linear' else 4
+  s_z = 2 if vertical_order == 'linear' else 4
+  w_lat_size = min(n_lat_buf, min(n_lat_ext, 2 * eff_lat_shift + s_lat))
+  w_z_size = min(l_buf, min(l_src, 2 * eff_z_shift + s_z))
+  lat_start_offset = (2 if order == 'linear' else 1) - eff_lat_shift
+  z_start_offset = (
+      -eff_z_shift if vertical_order == 'linear' else (-eff_z_shift - 1)
+  )
 
   j_global = jnp.minimum(
       j_offset + jnp.arange(ny_loc, dtype=jnp.int32), n_lat - 1
@@ -1592,13 +1749,14 @@ def _matmul_3d_local(
     win_lat_start = jnp.zeros_like(j_global)
   else:
     win_lat_start = jnp.clip(
-        j_global + 1 - max_lat_shift, 0, n_lat_ext - w_lat_size
+        j_global + lat_start_offset, 0, n_lat_ext - w_lat_size
     )
-  buf_lat_start = win_lat_start - buf_lat_origin
-  # Place `w_lat_size` before `ny_loc` so `(c_cur, w_z_size, w_lat_size)` is
-  # already contiguous after `dot(f_z, m_lat_2d_t)` — eliminating multi-level
-  # 5-D transposes and keeping `w_z_size * w_lat_size` in axis=-1 (minor) for
-  # TPU (8, 128) tile alignment.
+  buf_lat_start = jnp.clip(
+      win_lat_start - buf_lat_origin, 0, n_lat_buf - w_lat_size
+  )
+  # Place `w_lat_size` before `ny_loc` so `[l_buf, c_cur, n_lon, w_lat_size * ny_loc]`
+  # is written directly by the hoisted latitude `dot` with zero post-dot transpose
+  # and `(n_lon, w_lat_size * ny_loc)` aligned to TPU `(8, 128)` physical tiles.
   m_lat_win = jax.nn.one_hot(
       jnp.arange(w_lat_size, dtype=jnp.int32)[:, jnp.newaxis]
       + buf_lat_start[jnp.newaxis, :],
@@ -1607,9 +1765,10 @@ def _matmul_3d_local(
   )  # [w_lat_size, ny_loc, n_lat_buf]
   m_lat_2d_t = m_lat_win.reshape(w_lat_size * ny_loc, n_lat_buf).T
 
-  dot_prec_bf16 = jax_numpy_utils.resolve_dot_precision(
+  dot_prec_lhs_bf16 = jax_numpy_utils.resolve_dot_precision(
       None, m_lat_win, f_buf, lhs_exact_in_bf16=True
   )
+  dot_prec_rhs_bf16 = _resolve_rhs_binary_dot_precision(f_buf, m_lat_2d_t)
   dot_prec_f32 = jax_numpy_utils.resolve_dot_precision(None, f_buf, f_buf)
 
   ref_centered = None
@@ -1620,17 +1779,23 @@ def _matmul_3d_local(
     k_buf_levels = jnp.clip(
         buf_z_origin + jnp.arange(l_buf, dtype=jnp.int32), 0, l_src - 1
     )
-    ref_buf = ref_centered[k_buf_levels]
+    ref_buf = _take_1d(ref_centered, k_buf_levels)
 
   if limiter is not None:
-    w_lat_cell_size = min(n_lat_ext - 1, max(1, w_lat_size - 1))
+    w_lat_cell_size = min(
+        n_lat_buf - 1, min(n_lat_ext - 1, 2 * eff_lat_shift + 2)
+    )
     if w_lat_cell_size == n_lat_ext - 1:
       win_lat_cell_start = jnp.zeros_like(j_global)
     else:
       win_lat_cell_start = jnp.clip(
-          win_lat_start, 0, (n_lat_ext - 1) - w_lat_cell_size
+          j_global + 1 - eff_lat_shift, 0, (n_lat_ext - 1) - w_lat_cell_size
       )
-    buf_lat_cell_start = win_lat_cell_start - buf_lat_origin
+    buf_lat_cell_start = jnp.clip(
+        win_lat_cell_start - buf_lat_origin,
+        0,
+        (n_lat_buf - 1) - w_lat_cell_size,
+    )
     m_lat_cell_win = jax.nn.one_hot(
         jnp.arange(w_lat_cell_size, dtype=jnp.int32)[:, jnp.newaxis]
         + buf_lat_cell_start[jnp.newaxis, :],
@@ -1640,240 +1805,221 @@ def _matmul_3d_local(
     m_lat_cell_2d_t = m_lat_cell_win.reshape(
         w_lat_cell_size * ny_loc, n_lat_buf - 1
     ).T
-    w_z_cell_size = min(l_src - 1, max(1, w_z_size - 1))
+    w_z_cell_size = min(l_buf - 1, min(l_src - 1, 2 * eff_z_shift + 2))
 
-  chunk_size = 4
-  if num_channels <= chunk_size:
-    c_cur = num_channels
-    n_chunks = 1
-    f_c_by_l = f_buf.transpose(1, 2, 0, 3).reshape(
-        l_buf, n_lon * c_cur, n_lat_buf
+  item_bytes = 8 if dtype == jnp.float64 else 4
+  sub_pad = _round_to_multiple(n_lon, 8)
+  bytes_per_c_f = (
+      l_buf * sub_pad * _round_to_multiple(w_lat_size * ny_loc, 128) * item_bytes
+  )
+  if limiter is not None:
+    bytes_per_c_lo = (
+        max(1, l_buf - 1)
+        * sub_pad
+        * _round_to_multiple(w_lat_cell_size * ny_loc, 128)
+        * item_bytes
     )
-    b_c_by_l = None
-    if limiter is not None:
-      f_for_bounds = (
-          f_buf + ref_buf[jnp.newaxis, :, jnp.newaxis, jnp.newaxis]
-          if ref_buf is not None
-          else f_buf
-      )
-      lo_buf, hi_buf = _cell_bounds_3d(f_for_bounds)
-      b_c_by_l = (
-          jnp.concatenate([lo_buf, hi_buf], axis=0)
-          .transpose(1, 2, 0, 3)
-          .reshape(l_buf - 1, n_lon * 2 * c_cur, n_lat_buf - 1)
-      )
+    max_single_per_c = max(bytes_per_c_f, bytes_per_c_lo)
+    total_ws_per_c = bytes_per_c_f + 2 * bytes_per_c_lo
   else:
-    c_cur = chunk_size
-    c_pad = _round_to_multiple(num_channels, c_cur)
-    n_chunks = c_pad // c_cur
-    f_pad = (
-        jnp.pad(f_buf, [(0, c_pad - num_channels), (0, 0), (0, 0), (0, 0)])
-        if c_pad > num_channels
-        else f_buf
-    )
-    f_grouped_by_l = (
-        f_pad.reshape(n_chunks, c_cur, l_buf, n_lon, n_lat_buf)
-        .transpose(0, 2, 3, 1, 4)
-        .reshape(n_chunks, l_buf, n_lon * c_cur, n_lat_buf)
-    )
-    b_grouped_by_l = None
+    max_single_per_c = bytes_per_c_f
+    total_ws_per_c = bytes_per_c_f
+  max_c_rhs = max(1, 1024 // max(1, w_z_size * w_lat_size))
+  if (
+      num_channels <= 8
+      and num_channels <= max_c_rhs
+      and num_channels * max_single_per_c <= 185 * 1024 * 1024
+      and num_channels * total_ws_per_c <= 440 * 1024 * 1024
+  ):
+    chunk_size = num_channels
+  else:
+    max_c_single = max(1, (150 * 1024 * 1024) // max(1, max_single_per_c))
+    max_c_ws = max(1, (340 * 1024 * 1024) // max(1, total_ws_per_c))
+    chunk_size = min(8, max_c_single, max_c_ws, max_c_rhs)
+
+  scan_inputs = (
+      jnp.arange(l_q_loc, dtype=jnp.int32),
+      lon_q,
+      sin_lat_q,
+      sigma_q,
+  )
+
+  def _eval_channel_chunk(f_chunk: jax.Array) -> jax.Array:
+    c_cur = f_chunk.shape[0]
+    f_2d = f_chunk.transpose(1, 2, 0, 3).reshape(l_buf * n_lon * c_cur, n_lat_buf)
+    f_lat_by_l = jnp.dot(
+        f_2d, m_lat_2d_t, precision=dot_prec_rhs_bf16
+    ).reshape(l_buf, n_lon, c_cur * w_lat_size * ny_loc)
+
+    lo_lat_by_l = None
+    hi_lat_by_l = None
     if limiter is not None:
       f_for_bounds = (
-          f_pad + ref_buf[jnp.newaxis, :, jnp.newaxis, jnp.newaxis]
+          f_chunk + ref_buf[jnp.newaxis, :, jnp.newaxis, jnp.newaxis]
           if ref_buf is not None
-          else f_pad
+          else f_chunk
       )
       lo_buf, hi_buf = _cell_bounds_3d(f_for_bounds)
-      b_grouped = jnp.concatenate(
-          [
-              lo_buf.reshape(n_chunks, c_cur, l_buf - 1, n_lon, n_lat_buf - 1),
-              hi_buf.reshape(n_chunks, c_cur, l_buf - 1, n_lon, n_lat_buf - 1),
-          ],
-          axis=1,
+      lo_2d = lo_buf.transpose(1, 2, 0, 3).reshape(
+          (l_buf - 1) * n_lon * c_cur, n_lat_buf - 1
       )
-      b_grouped_by_l = b_grouped.transpose(0, 2, 3, 1, 4).reshape(
-          n_chunks, l_buf - 1, n_lon * 2 * c_cur, n_lat_buf - 1
+      hi_2d = hi_buf.transpose(1, 2, 0, 3).reshape(
+          (l_buf - 1) * n_lon * c_cur, n_lat_buf - 1
+      )
+      lo_lat_by_l = jnp.dot(
+          lo_2d, m_lat_cell_2d_t, precision=dot_prec_rhs_bf16
+      ).reshape(l_buf - 1, n_lon, c_cur * w_lat_cell_size * ny_loc)
+      hi_lat_by_l = jnp.dot(
+          hi_2d, m_lat_cell_2d_t, precision=dot_prec_rhs_bf16
+      ).reshape(l_buf - 1, n_lon, c_cur * w_lat_cell_size * ny_loc)
+
+    def _scan_level(_, inputs):
+      k_loc, lon_k, sin_lat_k, sigma_k = inputs
+      (
+          lon_idx_k,
+          lon_w_k,
+          lat_idx_k,
+          lat_w_k,
+          lon_c0_k,
+          lat_c0_k,
+          _,
+      ) = _horizontal_stencil_tuple(grid, lon_k, sin_lat_k, order)
+      lvl_idx_k, lvl_w_k, _, lvl_c0_k = _vertical_stencil_tuple(
+          sigma_k, sigma_nodes, vertical_order
       )
 
-  def _scan_level(_, inputs):
-    k_loc, lon_k, sin_lat_k, sigma_k = inputs
-    (
-        lon_idx_k,
-        lon_w_k,
-        lat_idx_k,
-        lat_w_k,
-        lon_c0_k,
-        lat_c0_k,
-        _,
-    ) = _horizontal_stencil_tuple(grid, lon_k, sin_lat_k, order)
-    lvl_idx_k, lvl_w_k, _, lvl_c0_k = _vertical_stencil_tuple(
-        sigma_k, sigma_nodes, vertical_order
-    )
-
-    k_glob = jnp.minimum(k_offset + k_loc, l_src - 1)
-    if w_z_size == l_src:
-      win_z_start = jnp.int32(0)
-    else:
-      win_z_start = jnp.clip(
-          k_glob + 1 - max_vertical_shift, 0, l_src - w_z_size
-      )
-    buf_z_start = win_z_start - buf_z_origin
-
-    m_z_k = jax.nn.one_hot(
-        buf_z_start + jnp.arange(w_z_size, dtype=jnp.int32),
-        l_buf,
-        dtype=dtype,
-    )  # [w_z_size, l_buf]
-    w_lon_mat = sum(
-        w.T[:, :, jnp.newaxis] * jax.nn.one_hot(idx.T, n_lon, dtype=dtype)
-        for idx, w in zip(lon_idx_k, lon_w_k)
-    )
-    w_z_mat = sum(
-        w.T[:, :, jnp.newaxis]
-        * jax.nn.one_hot(idx.T - win_z_start, w_z_size, dtype=dtype)
-        for idx, w in zip(lvl_idx_k, lvl_w_k)
-    )
-    w_lat_mat = sum(
-        w.T[:, :, jnp.newaxis]
-        * jax.nn.one_hot(
-            idx.T - win_lat_start[:, jnp.newaxis], w_lat_size, dtype=dtype
-        )
-        for idx, w in zip(lat_idx_k, lat_w_k)
-    )
-    w_zy = (
-        w_z_mat[:, :, :, jnp.newaxis] * w_lat_mat[:, :, jnp.newaxis, :]
-    ).reshape(ny_loc, nx_loc, w_z_size * w_lat_size)
-
-    if limiter is not None:
-      if w_z_cell_size == l_src - 1:
-        win_z_cell_start = jnp.int32(0)
+      k_glob = jnp.minimum(k_offset + k_loc, l_src - 1)
+      if w_z_size == l_src:
+        win_z_start = jnp.int32(0)
       else:
-        win_z_cell_start = jnp.clip(
-            win_z_start, 0, (l_src - 1) - w_z_cell_size
-        )
-      buf_z_cell_start = win_z_cell_start - buf_z_origin
-      m_z_cell_k = jax.nn.one_hot(
-          buf_z_cell_start + jnp.arange(w_z_cell_size, dtype=jnp.int32),
-          l_buf - 1,
-          dtype=dtype,
+        win_z_start = jnp.clip(k_glob + z_start_offset, 0, l_src - w_z_size)
+      buf_z_start = jnp.clip(win_z_start - buf_z_origin, 0, l_buf - w_z_size)
+
+      w_lon_mat = sum(
+          w.T[:, :, jnp.newaxis] * jax.nn.one_hot(idx.T, n_lon, dtype=dtype)
+          for idx, w in zip(lon_idx_k, lon_w_k)
       )
-      p_lon_mat = jax.nn.one_hot(lon_c0_k.T, n_lon, dtype=dtype)
-      z_cell_rel = lvl_c0_k.T - win_z_cell_start
-      y_cell_rel = lat_c0_k.T - win_lat_cell_start[:, jnp.newaxis]
-      valid_zy = (
-          (z_cell_rel >= 0)
-          & (z_cell_rel < w_z_cell_size)
-          & (y_cell_rel >= 0)
-          & (y_cell_rel < w_lat_cell_size)
+      w_z_mat = sum(
+          w.T[:, :, jnp.newaxis]
+          * jax.nn.one_hot(idx.T - win_z_start, w_z_size, dtype=dtype)
+          for idx, w in zip(lvl_idx_k, lvl_w_k)
       )
-      zy_cell_idx = jnp.where(
-          valid_zy, z_cell_rel * w_lat_cell_size + y_cell_rel, -1
-      )
-      p_zy = jax.nn.one_hot(
-          zy_cell_idx, w_z_cell_size * w_lat_cell_size, dtype=dtype
-      )
-      ref_k = (
-          sum(w * ref_centered[idx] for idx, w in zip(lvl_idx_k, lvl_w_k))
-          if ref_centered is not None
-          else None
+      w_lat_mat = sum(
+          w.T[:, :, jnp.newaxis]
+          * jax.nn.one_hot(
+              idx.T - win_lat_start[:, jnp.newaxis], w_lat_size, dtype=dtype
+          )
+          for idx, w in zip(lat_idx_k, lat_w_k)
       )
 
-    def _eval_k_chunk(
-        f_cur_by_l: jax.Array, b_cur_by_l: jax.Array | None
-    ) -> jax.Array:
-      f_z = (
-          jnp.dot(
-              m_z_k,
-              f_cur_by_l.reshape(l_buf, n_lon * c_cur * n_lat_buf),
-              precision=dot_prec_bf16,
-          )
-          .reshape(w_z_size, n_lon * c_cur, n_lat_buf)
-          .transpose(1, 0, 2)
-          .reshape(n_lon * c_cur * w_z_size, n_lat_buf)
-      )
-      f_patch_flat = (
-          jnp.dot(f_z, m_lat_2d_t, precision=dot_prec_bf16)
-          .reshape(n_lon, c_cur * w_z_size * w_lat_size, ny_loc)
-          .transpose(2, 0, 1)
+      f_win = lax.dynamic_slice_in_dim(
+          f_lat_by_l, buf_z_start, w_z_size, axis=0
+      ).reshape(w_z_size, n_lon, c_cur * w_lat_size, ny_loc)
+      f_patch_flat = f_win.transpose(3, 1, 0, 2).reshape(
+          ny_loc, n_lon, w_z_size * c_cur * w_lat_size
       )
       gathered_lon = jnp.einsum(
           'jim,jmk->jik', w_lon_mat, f_patch_flat, precision=dot_prec_f32
       )
+      after_z = (
+          gathered_lon.reshape(ny_loc, nx_loc, w_z_size, c_cur * w_lat_size)
+          * w_z_mat[:, :, :, jnp.newaxis]
+      ).sum(axis=-2)
       if c_cur == 1:
-        val = (gathered_lon * w_zy).sum(axis=-1).T[jnp.newaxis, :, :]
+        val = (after_z * w_lat_mat).sum(axis=-1).T[jnp.newaxis, :, :]
       else:
-        gathered_c_zy = gathered_lon.reshape(
-            ny_loc, nx_loc, c_cur, w_z_size * w_lat_size
-        )
         val = (
-            (gathered_c_zy * w_zy[:, :, jnp.newaxis, :])
+            (
+                after_z.reshape(ny_loc, nx_loc, c_cur, w_lat_size)
+                * w_lat_mat[:, :, jnp.newaxis, :]
+            )
             .sum(axis=-1)
             .transpose(2, 1, 0)
         )
 
       if limiter is not None:
-        assert b_cur_by_l is not None
-        b_z = (
-            jnp.dot(
-                m_z_cell_k,
-                b_cur_by_l.reshape(
-                    l_buf - 1, n_lon * 2 * c_cur * (n_lat_buf - 1)
-                ),
-                precision=dot_prec_bf16,
-            )
-            .reshape(w_z_cell_size, n_lon * 2 * c_cur, n_lat_buf - 1)
-            .transpose(1, 0, 2)
-            .reshape(n_lon * 2 * c_cur * w_z_cell_size, n_lat_buf - 1)
+        assert lo_lat_by_l is not None and hi_lat_by_l is not None
+        if w_z_cell_size == l_src - 1:
+          win_z_cell_start = jnp.int32(0)
+        else:
+          win_z_cell_start = jnp.clip(
+              k_glob - eff_z_shift, 0, (l_src - 1) - w_z_cell_size
+          )
+        buf_z_cell_start = jnp.clip(
+            win_z_cell_start - buf_z_origin, 0, (l_buf - 1) - w_z_cell_size
         )
-        b_patch_flat = (
-            jnp.dot(b_z, m_lat_cell_2d_t, precision=dot_prec_bf16)
-            .reshape(n_lon, 2 * c_cur * w_z_cell_size * w_lat_cell_size, ny_loc)
-            .transpose(2, 0, 1)
+        p_lon_mat = jax.nn.one_hot(lon_c0_k.T, n_lon, dtype=dtype)
+        p_z_mat = jax.nn.one_hot(
+            lvl_c0_k.T - win_z_cell_start, w_z_cell_size, dtype=dtype
+        )
+        p_lat_mat = jax.nn.one_hot(
+            lat_c0_k.T - win_lat_cell_start[:, jnp.newaxis],
+            w_lat_cell_size,
+            dtype=dtype,
+        )
+
+        lo_win = lax.dynamic_slice_in_dim(
+            lo_lat_by_l, buf_z_cell_start, w_z_cell_size, axis=0
+        ).reshape(w_z_cell_size, n_lon, c_cur, w_lat_cell_size * ny_loc)
+        hi_win = lax.dynamic_slice_in_dim(
+            hi_lat_by_l, buf_z_cell_start, w_z_cell_size, axis=0
+        ).reshape(w_z_cell_size, n_lon, c_cur, w_lat_cell_size * ny_loc)
+        b_win = jnp.concatenate([lo_win, hi_win], axis=2).reshape(
+            w_z_cell_size, n_lon, 2 * c_cur * w_lat_cell_size, ny_loc
+        )
+        b_patch_flat = b_win.transpose(3, 1, 0, 2).reshape(
+            ny_loc, n_lon, w_z_cell_size * 2 * c_cur * w_lat_cell_size
         )
         b_lon = jnp.einsum(
-            'jim,jmk->jik', p_lon_mat, b_patch_flat, precision=dot_prec_bf16
+            'jim,jmk->jik', p_lon_mat, b_patch_flat, precision=dot_prec_lhs_bf16
         )
-        b_c_zy = b_lon.reshape(
-            ny_loc, nx_loc, 2 * c_cur, w_z_cell_size * w_lat_cell_size
-        )
+        b_after_z = (
+            b_lon.reshape(
+                ny_loc, nx_loc, w_z_cell_size, 2 * c_cur * w_lat_cell_size
+            )
+            * p_z_mat[:, :, :, jnp.newaxis]
+        ).sum(axis=-2)
         b_val = (
-            (b_c_zy * p_zy[:, :, jnp.newaxis, :])
+            (
+                b_after_z.reshape(ny_loc, nx_loc, 2 * c_cur, w_lat_cell_size)
+                * p_lat_mat[:, :, jnp.newaxis, :]
+            )
             .sum(axis=-1)
             .transpose(2, 1, 0)
         )
         lo_k, hi_k = b_val[:c_cur], b_val[c_cur:]
-        if ref_k is not None:
+        if ref_centered is not None:
+          ref_k = sum(
+              w * _take_1d(ref_centered, idx)
+              for idx, w in zip(lvl_idx_k, lvl_w_k)
+          )
           val = (
               jnp.clip(val + ref_k[jnp.newaxis, :, :], lo_k, hi_k)
               - ref_k[jnp.newaxis, :, :]
           )
         else:
           val = jnp.clip(val, lo_k, hi_k)
-      return val
+      return None, val
 
-    if n_chunks == 1:
-      return None, _eval_k_chunk(f_c_by_l, b_c_by_l)
+    _, out_by_l = lax.scan(_scan_level, None, scan_inputs)
+    return out_by_l.transpose(1, 0, 2, 3)
 
-    if limiter is not None:
-      _, chunks_k = lax.scan(
-          lambda _, cb: (None, _eval_k_chunk(cb[0], cb[1])),
-          None,
-          (f_grouped_by_l, b_grouped_by_l),
-      )
-    else:
-      _, chunks_k = lax.scan(
-          lambda _, fc: (None, _eval_k_chunk(fc, None)),
-          None,
-          f_grouped_by_l,
-      )
-    return None, chunks_k.reshape(c_pad, nx_loc, ny_loc)[:num_channels]
+  if num_channels <= chunk_size:
+    return _eval_channel_chunk(f_buf)
 
-  _, out_by_l = lax.scan(
-      _scan_level,
-      None,
-      (jnp.arange(l_q_loc, dtype=jnp.int32), lon_q, sin_lat_q, sigma_q),
+  c_pad = _round_to_multiple(num_channels, chunk_size)
+  f_pad = (
+      jnp.pad(f_buf, [(0, c_pad - num_channels), (0, 0), (0, 0), (0, 0)])
+      if c_pad > num_channels
+      else f_buf
   )
-  return out_by_l.transpose(1, 0, 2, 3)
+  f_grouped = f_pad.reshape(
+      c_pad // chunk_size, chunk_size, l_buf, n_lon, n_lat_buf
+  )
+  _, out_grouped = lax.scan(
+      lambda _, grp: (None, _eval_channel_chunk(grp)), None, f_grouped
+  )
+  return out_grouped.reshape(c_pad, l_q_loc, nx_loc, ny_loc)[:num_channels]
 
 
 def _interpolate_3d_grid_matmul(
