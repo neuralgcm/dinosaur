@@ -918,39 +918,165 @@ class MatmulInterpolationTest(parameterized.TestCase):
       )
       return u_out, v_out, tr_out
 
+    layout_re = re.compile(r'\b(f32|bf16|s32|u32|pred)\[([0-9,]+)\]\{([0-9,]+)\}')
+    dtype_bytes = {'f32': 4, 'bf16': 2, 's32': 4, 'u32': 4, 'pred': 1}
+
+    def max_padded_bytes(hlo_text: str) -> int:
+      best = 0
+      for match in layout_re.finditer(hlo_text):
+        dt, dims_s, lay_s = match.groups()
+        dims = [int(x) for x in dims_s.split(',')]
+        lay = [int(x) for x in lay_s.split(',')]
+        item = dtype_bytes[dt]
+        if len(dims) == 1:
+          tpu_bytes = math.ceil(dims[0] / 128) * 128 * item
+        else:
+          d_minor = dims[lay[0]]
+          d_sub = dims[lay[1]]
+          rest = math.prod(
+              dims[i] for i in range(len(dims)) if i not in (lay[0], lay[1])
+          )
+          tpu_bytes = (
+              rest
+              * (math.ceil(d_sub / 8) * 8)
+              * (math.ceil(d_minor / 128) * 128)
+              * item
+          )
+        best = max(best, tpu_bytes)
+      return best
+
     compiled = step_transport.lower(u, v, sigma_dot, tracers).compile()
     mem = compiled.memory_analysis()
     # Unpadded HLO temporary workspace for T63 L47 + 10 tracers must stay <750MB
-    # (vs >2.1GB when pre-extracting multi-level latitude windows).
+    # on single-level non-TPU paths, with every buffer <200MB under TPU (8, 128)
+    # physical tile padding.
     self.assertLess(mem.temp_size_in_bytes, 750 * 1024 * 1024)
+    self.assertLess(max_padded_bytes(compiled.as_text()), 200 * 1024 * 1024)
 
-    # Every post-optimization HLO buffer must also stay <200MB under TPU (8, 128)
-    # subminor/minor physical tile padding (guards against trailing small-channel
-    # dims that blow up 128x on TPU).
-    layout_re = re.compile(r'\b(f32|bf16|s32|u32|pred)\[([0-9,]+)\]\{([0-9,]+)\}')
-    dtype_bytes = {'f32': 4, 'bf16': 2, 's32': 4, 'u32': 4, 'pred': 1}
-    max_tpu_bytes = 0
-    for match in layout_re.finditer(compiled.as_text()):
-      dt, dims_s, lay_s = match.groups()
-      dims = [int(x) for x in dims_s.split(',')]
-      lay = [int(x) for x in lay_s.split(',')]
-      item = dtype_bytes[dt]
-      if len(dims) == 1:
-        tpu_bytes = math.ceil(dims[0] / 128) * 128 * item
-      else:
-        d_minor = dims[lay[0]]
-        d_sub = dims[lay[1]]
-        rest = math.prod(
-            dims[i] for i in range(len(dims)) if i not in (lay[0], lay[1])
-        )
-        tpu_bytes = (
-            rest
-            * (math.ceil(d_sub / 8) * 8)
-            * (math.ceil(d_minor / 128) * 128)
-            * item
-        )
-      max_tpu_bytes = max(max_tpu_bytes, tpu_bytes)
-    self.assertLess(max_tpu_bytes, 200 * 1024 * 1024)
+    # Also verify multi-level TPU MXU chunking stays bounded under (8, 128)
+    # tile padding (catches 6-D transpose blowups while trading modest workspace
+    # for multi-level MXU batching).
+    with mock.patch.object(jax, 'default_backend', return_value='tpu'):
+      jax.clear_caches()
+      compiled_tpu = step_transport.lower(u, v, sigma_dot, tracers).compile()
+      mem_tpu = compiled_tpu.memory_analysis()
+      self.assertLess(mem_tpu.temp_size_in_bytes, 1600 * 1024 * 1024)
+      self.assertLess(
+          max_padded_bytes(compiled_tpu.as_text()), 650 * 1024 * 1024
+      )
+    jax.clear_caches()
+
+  def test_interpolate_3d_mixed_partial_limiting_and_trilinear(self):
+    grid = spherical_harmonic.Grid.T21()
+    coords = coordinate_systems.CoordinateSystem(
+        grid, sigma_coordinates.SigmaCoordinates.equidistant(16)
+    )
+    layers = coords.vertical.layers
+    rng = np.random.RandomState(23)
+    u = jnp.asarray(0.2 * rng.normal(size=(layers,) + grid.nodal_shape), jnp.float32)
+    v = jnp.asarray(0.2 * rng.normal(size=(layers,) + grid.nodal_shape), jnp.float32)
+    sigma_dot = jnp.zeros((layers + 1,) + grid.nodal_shape, dtype=jnp.float32)
+    sigma_dot = sigma_dot.at[1:-1].set(
+        jnp.asarray(0.05 * rng.normal(size=(layers - 1,) + grid.nodal_shape), jnp.float32)
+    )
+    fields = jnp.asarray(
+        jnp.maximum(0.5 + rng.normal(size=(7, layers) + grid.nodal_shape), 0.0),
+        jnp.float32,
+    )
+
+    dep_g = semi_lagrangian.departure_points_3d(
+        u, v, sigma_dot, coords, dt=0.25, method='gather'
+    )
+    dep_cpu = semi_lagrangian.departure_points_3d(
+        u, v, sigma_dot, coords, dt=0.25, method='matmul'
+    )
+    np.testing.assert_allclose(dep_cpu.cartesian, dep_g.cartesian, atol=1e-5)
+    np.testing.assert_allclose(dep_cpu.sigma, dep_g.sigma, atol=1e-5)
+    with mock.patch.object(jax, 'default_backend', return_value='tpu'):
+      jax.clear_caches()
+      dep_tpu = semi_lagrangian.departure_points_3d(
+          u, v, sigma_dot, coords, dt=0.25, method='matmul'
+      )
+    jax.clear_caches()
+    np.testing.assert_allclose(dep_tpu.cartesian, dep_g.cartesian, atol=5e-5)
+    np.testing.assert_allclose(dep_tpu.sigma, dep_g.sigma, atol=1e-5)
+
+    ref_unlim = semi_lagrangian.interpolate_3d(
+        fields[:4],
+        grid,
+        dep_g.lon,
+        dep_g.sin_lat,
+        dep_g.sigma,
+        coords.vertical.centers,
+        order='cubic',
+        limiter=None,
+        vertical_order='cubic',
+        method='gather',
+    )
+    ref_lim = semi_lagrangian.interpolate_3d(
+        fields[4:],
+        grid,
+        dep_g.lon,
+        dep_g.sin_lat,
+        dep_g.sigma,
+        coords.vertical.centers,
+        order='cubic',
+        limiter='quasi_monotone',
+        vertical_order='cubic',
+        method='gather',
+    )
+    ref_trilin = semi_lagrangian.interpolate_3d(
+        fields[4:],
+        grid,
+        dep_g.lon,
+        dep_g.sin_lat,
+        dep_g.sigma,
+        coords.vertical.centers,
+        order='linear',
+        limiter=None,
+        vertical_order='linear',
+        method='gather',
+    )
+    ref_high = jnp.concatenate([ref_unlim, ref_lim], axis=0)
+
+    for backend in ('cpu', 'tpu'):
+      with self.subTest(backend=backend):
+        with mock.patch.object(jax, 'default_backend', return_value=backend):
+          jax.clear_caches()
+          fn = jax.jit(
+              lambda f: semi_lagrangian._interpolate_3d_mixed(
+                  f,
+                  grid,
+                  dep_g.lon,
+                  dep_g.sin_lat,
+                  dep_g.sigma,
+                  coords.vertical.centers,
+                  order='cubic',
+                  limiter='quasi_monotone',
+                  limited_channel_start=4,
+                  trilinear_channel_start=4,
+                  vertical_order='cubic',
+                  method='matmul',
+              )
+          )
+          out_high, out_low = fn(fields)
+          np.testing.assert_allclose(out_high, ref_high, rtol=2e-5, atol=5e-5)
+          np.testing.assert_allclose(out_low, ref_trilin, rtol=2e-5, atol=5e-5)
+          self.assertGreaterEqual(float(jnp.min(out_high[4:])), 0.0)
+          self.assertGreaterEqual(float(jnp.min(out_low)), 0.0)
+
+          if backend == 'tpu':
+            loss_fn = jax.jit(
+                jax.value_and_grad(
+                    lambda f: jnp.sum(fn(f)[0] ** 2) + 0.5 * jnp.sum(fn(f)[1] ** 2)
+                )
+            )
+            hlo = loss_fn.lower(fields).as_text()
+            self.assertNotIn('stablehlo.gather', hlo)
+            self.assertNotIn('stablehlo.scatter', hlo)
+            _, grad_f = loss_fn(fields)
+            self.assertTrue(np.all(np.isfinite(np.asarray(grad_f))))
+    jax.clear_caches()
 
 
 if __name__ == '__main__':

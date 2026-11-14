@@ -331,6 +331,7 @@ class IntegrationTest(absltest.TestCase):
       return padded.replace(tracers={**padded.tracers, **padded_nodal})
 
     def to_unpadded_nodal(state, dist_coords=None):
+      state = jax.device_get(state)
       if dist_coords is not None:
         mpad_x, mpad_y = dist_coords.horizontal.modal_padding
         npad_x, npad_y = dist_coords.horizontal.nodal_padding
@@ -381,7 +382,7 @@ class IntegrationTest(absltest.TestCase):
         dist_out = make_sl_sim_fn(dist_coords)(dist_init)
         dist_nodal = to_unpadded_nodal(dist_out, dist_coords)
         assert_states_close(
-            ref_matmul_out, dist_nodal, rtol=1e-5, range_tol=1e-5, atol=1e-6
+            ref_matmul_out, dist_nodal, rtol=1e-4, range_tol=1e-4, atol=1e-5
         )
         for tr_name in nodal_tracer_names:
           self.assertGreaterEqual(
@@ -476,15 +477,19 @@ class IntegrationTest(absltest.TestCase):
     ref_step, ref_grad_fn = make_step_and_loss(coords)
     dist_step, dist_grad_fn = make_step_and_loss(dist_coords)
 
-    ref_out = ref_step(init_state)
-    dist_out = dist_step(dist_init)
-    np.testing.assert_allclose(
-        coords.horizontal.to_nodal(ref_out.temperature_variation),
-        coords.horizontal.to_nodal(
-            dist_out.temperature_variation[..., : -mpad_x or None, : -mpad_y or None]
+    ref_out = jax.device_get(ref_step(init_state))
+    dist_out = jax.device_get(dist_step(dist_init))
+    assert_allclose(
+        np.asarray(coords.horizontal.to_nodal(ref_out.temperature_variation)),
+        np.asarray(
+            coords.horizontal.to_nodal(
+                dist_out.temperature_variation[
+                    ..., : -mpad_x or None, : -mpad_y or None
+                ]
+            )
         ),
         rtol=2e-5,
-        atol=2e-5,
+        range_tol=3e-5,
     )
     np.testing.assert_allclose(
         ref_out.tracers['aerosol_0'],

@@ -249,6 +249,28 @@ class SemiLagrangianImplicitExplicitODE:
     raise NotImplementedError
 
 
+def _can_fuse_nonadvective_and_velocities(
+    equation: SemiLagrangianImplicitExplicitODE,
+) -> bool:
+  """Returns True if `equation` supports fused `(nonadvective, velocities)`."""
+  inst_dict = getattr(equation, '__dict__', ())
+  if 'nonadvective_terms' in inst_dict or 'nodal_velocities' in inst_dict:
+    return False
+  cls = type(equation)
+  if getattr(cls, 'nonadvective_terms_and_velocities', None) is None:
+    return False
+  for base in cls.__mro__:
+    if 'nonadvective_terms_and_velocities' in base.__dict__:
+      owner = base
+      break
+  else:
+    return False
+  return (
+      cls.nonadvective_terms is owner.nonadvective_terms
+      and cls.nodal_velocities is owner.nodal_velocities
+  )
+
+
 def semi_lagrangian_crank_nicolson_rk2(
     equation: SemiLagrangianImplicitExplicitODE,
     time_step: float,
@@ -307,11 +329,15 @@ def semi_lagrangian_crank_nicolson_rk2(
   dt = time_step
   α = (0.5 + off_centering) * dt
   β = (0.5 - off_centering) * dt
+  use_fused = _can_fuse_nonadvective_and_velocities(equation)
 
   def step_fn(x0: PyTreeState) -> PyTreeState:
-    n0 = equation.nonadvective_terms(x0)
+    if use_fused:
+      n0, v0 = equation.nonadvective_terms_and_velocities(x0)
+    else:
+      n0 = equation.nonadvective_terms(x0)
+      v0 = equation.nodal_velocities(x0)
     l0 = equation.implicit_terms(x0)
-    v0 = equation.nodal_velocities(x0)
 
     # Stage 1 (predictor): first-order trajectories from current winds.
     departure1 = equation.departure_points(v0, dt)
@@ -321,11 +347,14 @@ def semi_lagrangian_crank_nicolson_rk2(
     )
 
     # Stage 2 (corrector): time-centered trajectories and trapezoidal update.
-    v_star = equation.nodal_velocities(x_star)
+    if use_fused:
+      n_star, v_star = equation.nonadvective_terms_and_velocities(x_star)
+    else:
+      v_star = equation.nodal_velocities(x_star)
+      n_star = equation.nonadvective_terms(x_star)
     v_mid = tree_map(lambda a, b: 0.5 * (a + b), v0, v_star)
     guess = departure1 if warm_start_corrector else None
     departure2 = equation.departure_points(v_mid, dt, initial_guess=guess)
-    n_star = equation.nonadvective_terms(x_star)
     bracket2 = tree_map(lambda x, l, n: x + β * (l + n), x0, l0, n0)
     transported = equation.semi_lagrangian_transport(bracket2, departure2)
     combined = tree_map(lambda t, n: t + α * n, transported, n_star)
@@ -386,6 +415,7 @@ def semi_lagrangian_settls(
     Q. J. R. Meteorol. Soc. 128, 1671-1687 (2002).
   """
   dt = time_step
+  use_fused = _can_fuse_nonadvective_and_velocities(equation)
 
   def step_fn(carry):
     if warm_start_departures:
@@ -393,9 +423,12 @@ def semi_lagrangian_settls(
     else:
       x, (n_prev, v_prev) = carry
       dep_prev = None
-    n = equation.nonadvective_terms(x)
+    if use_fused:
+      n, v = equation.nonadvective_terms_and_velocities(x)
+    else:
+      n = equation.nonadvective_terms(x)
+      v = equation.nodal_velocities(x)
     l = equation.implicit_terms(x)
-    v = equation.nodal_velocities(x)
     v_mid = tree_map(lambda a, b: 1.5 * a - 0.5 * b, v, v_prev)
     departure = equation.departure_points(v_mid, dt, initial_guess=dep_prev)
     bracket = tree_map(
