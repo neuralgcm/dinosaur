@@ -13,6 +13,7 @@
 # limitations under the License.
 import dataclasses
 import functools
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -2197,6 +2198,130 @@ class SemiLagrangianHybridTest(parameterized.TestCase):
     equation, state, _, _ = self._hybrid_setup(hybrid_levels)
     with self.assertRaisesRegex(TypeError, 'semi-Lagrangian'):
       equation.explicit_terms(state)
+
+  def test_nonadvective_terms_and_velocities_matches_separate(self):
+    """Fused nonadvective_terms_and_velocities matches separate evaluations."""
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        8, sigma_exponent=1.5, stretch_exponent=0.5
+    )
+    eq_hybrid, state_h, ref_temps_h, orog_h = self._hybrid_setup(
+        hybrid_levels,
+        humidity_key='specific_humidity',
+        cloud_keys=('cloud_liq',),
+    )
+    q = primitive_equations_states.gaussian_scalar(
+        eq_hybrid.coords, eq_hybrid.physics_specs, amplitude=0.01
+    )
+    state_h.tracers = {'specific_humidity': q, 'cloud_liq': 0.1 * q}
+    n_ref_h = eq_hybrid.nonadvective_terms(state_h)
+    v_ref_h = eq_hybrid.nodal_velocities(state_h)
+    n_fused_h, v_fused_h = eq_hybrid.nonadvective_terms_and_velocities(state_h)
+    assert_states_close(n_fused_h, n_ref_h, rtol=1e-5, atol=1e-6)
+    for name in ('u', 'v', 'sigma_dot', 'u_mean', 'v_mean'):
+      np.testing.assert_allclose(
+          getattr(v_fused_h, name),
+          getattr(v_ref_h, name),
+          rtol=1e-5,
+          atol=1e-6,
+          err_msg=name,
+      )
+
+    sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(8)
+    coords_s = coordinate_systems.CoordinateSystem(
+        eq_hybrid.coords.horizontal, sigma_levels
+    )
+    eq_sigma = primitive_equations.SemiLagrangianPrimitiveEquations(
+        ref_temps_h,
+        orog_h,
+        coords_s,
+        eq_hybrid.physics_specs,
+        humidity_key='specific_humidity',
+    )
+    state_s = state_h.replace(tracers={'specific_humidity': q})
+    n_ref_s = eq_sigma.nonadvective_terms(state_s)
+    v_ref_s = eq_sigma.nodal_velocities(state_s)
+    n_fused_s, v_fused_s = eq_sigma.nonadvective_terms_and_velocities(state_s)
+    assert_states_close(n_fused_s, n_ref_s, rtol=1e-5, atol=1e-6)
+    for name in ('u', 'v', 'sigma_dot', 'u_mean', 'v_mean'):
+      np.testing.assert_allclose(
+          getattr(v_fused_s, name),
+          getattr(v_ref_s, name),
+          rtol=1e-5,
+          atol=1e-6,
+          err_msg=name,
+      )
+
+  def test_semi_lagrangian_transport_fused_low_order_tracers(self):
+    """return_nodal_tracers_linear fuses trilinear low-order tracer transport."""
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        8, sigma_exponent=1.5, stretch_exponent=0.5
+    )
+    base_eq, state, _, _ = self._hybrid_setup(
+        hybrid_levels,
+        humidity_key='specific_humidity',
+        nodal_tracers=('specific_humidity', 'aerosol'),
+        monotone_tracers=True,
+        vertical_interpolation_order='cubic',
+    )
+    grid = base_eq.coords.horizontal
+    q_nodal = jnp.maximum(
+        grid.to_nodal(
+            primitive_equations_states.gaussian_scalar(
+                base_eq.coords, base_eq.physics_specs, amplitude=0.01
+            )
+        ),
+        0.0,
+    )
+    state.tracers = {
+        'specific_humidity': q_nodal,
+        'aerosol': 0.5 * jnp.roll(q_nodal, shift=5, axis=1),
+        'modal_passive': primitive_equations_states.gaussian_scalar(
+            base_eq.coords, base_eq.physics_specs
+        ),
+    }
+    dt = self._nondim_minutes(base_eq.physics_specs, 30)
+    vel = base_eq.nodal_velocities(state)
+    dep = base_eq.departure_points(vel, dt)
+    linear_interp = semi_lagrangian.GridInterpolator(
+        grid, 'linear', limiter=None, method='gather'
+    )
+    expected_low = {
+        k: semi_lagrangian.transport_scalar(
+            state.tracers[k],
+            dep.full,
+            base_eq._reference_vertical_nodes,
+            linear_interp,
+            vertical_order='linear',
+        )
+        for k in ('specific_humidity', 'aerosol')
+    }
+
+    for method, backend in (('gather', 'cpu'), ('matmul', 'tpu')):
+      with self.subTest(method=method, backend=backend):
+        eq = dataclasses.replace(base_eq, interpolation_method=method)
+        with mock.patch.object(jax, 'default_backend', return_value=backend):
+          jax.clear_caches()
+          ref_out = jax.jit(
+              lambda s: primitive_equations._semi_lagrangian_transport(
+                  eq, s, dep, eq._reference_vertical_nodes
+              )
+          )(state)
+          fused_out, tr_low = jax.jit(
+              lambda s: primitive_equations._semi_lagrangian_transport(
+                  eq,
+                  s,
+                  dep,
+                  eq._reference_vertical_nodes,
+                  return_nodal_tracers_linear=True,
+              )
+          )(state)
+        assert_states_close(fused_out, ref_out, rtol=2e-5, atol=2e-5)
+        self.assertEqual(set(tr_low.keys()), {'specific_humidity', 'aerosol'})
+        for k in ('specific_humidity', 'aerosol'):
+          np.testing.assert_allclose(
+              tr_low[k], expected_low[k], rtol=2e-5, atol=2e-5, err_msg=k
+          )
+    jax.clear_caches()
 
 
 def interpolate_state_hybrid_to_sigma(

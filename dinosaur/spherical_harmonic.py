@@ -488,15 +488,25 @@ class FastSphericalHarmonics(SphericalHarmonics):
   stacked_fourier_transforms: bool | None = None
   transform_precision: jax.lax.PrecisionLike = None
   fourier_method: Literal['matmul', 'fft'] | None = None
+  nodal_shape_multiple: int | None = dataclasses.field(
+      default=None, kw_only=True
+  )
 
   def __post_init__(self):
     model_parallelism = self.spmd_mesh is not None and any(
         self.spmd_mesh.shape[dim] > 1 for dim in 'zxy'
     )
 
+    explicit_base_multiple = self.base_shape_multiple
     if self.base_shape_multiple is None:
       shape_multiple = 8 if model_parallelism else 1
       object.__setattr__(self, 'base_shape_multiple', shape_multiple)
+
+    if self.nodal_shape_multiple is None:
+      nodal_multiple = (
+          explicit_base_multiple if explicit_base_multiple is not None else 1
+      )
+      object.__setattr__(self, 'nodal_shape_multiple', nodal_multiple)
 
     if self.reverse_einsum_arg_order is None:
       object.__setattr__(self, 'reverse_einsum_arg_order', model_parallelism)
@@ -555,7 +565,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
     if method == 'fft' and self.nodal_padding[0]:
       raise ValueError(
           'fourier_method="fft" does not support nodal padding in longitude; '
-          f'got {self.nodal_padding[0]=} from {self.base_shape_multiple=}'
+          f'got {self.nodal_padding[0]=} from {self.nodal_shape_multiple=}'
       )
     return method
 
@@ -575,7 +585,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
 
   @functools.cached_property
   def nodal_shape(self) -> tuple[int, int]:
-    base = self.base_shape_multiple or 1
+    base = self.nodal_shape_multiple or 1
     x_shards, y_shards = self._mesh_shape()
     shape_multiples = (base * x_shards, base * y_shards)
     return tuple(map(_round_to_multiple, self.nodal_limits, shape_multiples))  # pyrefly: ignore[bad-return]
@@ -832,6 +842,27 @@ def _with_vertical_padding(
   """
 
   def g(x):
+    if mesh is not None and x.ndim > 3:
+      batch_shape = x.shape[:-3]
+      batch_size = math.prod(batch_shape)
+      if batch_size == 0:
+        out_spatial = jax.eval_shape(
+            f, jnp.zeros((1,) + x.shape[-2:], dtype=x.dtype)
+        ).shape[-2:]
+        return jnp.zeros(x.shape[:-2] + out_spatial, dtype=x.dtype)
+      z_size = x.shape[-3]
+      z_multiple = mesh.shape['z']
+      z_padded = _round_to_multiple(z_size, z_multiple)
+      x_moved = jnp.moveaxis(x, -3, 0)
+      if z_padded > z_size:
+        pad_width = [(0, z_padded - z_size)] + [(0, 0)] * (x_moved.ndim - 1)
+        x_moved = jnp.pad(x_moved, pad_width)
+      x_flat = x_moved.reshape((z_padded * batch_size,) + x.shape[-2:])
+      y_flat = f(x_flat)
+      y_moved = y_flat.reshape((z_padded, *batch_shape, *y_flat.shape[-2:]))
+      if z_padded > z_size:
+        y_moved = jax.lax.slice_in_dim(y_moved, 0, z_size, axis=0)
+      return jnp.moveaxis(y_moved, 0, -3)
     x, padding = _vertical_pad(x, mesh)
     return _vertical_crop(f(x), padding)
 
@@ -1016,6 +1047,10 @@ class Grid:
   @classmethod
   def T42(cls, **kwargs) -> Grid:
     return cls.construct(max_wavenumber=42, gaussian_nodes=32, **kwargs)
+
+  @classmethod
+  def T63(cls, **kwargs) -> Grid:
+    return cls.construct(max_wavenumber=63, gaussian_nodes=48, **kwargs)
 
   @classmethod
   def T85(cls, **kwargs) -> Grid:

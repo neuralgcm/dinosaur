@@ -583,6 +583,71 @@ class GridTest(parameterized.TestCase):
     np.testing.assert_array_equal(clipped['u'], expected_u)
     self.assertEqual(clipped['time'], 1.0)
 
+  def testFastSphericalHarmonicsNodalShapeMultiple(self):
+    x_shards = 2 if len(jax.devices()) >= 2 else 1
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()[:x_shards]).reshape(1, x_shards, 1),
+        ['z', 'x', 'y'],
+    )
+    t63 = spherical_harmonic.Grid.T63(
+        spherical_harmonics_impl=spherical_harmonic.FastSphericalHarmonics,
+        spmd_mesh=mesh,
+    )
+    self.assertEqual(t63.nodal_shape, (192, 96))
+    self.assertEqual(t63.nodal_padding, (0, 0))
+    expected_modal = (128, 72) if x_shards > 1 else (128, 65)
+    self.assertEqual(t63.modal_shape, expected_modal)
+
+    # Explicit base_shape_multiple preserves backwards compatibility for nodal.
+    padded_legacy = spherical_harmonic.FastSphericalHarmonics(
+        longitude_nodes=94,
+        latitude_nodes=47,
+        longitude_wavenumbers=32,
+        total_wavenumbers=32,
+        base_shape_multiple=8,
+    )
+    self.assertEqual(padded_legacy.nodal_shape, (96, 48))
+    self.assertEqual(padded_legacy.nodal_padding, (2, 1))
+
+    # Explicit nodal_shape_multiple controls nodal rounding independently.
+    padded_nodal = spherical_harmonic.FastSphericalHarmonics(
+        longitude_nodes=94,
+        latitude_nodes=47,
+        longitude_wavenumbers=32,
+        total_wavenumbers=32,
+        nodal_shape_multiple=8,
+    )
+    self.assertEqual(padded_nodal.nodal_shape, (96, 48))
+    self.assertEqual(padded_nodal.modal_shape, (64, 32))
+
+  def testBatched4DSphericalHarmonicsWithMesh(self):
+    z_shards = 2 if len(jax.devices()) >= 2 else 1
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()[:z_shards]).reshape(z_shards, 1, 1),
+        ['z', 'x', 'y'],
+    )
+    grid = spherical_harmonic.Grid.T21(
+        spherical_harmonics_impl=spherical_harmonic.FastSphericalHarmonics,
+        spmd_mesh=mesh,
+    )
+    rng = np.random.RandomState(0)
+    # 4-D [batch=5, z=3, m, l] exercises ndim > 3 and odd z padding.
+    modal = rng.normal(size=(5, 3) + grid.modal_shape).astype(np.float32)
+    modal *= grid.mask
+    nodal_batched = grid.to_nodal(jnp.asarray(modal))
+    nodal_expected = jnp.stack([grid.to_nodal(jnp.asarray(m)) for m in modal])
+    np.testing.assert_allclose(
+        nodal_batched, nodal_expected, rtol=1e-5, atol=1e-5
+    )
+
+    modal_roundtrip = grid.to_modal(nodal_batched)
+    modal_expected = jnp.stack(
+        [grid.to_modal(n) for n in nodal_batched]
+    )
+    np.testing.assert_allclose(
+        modal_roundtrip, modal_expected, rtol=1e-5, atol=1e-5
+    )
+
 
 if __name__ == '__main__':
   absltest.main()
