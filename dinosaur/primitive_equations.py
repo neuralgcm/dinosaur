@@ -2146,8 +2146,39 @@ def _semi_lagrangian_transport(
     vertical_nodes: semi_lagrangian.VerticalNodes,
     *,
     return_nodal_tracers_linear: bool = False,
+    predictor_stage: bool = False,
 ) -> State | tuple[State, dict[str, jnp.ndarray]]:
   """Remaps the advected representation of a modal state-like pytree."""
+  cls = type(equation)
+  can_skip_passive = (
+      predictor_stage
+      and not return_nodal_tracers_linear
+      and 'explicit_nonadvective_terms' not in getattr(equation, '__dict__', ())
+      and cls.explicit_nonadvective_terms
+      in (
+          PrimitiveEquationsSigma.explicit_nonadvective_terms,
+          PrimitiveEquationsHybrid.explicit_nonadvective_terms,
+      )
+      and 'implicit_inverse' not in getattr(equation, '__dict__', ())
+      and cls.implicit_inverse
+      in (
+          PrimitiveEquationsSigma.implicit_inverse,
+          PrimitiveEquationsHybrid.implicit_inverse,
+      )
+  )
+  passthrough_tracers = {}
+  if can_skip_passive and state.tracers:
+    dynamics_keys = {equation.humidity_key, *(equation.cloud_keys or ())}
+    passthrough_tracers = {
+        k: v for k, v in state.tracers.items() if k not in dynamics_keys
+    }
+    if passthrough_tracers:
+      state = state.replace(
+          tracers={
+              k: v for k, v in state.tracers.items() if k in dynamics_keys
+          }
+      )
+
   grid = equation.coords.horizontal
   dynamics_limiter = (
       'quasi_monotone' if equation.monotone_dynamics else None
@@ -2384,7 +2415,7 @@ def _semi_lagrangian_transport(
   )
   transported = grid.clip_wavenumbers(transported)
   result = transported.replace(
-      tracers={**transported.tracers, **nodal_tracers}
+      tracers={**transported.tracers, **nodal_tracers, **passthrough_tracers}
   )
   if return_nodal_tracers_linear:
     return result, nodal_tracers_linear
@@ -2600,9 +2631,15 @@ class SemiLagrangianPrimitiveEquations(
       self,
       state: State,
       departure: PrimitiveDeparturePoints,
+      *,
+      predictor_stage: bool = False,
   ) -> State:
     return _semi_lagrangian_transport(
-        self, state, departure, self._vertical_nodes
+        self,
+        state,
+        departure,
+        self._vertical_nodes,
+        predictor_stage=predictor_stage,
     )
 
 
@@ -4311,9 +4348,15 @@ class SemiLagrangianPrimitiveEquationsHybrid(
       self,
       state: State,
       departure: PrimitiveDeparturePoints,
+      *,
+      predictor_stage: bool = False,
   ) -> State:
     return _semi_lagrangian_transport(
-        self, state, departure, self._reference_vertical_nodes
+        self,
+        state,
+        departure,
+        self._reference_vertical_nodes,
+        predictor_stage=predictor_stage,
     )
 
 

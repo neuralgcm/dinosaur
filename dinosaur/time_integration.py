@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import math
 from typing import Any, Callable, Optional, Sequence, TypeVar, Union
 
@@ -330,6 +331,10 @@ def semi_lagrangian_crank_nicolson_rk2(
   α = (0.5 + off_centering) * dt
   β = (0.5 - off_centering) * dt
   use_fused = _can_fuse_nonadvective_and_velocities(equation)
+  supports_predictor_stage = (
+      'predictor_stage'
+      in inspect.signature(equation.semi_lagrangian_transport).parameters
+  )
 
   def step_fn(x0: PyTreeState) -> PyTreeState:
     if use_fused:
@@ -342,9 +347,14 @@ def semi_lagrangian_crank_nicolson_rk2(
     # Stage 1 (predictor): first-order trajectories from current winds.
     departure1 = equation.departure_points(v0, dt)
     bracket1 = tree_map(lambda x, l, n: x + β * l + dt * n, x0, l0, n0)
-    x_star = equation.implicit_inverse(
-        equation.semi_lagrangian_transport(bracket1, departure1), α
+    transported1 = (
+        equation.semi_lagrangian_transport(
+            bracket1, departure1, predictor_stage=True
+        )
+        if supports_predictor_stage
+        else equation.semi_lagrangian_transport(bracket1, departure1)
     )
+    x_star = equation.implicit_inverse(transported1, α)
 
     # Stage 2 (corrector): time-centered trajectories and trapezoidal update.
     if use_fused:

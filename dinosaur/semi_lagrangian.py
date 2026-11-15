@@ -429,6 +429,23 @@ def _searchsorted_right_minus_one(
   return (jnp.searchsorted(nodes_1d, x, side='right') - 1).astype(jnp.int32)
 
 
+def _tpu_step_diff_one_hot(
+    x: jax.Array, thresholds_1d: jax.Array, dtype: jnp.dtype
+) -> jax.Array:
+  """Builds exact 1-D cell one-hot directly from boolean threshold step diffs."""
+  num_thresh = thresholds_1d.shape[0]
+  if num_thresh == 0:
+    return jnp.ones((*x.shape, 1), dtype=dtype)
+  ge = x[..., jnp.newaxis] >= thresholds_1d
+  if num_thresh == 1:
+    oh_bool = jnp.concatenate([~ge, ge], axis=-1)
+  else:
+    oh_bool = jnp.concatenate(
+        [~ge[..., :1], ge[..., :-1] & ~ge[..., 1:], ge[..., -1:]], axis=-1
+    )
+  return oh_bool.astype(dtype)
+
+
 def _horizontal_stencil_tuple(
     grid: spherical_harmonic.Grid,
     lon: Array,
@@ -461,32 +478,32 @@ def _horizontal_stencil_tuple(
   lon_weights = _uniform_lagrange_weights_tuple(alpha_lon, order)
   lon_indices = tuple((lon_cell + int(off)) % n_lon for off in offsets)
 
-  # Latitude nodes are non-uniform; searchsorted locates the bracketing ring
-  # on the halo-extended axis and Lagrange weights use actual node latitudes.
+  # Latitude nodes are non-uniform; locate the bracketing ring on the
+  # halo-extended axis and compute Lagrange weights on actual node latitudes.
   phi_extended = _latitude_halo_axis(grid)
-  phi_ext_jax = jnp.asarray(phi_extended, dtype=phi.dtype)
-  lat_cell = _searchsorted_right_minus_one(phi_ext_jax, phi)
-  # Physical points always satisfy |φ| <= π/2, which keeps cubic stencils
-  # within the extended axis; clip for numerical safety only.
-  lat_cell = jnp.clip(
-      lat_cell, -int(offsets[0]), phi_extended.size - 1 - int(offsets[-1])
-  )
-  lat_indices = tuple(lat_cell + int(off) for off in offsets)
+  c_min = -int(offsets[0])
+  c_max = phi_extended.size - 1 - int(offsets[-1])
   alpha_lat = None
   if jax.default_backend() == 'tpu' and phi_extended.size <= 512:
-    n_starts = phi_extended.size - len(offsets) + 1
-    oh_lat = jax.nn.one_hot(lat_indices[0], n_starts, dtype=phi.dtype)
+    n_starts = c_max - c_min + 1
+    thresholds = jnp.asarray(
+        phi_extended[c_min + 1 : c_max + 1], dtype=phi.dtype
+    )
+    oh_lat = _tpu_step_diff_one_hot(phi, thresholds, phi.dtype)
     dot_prec = jax_numpy_utils.resolve_dot_precision(
         None, oh_lat, oh_lat, lhs_exact_in_bf16=True
     )
+    cell_np = np.arange(c_min, c_max + 1, dtype=np.float64)
     if order == 'linear':
       lin_np = np.stack(
-          [phi_extended[:-1], 1.0 / np.diff(phi_extended)], axis=-1
+          [phi_extended[:-1], 1.0 / np.diff(phi_extended), cell_np], axis=-1
       )
       packed = jnp.dot(
           oh_lat, jnp.asarray(lin_np, dtype=phi.dtype), precision=dot_prec
       )
       frac = (phi - packed[..., 0]) * packed[..., 1]
+      lat_cell = jnp.rint(packed[..., 2]).astype(jnp.int32)
+      lat_indices = (lat_cell, lat_cell + 1)
       lat_weights = (1.0 - frac, frac)
       if include_linear_fractions:
         alpha_lat = frac
@@ -496,7 +513,10 @@ def _horizontal_stencil_tuple(
           1.0 / math.prod(nodes_np[i] - nodes_np[j] for j in range(4) if j != i)
           for i in range(4)
       ]
-      cub_np = np.stack([*nodes_np, *inv_den_np], axis=-1)
+      cols_np = [*nodes_np, *inv_den_np, cell_np]
+      if include_linear_fractions:
+        cols_np.append(1.0 / (nodes_np[2] - nodes_np[1]))
+      cub_np = np.stack(cols_np, axis=-1)
       packed = jnp.dot(
           oh_lat, jnp.asarray(cub_np, dtype=phi.dtype), precision=dot_prec
       )
@@ -510,13 +530,21 @@ def _horizontal_stencil_tuple(
           d0 * d1 * d3 * packed[..., 6],
           d0 * d1 * d2 * packed[..., 7],
       )
+      lat_cell = jnp.rint(packed[..., 8]).astype(jnp.int32)
+      lat_indices = tuple(lat_cell + int(off) for off in offsets)
       if include_linear_fractions:
-        alpha_lat = d1 / (packed[..., 2] - packed[..., 1])
+        alpha_lat = d1 * packed[..., 9]
   else:
+    phi_ext_jax = jnp.asarray(phi_extended, dtype=phi.dtype)
+    lat_cell = _searchsorted_right_minus_one(phi_ext_jax, phi)
+    # Physical points always satisfy |φ| <= π/2, which keeps cubic stencils
+    # within the extended axis; clip for numerical safety only.
+    lat_cell = jnp.clip(lat_cell, c_min, c_max)
+    lat_indices = tuple(lat_cell + int(off) for off in offsets)
     lat_nodes = tuple(phi_ext_jax[idx] for idx in lat_indices)
     lat_weights = _lagrange_weights_tuple(phi, lat_nodes)
     if include_linear_fractions:
-      c0_pos = -int(offsets[0])
+      c0_pos = c_min
       alpha_lat = (phi - lat_nodes[c0_pos]) / (
           lat_nodes[c0_pos + 1] - lat_nodes[c0_pos]
       )
@@ -1345,20 +1373,23 @@ def _vertical_stencil_tuple(
   sigma_nodes = jnp.asarray(sigma_nodes, dtype=sigma.dtype)
   num_levels = sigma_nodes.shape[0]
   sigma = jnp.clip(sigma, sigma_nodes[0], sigma_nodes[-1])
-  level_cell = _searchsorted_right_minus_one(sigma_nodes, sigma)
-  level_cell = jnp.clip(level_cell, 0, num_levels - 2)
-  if jax.default_backend() == 'tpu' and num_levels <= 512:
+  if (
+      jax.default_backend() == 'tpu'
+      and (vertical_order == 'linear' or num_levels >= 4)
+      and num_levels <= 512
+  ):
+    n_cells = num_levels - 1
+    oh_cell = _tpu_step_diff_one_hot(sigma, sigma_nodes[1:-1], sigma.dtype)
+    cell_f = jnp.arange(n_cells, dtype=sigma.dtype)
+    inv_w = 1.0 / (sigma_nodes[1:] - sigma_nodes[:-1])
     if vertical_order == 'linear':
-      lin_tbl = jnp.stack(
-          [sigma_nodes[:-1], 1.0 / (sigma_nodes[1:] - sigma_nodes[:-1])],
-          axis=-1,
-      )
-      oh_cell = jax.nn.one_hot(level_cell, num_levels - 1, dtype=sigma.dtype)
+      lin_tbl = jnp.stack([sigma_nodes[:-1], inv_w, cell_f], axis=-1)
       dot_prec = jax_numpy_utils.resolve_dot_precision(
           None, oh_cell, lin_tbl, lhs_exact_in_bf16=True
       )
       packed = jnp.dot(oh_cell, lin_tbl, precision=dot_prec)
       fraction = (sigma - packed[..., 0]) * packed[..., 1]
+      level_cell = jnp.rint(packed[..., 2]).astype(jnp.int32)
       base = (
           (level_cell, level_cell + 1),
           (1.0 - fraction, fraction),
@@ -1366,21 +1397,29 @@ def _vertical_stencil_tuple(
           level_cell,
       )
       return (*base, fraction) if include_linear_fractions else base
-    start = jnp.clip(level_cell - 1, 0, num_levels - 4)
-    level_indices = tuple(start + a for a in range(4))
-    n_starts = num_levels - 3
-    nodes_cols = [sigma_nodes[a : a + n_starts] for a in range(4)]
+    nodes_cols = [
+        jnp.concatenate(
+            [
+                sigma_nodes[a : a + 1],
+                sigma_nodes[a : num_levels - 3 + a],
+                sigma_nodes[num_levels - 4 + a : num_levels - 3 + a],
+            ],
+            axis=0,
+        )
+        for a in range(4)
+    ]
     inv_denoms = [
         1.0
         / math.prod(nodes_cols[i] - nodes_cols[j] for j in range(4) if j != i)
         for i in range(4)
     ]
-    cub_tbl = jnp.stack([*nodes_cols, *inv_denoms], axis=-1)
-    oh_start = jax.nn.one_hot(start, n_starts, dtype=sigma.dtype)
-    dot_prec = jax_numpy_utils.resolve_dot_precision(
-        None, oh_start, cub_tbl, lhs_exact_in_bf16=True
+    cub_tbl = jnp.stack(
+        [*nodes_cols, *inv_denoms, cell_f, sigma_nodes[:-1], inv_w], axis=-1
     )
-    packed = jnp.dot(oh_start, cub_tbl, precision=dot_prec)
+    dot_prec = jax_numpy_utils.resolve_dot_precision(
+        None, oh_cell, cub_tbl, lhs_exact_in_bf16=True
+    )
+    packed = jnp.dot(oh_cell, cub_tbl, precision=dot_prec)
     d0 = sigma - packed[..., 0]
     d1 = sigma - packed[..., 1]
     d2 = sigma - packed[..., 2]
@@ -1391,9 +1430,10 @@ def _vertical_stencil_tuple(
         d0 * d1 * d3 * packed[..., 6],
         d0 * d1 * d2 * packed[..., 7],
     )
-    frac_low = (sigma - sigma_nodes[0]) / (sigma_nodes[1] - sigma_nodes[0])
-    frac_high = (sigma - sigma_nodes[-2]) / (sigma_nodes[-1] - sigma_nodes[-2])
-    fraction = jnp.where(level_cell == 0, frac_low, frac_high)
+    level_cell = jnp.rint(packed[..., 8]).astype(jnp.int32)
+    start = jnp.clip(level_cell - 1, 0, num_levels - 4)
+    level_indices = tuple(start + a for a in range(4))
+    fraction = (sigma - packed[..., 9]) * packed[..., 10]
     bracket_offset = level_cell - start
     boundary_cell = (level_cell == 0) | (level_cell == num_levels - 2)
     level_weights = tuple(
@@ -1406,13 +1446,10 @@ def _vertical_stencil_tuple(
         for a in range(4)
     )
     base = (level_indices, level_weights, bracket_offset, level_cell)
-    if include_linear_fractions:
-      alpha_z = jnp.where(
-          boundary_cell, fraction, d1 / (packed[..., 2] - packed[..., 1])
-      )
-      return (*base, alpha_z)
-    return base
+    return (*base, fraction) if include_linear_fractions else base
 
+  level_cell = _searchsorted_right_minus_one(sigma_nodes, sigma)
+  level_cell = jnp.clip(level_cell, 0, num_levels - 2)
   below = sigma_nodes[level_cell]
   above = sigma_nodes[level_cell + 1]
   fraction = (sigma - below) / (above - below)
@@ -1770,24 +1807,21 @@ def _matmul_3d_local(
   buf_lat_start = jnp.clip(
       win_lat_start - buf_lat_origin, 0, n_lat_buf - w_lat_size
   )
-  # Place `w_lat_size` before `ny_loc` so `[l_buf, c_cur, n_lon, w_lat_size * ny_loc]`
-  # is written directly by the hoisted latitude `dot` with zero post-dot transpose
-  # and `(n_lon, w_lat_size * ny_loc)` aligned to TPU `(8, 128)` physical tiles.
+  # Build `m_lat_win` in `[ny_loc, w_lat_size, n_lat_buf]` so `dot(m_lat_2d, ...)`
+  # keeps `n_lon` in `axis=-1` without cross-lane minor-axis transposes.
   m_lat_win = jax.nn.one_hot(
-      jnp.arange(w_lat_size, dtype=jnp.int32)[:, jnp.newaxis]
-      + buf_lat_start[jnp.newaxis, :],
+      buf_lat_start[:, jnp.newaxis]
+      + jnp.arange(w_lat_size, dtype=jnp.int32)[jnp.newaxis, :],
       n_lat_buf,
       dtype=dtype,
-  )  # [w_lat_size, ny_loc, n_lat_buf]
-  m_lat_2d_t = m_lat_win.reshape(w_lat_size * ny_loc, n_lat_buf).T
+  )  # [ny_loc, w_lat_size, n_lat_buf]
+  m_lat_2d = m_lat_win.reshape(ny_loc * w_lat_size, n_lat_buf)
 
   dot_prec_lhs_bf16 = jax_numpy_utils.resolve_dot_precision(
-      None, m_lat_win, f_buf, lhs_exact_in_bf16=True
+      None, m_lat_2d, f_buf, lhs_exact_in_bf16=True
   )
-  dot_prec_rhs_bf16 = _resolve_rhs_binary_dot_precision(f_buf, m_lat_2d_t)
   dot_prec_f32 = jax_numpy_utils.resolve_dot_precision(None, f_buf, f_buf)
 
-  ref_centered = None
   ref_buf = None
   if eff_limiter is not None and limiter_bound_reference is not None:
     ref_arr = jnp.asarray(limiter_bound_reference, dtype=dtype)
@@ -1800,7 +1834,7 @@ def _matmul_3d_local(
   w_lat_cell_size = 0
   w_z_cell_size = 0
   win_lat_cell_start = None
-  m_lat_cell_2d_t = None
+  m_lat_cell_2d = None
   if eff_limiter is not None:
     w_lat_cell_size = min(
         n_lat_buf - 1, min(n_lat_ext - 1, 2 * eff_lat_shift + 2)
@@ -1817,83 +1851,75 @@ def _matmul_3d_local(
         (n_lat_buf - 1) - w_lat_cell_size,
     )
     m_lat_cell_win = jax.nn.one_hot(
-        jnp.arange(w_lat_cell_size, dtype=jnp.int32)[:, jnp.newaxis]
-        + buf_lat_cell_start[jnp.newaxis, :],
+        buf_lat_cell_start[:, jnp.newaxis]
+        + jnp.arange(w_lat_cell_size, dtype=jnp.int32)[jnp.newaxis, :],
         n_lat_buf - 1,
         dtype=dtype,
-    )  # [w_lat_cell_size, ny_loc, n_lat_buf - 1]
-    m_lat_cell_2d_t = m_lat_cell_win.reshape(
-        w_lat_cell_size * ny_loc, n_lat_buf - 1
-    ).T
+    )  # [ny_loc, w_lat_cell_size, n_lat_buf - 1]
+    m_lat_cell_2d = m_lat_cell_win.reshape(
+        ny_loc * w_lat_cell_size, n_lat_buf - 1
+    )
     w_z_cell_size = min(l_buf - 1, min(l_src - 1, 2 * eff_z_shift + 2))
 
   need_separate_trilinear = trilinear_channel_start is not None and not (
       order == 'linear' and vertical_order == 'linear'
   )
-  w_lat_lin_size = 0
-  w_z_lin_size = 0
-  win_lat_lin_start = None
-  m_lat_lin_2d_t = None
-  if need_separate_trilinear:
-    w_lat_lin_size = min(n_lat_buf, min(n_lat_ext, 2 * eff_lat_shift + 2))
-    if w_lat_lin_size == n_lat_ext:
-      win_lat_lin_start = jnp.zeros_like(j_global)
-    else:
-      win_lat_lin_start = jnp.clip(
-          j_global + 2 - eff_lat_shift, 0, n_lat_ext - w_lat_lin_size
-      )
-    buf_lat_lin_start = jnp.clip(
-        win_lat_lin_start - buf_lat_origin, 0, n_lat_buf - w_lat_lin_size
-    )
-    m_lat_lin_win = jax.nn.one_hot(
-        jnp.arange(w_lat_lin_size, dtype=jnp.int32)[:, jnp.newaxis]
-        + buf_lat_lin_start[jnp.newaxis, :],
-        n_lat_buf,
-        dtype=dtype,
-    )
-    m_lat_lin_2d_t = m_lat_lin_win.reshape(w_lat_lin_size * ny_loc, n_lat_buf).T
-    w_z_lin_size = min(l_buf, min(l_src, 2 * eff_z_shift + 2))
 
+  # Size channel chunks so hoisted `[ny_loc, l_buf, k_pad, n_lon]` buffers stay
+  # compact in HBM AND per-level `b_len = 1` working sets fit inside TPU v5e's
+  # 128 MiB on-chip VMEM without spilling.
   item_bytes = 8 if dtype == jnp.float64 else 4
-  sub_pad = _round_to_multiple(n_lon, 8)
-  bytes_per_c_f = (
-      l_buf * sub_pad * _round_to_multiple(w_lat_size * ny_loc, 128) * item_bytes
+  n_lon_pad128 = _round_to_multiple(n_lon, 128)
+  nx_pad128 = _round_to_multiple(nx_loc, 128)
+  w_lon_vmem_b = (
+      ny_loc * _round_to_multiple(n_lon, 8) * nx_pad128 * item_bytes
   )
-  if eff_limiter is not None:
-    bytes_per_c_lo = (
-        max(1, l_buf - 1)
-        * sub_pad
-        * _round_to_multiple(w_lat_cell_size * ny_loc, 128)
-        * item_bytes
-    )
-    max_single_per_c = max(bytes_per_c_f, 2 * bytes_per_c_lo)
-    total_ws_per_c = bytes_per_c_f + 2 * bytes_per_c_lo
-  else:
-    max_single_per_c = bytes_per_c_f
-    total_ws_per_c = bytes_per_c_f
-
   if is_tpu:
     max_c_cap = 12
     single_buf_limit = 450 * 1024 * 1024
     ws_buf_limit = 900 * 1024 * 1024
-    max_c_rhs = max(1, 2560 // max(1, w_z_size * w_lat_size))
+    vmem_limit = 112 * 1024 * 1024
   else:
     max_c_cap = 8
     single_buf_limit = 185 * 1024 * 1024
     ws_buf_limit = 440 * 1024 * 1024
-    max_c_rhs = max(1, 1024 // max(1, w_z_size * w_lat_size))
+    vmem_limit = 256 * 1024 * 1024
 
-  if (
-      num_channels <= max_c_cap
-      and num_channels <= max_c_rhs
-      and num_channels * max_single_per_c <= single_buf_limit
-      and num_channels * total_ws_per_c <= ws_buf_limit
+  def _fits_budget(c_test: int, lim_s: int = 0) -> bool:
+    k_c_pad = _round_to_multiple(c_test * w_lat_size, 8)
+    f_lat_b = ny_loc * l_buf * k_c_pad * n_lon_pad128 * item_bytes
+    f_patch_b = ny_loc * w_z_size * k_c_pad * n_lon_pad128 * item_bytes
+    gath_b = ny_loc * w_z_size * k_c_pad * nx_pad128 * item_bytes
+    vmem_b = w_lon_vmem_b + f_patch_b + gath_b
+    max_single_b = f_lat_b
+    ws_b = f_lat_b
+    c_lim_test = max(0, c_test - lim_s) if eff_limiter is not None else 0
+    if c_lim_test > 0:
+      k_l_pad = _round_to_multiple(2 * c_lim_test * w_lat_cell_size, 8)
+      b_lat_b = (
+          ny_loc * max(1, l_buf - 1) * k_l_pad * n_lon_pad128 * item_bytes
+      )
+      b_patch_b = ny_loc * w_z_cell_size * k_l_pad * n_lon_pad128 * item_bytes
+      b_lon_b = ny_loc * w_z_cell_size * k_l_pad * nx_pad128 * item_bytes
+      max_single_b = max(max_single_b, b_lat_b)
+      ws_b = f_lat_b + b_lat_b
+      vmem_b = max(vmem_b, w_lon_vmem_b + b_patch_b + b_lon_b)
+    return (
+        max_single_b <= single_buf_limit
+        and ws_b <= ws_buf_limit
+        and vmem_b <= vmem_limit
+    )
+
+  if num_channels <= max_c_cap and _fits_budget(
+      num_channels, limited_channel_start
   ):
     chunk_size = num_channels
   else:
-    max_c_single = max(1, int(0.8 * single_buf_limit) // max(1, max_single_per_c))
-    max_c_ws = max(1, int(0.75 * ws_buf_limit) // max(1, total_ws_per_c))
-    chunk_size = min(max_c_cap, max_c_single, max_c_ws, max_c_rhs)
+    chunk_size = 1
+    for c_cand in range(min(num_channels, max_c_cap), 0, -1):
+      if _fits_budget(c_cand, 0):
+        chunk_size = c_cand
+        break
 
   # If channel chunking is needed with mixed channel options, split into
   # homogeneous channel groups so each `lax.scan` chunk is uniform.
@@ -1966,6 +1992,22 @@ def _matmul_3d_local(
       return out_full, out_lin_full
     return out_full
 
+  # Pre-transpose query coordinates once outside `lax.scan` so `nx_loc` stays
+  # in `axis=-1` throughout `_scan_level` with zero per-level transposes.
+  lon_q_t = jnp.swapaxes(lon_q, 1, 2)
+  sin_lat_q_t = jnp.swapaxes(sin_lat_q, 1, 2)
+  sigma_q_t = jnp.swapaxes(sigma_q, 1, 2)
+  k_arr = jnp.arange(l_q_loc, dtype=jnp.int32)
+  m_arange = jnp.arange(n_lon, dtype=jnp.int32)[:, jnp.newaxis]
+  w_z_lin_size = min(l_buf, min(l_src, 2 * eff_z_shift + 2))
+  lat_arange = jnp.arange(w_lat_size, dtype=jnp.int32)[:, jnp.newaxis]
+  c0_lon_pos = 0 if order == 'linear' else 1
+  dot_prec_tri = (
+      lax.DotAlgorithmPreset.BF16_BF16_F32_X3
+      if (is_tpu and dtype == jnp.float32)
+      else dot_prec_f32
+  )
+
   def _eval_channel_chunk(
       f_chunk: jax.Array,
       lim_start: int,
@@ -1975,115 +2017,30 @@ def _matmul_3d_local(
     c_lim = max(0, c_cur - lim_start) if eff_limiter is not None else 0
     c_tri = max(0, c_cur - tri_start) if tri_start is not None else 0
 
-    if is_tpu and l_q_loc > 1:
-      k_cub = w_z_size * c_cur * w_lat_size
-      k_tri = (
-          w_z_lin_size * c_tri * w_lat_lin_size
-          if (c_tri > 0 and need_separate_trilinear)
-          else 0
-      )
-      k_lim = w_z_cell_size * 2 * c_lim * w_lat_cell_size if c_lim > 0 else 0
-      k_peak = max(k_cub, k_tri, k_lim)
-      w_lon_b = (
-          ny_loc
-          * _round_to_multiple(nx_loc, 8)
-          * _round_to_multiple(n_lon, 128)
-          * item_bytes
-      )
-      patch_b = (
-          ny_loc
-          * sub_pad
-          * _round_to_multiple(k_peak, 128)
-          * item_bytes
-      )
-      gath_b = (
-          ny_loc
-          * _round_to_multiple(nx_loc, 8)
-          * _round_to_multiple(k_peak, 128)
-          * item_bytes
-      )
-      cub_transp_b = (
-          ny_loc
-          * n_lon
-          * _round_to_multiple(w_z_size, 8)
-          * _round_to_multiple(c_cur * w_lat_size, 128)
-          * item_bytes
-      )
-      cub_red_b = (
-          ny_loc
-          * nx_loc
-          * _round_to_multiple(c_cur, 8)
-          * _round_to_multiple(w_lat_size, 128)
-          * item_bytes
-          if c_cur > 1
-          else 0
-      )
-      lim_transp_b = (
-          ny_loc
-          * n_lon
-          * _round_to_multiple(w_z_cell_size, 8)
-          * _round_to_multiple(2 * c_lim * w_lat_cell_size, 128)
-          * item_bytes
-          if c_lim > 0
-          else 0
-      )
-      lim_red_b = (
-          ny_loc
-          * nx_loc
-          * _round_to_multiple(2 * c_lim, 8)
-          * _round_to_multiple(w_lat_cell_size, 128)
-          * item_bytes
-          if c_lim > 0
-          else 0
-      )
-      tri_transp_b = (
-          ny_loc
-          * n_lon
-          * _round_to_multiple(w_z_lin_size, 8)
-          * _round_to_multiple(c_tri * w_lat_lin_size, 128)
-          * item_bytes
-          if (c_tri > 0 and need_separate_trilinear)
-          else 0
-      )
-      max_single_lvl = max(
-          1, cub_transp_b, cub_red_b, lim_transp_b, lim_red_b, tri_transp_b
-      )
-      per_lvl_ws = max(1, w_lon_b + patch_b + gath_b + max_single_lvl)
-      max_b_single = max(1, (600 * 1024 * 1024) // max_single_lvl)
-      max_b_ws = max(1, (900 * 1024 * 1024) // per_lvl_ws)
-      max_b = min(8, max_b_single, max_b_ws)
-      if l_q_loc >= 16:
-        n_lvl_chunks = max(4, math.ceil(l_q_loc / max_b))
-      else:
-        n_lvl_chunks = math.ceil(l_q_loc / max_b)
-      b_len = math.ceil(l_q_loc / n_lvl_chunks)
-    else:
-      n_lvl_chunks = l_q_loc
-      b_len = 1
-
-    l_q_pad = n_lvl_chunks * b_len
-    k_arr = jnp.minimum(
-        jnp.arange(l_q_pad, dtype=jnp.int32), max(0, l_q_loc - 1)
+    k_raw = c_cur * w_lat_size
+    k_pad = _round_to_multiple(k_raw, 8)
+    f_2d_t = (
+        f_chunk.swapaxes(0, 1)
+        .reshape(l_buf * c_cur, n_lon, n_lat_buf)
+        .transpose(2, 0, 1)
+        .reshape(n_lat_buf, l_buf * c_cur * n_lon)
     )
-    if l_q_pad > l_q_loc:
-      pad_n = l_q_pad - l_q_loc
-      q_pad = [(0, pad_n), (0, 0), (0, 0)]
-      lon_pad_q = jnp.pad(lon_q, q_pad)
-      sin_lat_pad_q = jnp.pad(sin_lat_q, q_pad)
-      sigma_pad_q = jnp.pad(
-          sigma_q, q_pad, constant_values=sigma_nodes[0]
-      )
-    else:
-      lon_pad_q, sin_lat_pad_q, sigma_pad_q = lon_q, sin_lat_q, sigma_q
+    f_lat = (
+        jnp.dot(m_lat_2d, f_2d_t, precision=dot_prec_lhs_bf16)
+        .reshape(ny_loc, w_lat_size, l_buf * c_cur, n_lon)
+        .transpose(0, 2, 1, 3)
+        .reshape(ny_loc, l_buf, k_raw, n_lon)
+    )
+    if k_pad > k_raw:
+      f_lat = jnp.pad(f_lat, [(0, 0), (0, 0), (0, k_pad - k_raw), (0, 0)])
 
-    f_2d = f_chunk.transpose(1, 2, 0, 3).reshape(l_buf * n_lon * c_cur, n_lat_buf)
-    f_lat_by_l = jnp.dot(
-        f_2d, m_lat_2d_t, precision=dot_prec_rhs_bf16
-    ).reshape(l_buf, n_lon * c_cur * w_lat_size * ny_loc)
-
-    b_lat_by_l = None
+    b_lat = None
+    k_lim_raw = 0
+    k_lim_pad = 0
     if c_lim > 0:
-      assert m_lat_cell_2d_t is not None
+      assert m_lat_cell_2d is not None
+      k_lim_raw = 2 * c_lim * w_lat_cell_size
+      k_lim_pad = _round_to_multiple(k_lim_raw, 8)
       f_lim = f_chunk[lim_start:]
       f_for_bounds = (
           f_lim + ref_buf[jnp.newaxis, :, jnp.newaxis, jnp.newaxis]
@@ -2091,346 +2048,447 @@ def _matmul_3d_local(
           else f_lim
       )
       lo_buf, hi_buf = _cell_bounds_3d(f_for_bounds)
-      b_2d = (
+      if is_tpu and dtype == jnp.float32:
+        # Widen cell bounds by 16-bit split ulp (`2^-16`) so 3-pass `bf16_3x`
+        # MXU selection preserves constants and non-negativity (`0.0`) exactly.
+        lo_buf = lo_buf - 1.6e-5 * jnp.abs(lo_buf)
+        hi_buf = hi_buf + 1.6e-5 * jnp.abs(hi_buf)
+      b_2d_t = (
           jnp.concatenate([lo_buf, hi_buf], axis=0)
-          .transpose(1, 2, 0, 3)
-          .reshape((l_buf - 1) * n_lon * 2 * c_lim, n_lat_buf - 1)
+          .swapaxes(0, 1)
+          .reshape((l_buf - 1) * 2 * c_lim, n_lon, n_lat_buf - 1)
+          .transpose(2, 0, 1)
+          .reshape(n_lat_buf - 1, (l_buf - 1) * 2 * c_lim * n_lon)
       )
-      b_lat_by_l = jnp.dot(
-          b_2d, m_lat_cell_2d_t, precision=dot_prec_rhs_bf16
-      ).reshape(l_buf - 1, n_lon * 2 * c_lim * w_lat_cell_size * ny_loc)
-
-    f_tri_lat_by_l = None
-    if c_tri > 0 and need_separate_trilinear:
-      assert m_lat_lin_2d_t is not None
-      f_tri_2d = (
-          f_chunk[tri_start:]
-          .transpose(1, 2, 0, 3)
-          .reshape(l_buf * n_lon * c_tri, n_lat_buf)
+      b_lat = (
+          jnp.dot(m_lat_cell_2d, b_2d_t, precision=dot_prec_tri)
+          .reshape(ny_loc, w_lat_cell_size, (l_buf - 1) * 2 * c_lim, n_lon)
+          .transpose(0, 2, 1, 3)
+          .reshape(ny_loc, l_buf - 1, k_lim_raw, n_lon)
       )
-      f_tri_lat_by_l = jnp.dot(
-          f_tri_2d, m_lat_lin_2d_t, precision=dot_prec_rhs_bf16
-      ).reshape(l_buf, n_lon * c_tri * w_lat_lin_size * ny_loc)
-
-    c0_lon_pos = 0 if order == 'linear' else 1
-
-    def _eval_level_chunk(inputs):
-      k_b, lon_b, sin_lat_b, sigma_b = inputs
-      if c_tri > 0 and need_separate_trilinear:
-        (
-            lon_idx,
-            lon_w,
-            lat_idx,
-            lat_w,
-            _,
-            lat_c0,
-            _,
-            (alpha_lon, alpha_lat),
-        ) = _horizontal_stencil_tuple(
-            grid, lon_b, sin_lat_b, order, include_linear_fractions=True
+      if k_lim_pad > k_lim_raw:
+        b_lat = jnp.pad(
+            b_lat, [(0, 0), (0, 0), (0, k_lim_pad - k_lim_raw), (0, 0)]
         )
-        lvl_idx, lvl_w, _, lvl_c0, alpha_z = _vertical_stencil_tuple(
-            sigma_b, sigma_nodes, vertical_order, include_linear_fractions=True
-        )
-      else:
-        (
-            lon_idx,
-            lon_w,
-            lat_idx,
-            lat_w,
-            _,
-            lat_c0,
-            _,
-        ) = _horizontal_stencil_tuple(grid, lon_b, sin_lat_b, order)
-        lvl_idx, lvl_w, _, lvl_c0 = _vertical_stencil_tuple(
-            sigma_b, sigma_nodes, vertical_order
-        )
-        alpha_lon = alpha_lat = alpha_z = None
 
-      k_glob = jnp.minimum(k_offset + k_b, l_src - 1)
-      if w_z_size == l_src:
-        win_z_start = jnp.zeros_like(k_glob)
-      else:
-        win_z_start = jnp.clip(k_glob + z_start_offset, 0, l_src - w_z_size)
-      buf_z_start = jnp.clip(win_z_start - buf_z_origin, 0, l_buf - w_z_size)
-
-      oh_lon = tuple(
-          jax.nn.one_hot(jnp.swapaxes(idx, 1, 2), n_lon, dtype=dtype)
-          for idx in lon_idx
-      )
-      w_lon_mat = sum(
-          jnp.swapaxes(w, 1, 2)[..., jnp.newaxis] * oh
-          for w, oh in zip(lon_w, oh_lon)
-      )
-      w_z_mat = sum(
-          jnp.swapaxes(w, 1, 2)[..., jnp.newaxis]
-          * jax.nn.one_hot(
-              jnp.swapaxes(idx, 1, 2)
-              - win_z_start[:, jnp.newaxis, jnp.newaxis],
-              w_z_size,
-              dtype=dtype,
+    def _eval_levels_grouped(b_len: int):
+      w_z_blk_size = min(l_buf, min(l_src, w_z_size + b_len - 1))
+      w_z_lin_blk_size = min(l_buf, min(l_src, w_z_lin_size + b_len - 1))
+      w_z_cell_blk_size = (
+          min(
+              max(1, l_buf - 1),
+              min(max(1, l_src - 1), w_z_cell_size + b_len - 1),
           )
-          for idx, w in zip(lvl_idx, lvl_w)
+          if c_lim > 0
+          else 0
       )
-      w_lat_mat = sum(
-          jnp.swapaxes(w, 1, 2)[..., jnp.newaxis]
-          * jax.nn.one_hot(
-              jnp.swapaxes(idx, 1, 2)
-              - win_lat_start[jnp.newaxis, :, jnp.newaxis],
-              w_lat_size,
-              dtype=dtype,
-          )
-          for idx, w in zip(lat_idx, lat_w)
+      nx_blk = b_len * nx_loc
+      nx_blk_pad128 = _round_to_multiple(nx_blk, 128)
+      f_patch_blk_b = ny_loc * w_z_blk_size * k_pad * n_lon_pad128 * item_bytes
+      w_lon_blk_b = (
+          ny_loc * _round_to_multiple(n_lon, 8) * nx_blk_pad128 * item_bytes
+      )
+      gath_blk_b = ny_loc * w_z_blk_size * k_pad * nx_blk_pad128 * item_bytes
+      fuse_gath_blk = (
+          b_len == 1 or (f_patch_blk_b + w_lon_blk_b + gath_blk_b) <= vmem_limit
       )
 
-      m_z_win = jax.nn.one_hot(
-          buf_z_start[:, jnp.newaxis]
-          + jnp.arange(w_z_size, dtype=jnp.int32)[jnp.newaxis, :],
-          l_buf,
-          dtype=dtype,
-      ).reshape(b_len * w_z_size, l_buf)
-      f_win = jnp.dot(
-          m_z_win, f_lat_by_l, precision=dot_prec_lhs_bf16
-      ).reshape(b_len, w_z_size, n_lon, c_cur * w_lat_size, ny_loc)
-      f_patch_flat = f_win.transpose(0, 4, 2, 1, 3).reshape(
-          b_len * ny_loc, n_lon, w_z_size * c_cur * w_lat_size
+      z_blk_arange = jnp.arange(w_z_blk_size, dtype=jnp.int32)[:, jnp.newaxis]
+      z_lin_blk_arange = jnp.arange(w_z_lin_blk_size, dtype=jnp.int32)[
+          :, jnp.newaxis
+      ]
+      z_cell_blk_arange = (
+          jnp.arange(w_z_cell_blk_size, dtype=jnp.int32)[:, jnp.newaxis]
+          if c_lim > 0
+          else None
       )
-      gathered_lon = jnp.einsum(
-          'bim,bmk->bik',
-          w_lon_mat.reshape(b_len * ny_loc, nx_loc, n_lon),
-          f_patch_flat,
-          precision=dot_prec_f32,
+      lat_cell_arange = (
+          jnp.arange(w_lat_cell_size, dtype=jnp.int32)[:, jnp.newaxis]
+          if c_lim > 0
+          else None
       )
-      after_z = (
-          gathered_lon.reshape(
-              b_len, ny_loc, nx_loc, w_z_size, c_cur * w_lat_size
-          )
-          * w_z_mat[..., jnp.newaxis]
-      ).sum(axis=-2)
-      if c_cur == 1:
-        val = (
-            (after_z * w_lat_mat)
-            .sum(axis=-1)
-            .swapaxes(1, 2)[:, jnp.newaxis, :, :]
-        )
-      else:
-        val = (
-            (
-                after_z.reshape(b_len, ny_loc, nx_loc, c_cur, w_lat_size)
-                * w_lat_mat[:, :, :, jnp.newaxis, :]
-            )
-            .sum(axis=-1)
-            .transpose(0, 3, 2, 1)
-        )
 
-      val_lin = None
-      if c_tri > 0:
-        if not need_separate_trilinear:
-          val_lin = val[:, tri_start:]
+      def _scan_block(inputs):
+        k_b, lon_b, sin_lat_b, sigma_b = inputs
+        if b_len == 1:
+          k0_s = k_b
+          lon_s = lon_b
+          sin_lat_s = sin_lat_b
+          sigma_s = sigma_b
         else:
-          assert f_tri_lat_by_l is not None and win_lat_lin_start is not None
-          assert alpha_lon is not None and alpha_lat is not None and alpha_z is not None
-          if w_z_lin_size == l_src:
-            win_z_lin_start = jnp.zeros_like(k_glob)
-          else:
-            win_z_lin_start = jnp.clip(
-                k_glob - eff_z_shift, 0, l_src - w_z_lin_size
-            )
-          buf_z_lin_start = jnp.clip(
-              win_z_lin_start - buf_z_origin, 0, l_buf - w_z_lin_size
+          k0_s = k_b[0]
+          lon_s = jnp.swapaxes(lon_b, 0, 1).reshape(ny_loc, nx_blk)
+          sin_lat_s = jnp.swapaxes(sin_lat_b, 0, 1).reshape(ny_loc, nx_blk)
+          sigma_s = jnp.swapaxes(sigma_b, 0, 1).reshape(ny_loc, nx_blk)
+
+        if c_tri > 0 and need_separate_trilinear:
+          (
+              lon_idx,
+              lon_w,
+              lat_idx,
+              lat_w,
+              _,
+              lat_c0,
+              _,
+              (alpha_lon, alpha_lat),
+          ) = _horizontal_stencil_tuple(
+              grid, lon_s, sin_lat_s, order, include_linear_fractions=True
+          )
+          lvl_idx, lvl_w, _, lvl_c0, alpha_z = _vertical_stencil_tuple(
+              sigma_s,
+              sigma_nodes,
+              vertical_order,
+              include_linear_fractions=True,
+          )
+        else:
+          (
+              lon_idx,
+              lon_w,
+              lat_idx,
+              lat_w,
+              _,
+              lat_c0,
+              _,
+          ) = _horizontal_stencil_tuple(grid, lon_s, sin_lat_s, order)
+          lvl_idx, lvl_w, _, lvl_c0 = _vertical_stencil_tuple(
+              sigma_s, sigma_nodes, vertical_order
+          )
+          alpha_lon = alpha_lat = alpha_z = None
+
+        k_glob = jnp.minimum(k_offset + k0_s, l_src - 1)
+        if w_z_blk_size == l_src:
+          win_z_start = jnp.int32(0)
+        else:
+          win_z_start = jnp.clip(
+              k_glob + z_start_offset, 0, l_src - w_z_blk_size
+          )
+        buf_z_start = jnp.clip(
+            win_z_start - buf_z_origin, 0, l_buf - w_z_blk_size
+        )
+
+        oh_lon = tuple(
+            (idx[:, jnp.newaxis, :] == m_arange).astype(dtype)
+            for idx in lon_idx
+        )
+        w_lon_mat = sum(
+            w[:, jnp.newaxis, :] * oh for w, oh in zip(lon_w, oh_lon)
+        )
+        w_z_mat = sum(
+            w[:, jnp.newaxis, :]
+            * (
+                (idx - win_z_start)[:, jnp.newaxis, :] == z_blk_arange
+            ).astype(dtype)
+            for idx, w in zip(lvl_idx, lvl_w)
+        )
+        w_lat_mat = sum(
+            w[:, jnp.newaxis, :]
+            * (
+                (idx - win_lat_start[:, jnp.newaxis])[:, jnp.newaxis, :]
+                == lat_arange
+            ).astype(dtype)
+            for idx, w in zip(lat_idx, lat_w)
+        )
+
+        # Slice the block vertical window once from `f_lat` across all `b_len`
+        # query levels so overlapping vertical levels are reused in VMEM.
+        f_win = lax.dynamic_slice_in_dim(
+            f_lat, buf_z_start, w_z_blk_size, axis=1
+        )
+
+        val_lin_jci = None
+        if c_tri > 0 and need_separate_trilinear:
+          assert (
+              alpha_lon is not None
+              and alpha_lat is not None
+              and alpha_z is not None
           )
           if order == 'linear':
             w_lon_lin_mat = w_lon_mat
             w_lat_lin_mat = w_lat_mat
           else:
-            a_lon_t = jnp.swapaxes(alpha_lon, 1, 2)[..., jnp.newaxis]
-            w_lon_lin_mat = (
-                (1.0 - a_lon_t) * oh_lon[c0_lon_pos]
-                + a_lon_t * oh_lon[c0_lon_pos + 1]
-            )
-            a_lat_t = jnp.swapaxes(alpha_lat, 1, 2)[..., jnp.newaxis]
-            lat_rel = (
-                jnp.swapaxes(lat_c0, 1, 2)
-                - win_lat_lin_start[jnp.newaxis, :, jnp.newaxis]
-            )
-            w_lat_lin_mat = (1.0 - a_lat_t) * jax.nn.one_hot(
-                lat_rel, w_lat_lin_size, dtype=dtype
-            ) + a_lat_t * jax.nn.one_hot(
-                lat_rel + 1, w_lat_lin_size, dtype=dtype
-            )
+            a_lon = alpha_lon[:, jnp.newaxis, :]
+            w_lon_lin_mat = (1.0 - a_lon) * oh_lon[c0_lon_pos] + a_lon * oh_lon[
+                c0_lon_pos + 1
+            ]
+            a_lat = alpha_lat[:, jnp.newaxis, :]
+            lat_rel = (lat_c0 - win_lat_start[:, jnp.newaxis])[
+                :, jnp.newaxis, :
+            ]
+            w_lat_lin_mat = (1.0 - a_lat) * (lat_rel == lat_arange).astype(
+                dtype
+            ) + a_lat * (lat_rel + 1 == lat_arange).astype(dtype)
           if vertical_order == 'linear':
+            buf_z_lin_start = buf_z_start
             w_z_lin_mat = w_z_mat
           else:
-            a_z_t = jnp.swapaxes(alpha_z, 1, 2)[..., jnp.newaxis]
-            z_rel = (
-                jnp.swapaxes(lvl_c0, 1, 2)
-                - win_z_lin_start[:, jnp.newaxis, jnp.newaxis]
+            win_z_lin_start = (
+                jnp.int32(0)
+                if w_z_lin_blk_size == l_src
+                else jnp.clip(
+                    k_glob - eff_z_shift, 0, l_src - w_z_lin_blk_size
+                )
             )
-            w_z_lin_mat = (1.0 - a_z_t) * jax.nn.one_hot(
-                z_rel, w_z_lin_size, dtype=dtype
-            ) + a_z_t * jax.nn.one_hot(
-                z_rel + 1, w_z_lin_size, dtype=dtype
+            buf_z_lin_start = jnp.clip(
+                win_z_lin_start - buf_z_origin, 0, l_buf - w_z_lin_blk_size
+            )
+            a_z = alpha_z[:, jnp.newaxis, :]
+            z_rel = (lvl_c0 - win_z_lin_start)[:, jnp.newaxis, :]
+            w_z_lin_mat = (1.0 - a_z) * (
+                z_rel == z_lin_blk_arange
+            ).astype(dtype) + a_z * (z_rel + 1 == z_lin_blk_arange).astype(
+                dtype
             )
 
-          m_z_lin_win = jax.nn.one_hot(
-              buf_z_lin_start[:, jnp.newaxis]
-              + jnp.arange(w_z_lin_size, dtype=jnp.int32)[jnp.newaxis, :],
-              l_buf,
-              dtype=dtype,
-          ).reshape(b_len * w_z_lin_size, l_buf)
-          f_tri_win = jnp.dot(
-              m_z_lin_win, f_tri_lat_by_l, precision=dot_prec_lhs_bf16
-          ).reshape(b_len, w_z_lin_size, n_lon, c_tri * w_lat_lin_size, ny_loc)
-          f_tri_patch = f_tri_win.transpose(0, 4, 2, 1, 3).reshape(
-              b_len * ny_loc, n_lon, w_z_lin_size * c_tri * w_lat_lin_size
+          k_tri_raw = c_tri * w_lat_size
+          k_tri_pad = _round_to_multiple(k_tri_raw, 8)
+          f_tri_win = lax.dynamic_slice(
+              f_lat,
+              (
+                  jnp.int32(0),
+                  buf_z_lin_start,
+                  jnp.int32(tri_start * w_lat_size),
+                  jnp.int32(0),
+              ),
+              (ny_loc, w_z_lin_blk_size, k_tri_raw, n_lon),
+          )
+          if k_tri_pad > k_tri_raw:
+            f_tri_win = jnp.pad(
+                f_tri_win,
+                [(0, 0), (0, 0), (0, k_tri_pad - k_tri_raw), (0, 0)],
+            )
+          f_tri_patch = f_tri_win.reshape(
+              ny_loc, w_z_lin_blk_size * k_tri_pad, n_lon
           )
           tri_lon = jnp.einsum(
-              'bim,bmk->bik',
-              w_lon_lin_mat.reshape(b_len * ny_loc, nx_loc, n_lon),
-              f_tri_patch,
-              precision=dot_prec_f32,
+              'jkm,jmi->jki', f_tri_patch, w_lon_lin_mat, precision=dot_prec_tri
           )
           tri_after_z = (
-              tri_lon.reshape(
-                  b_len, ny_loc, nx_loc, w_z_lin_size, c_tri * w_lat_lin_size
+              tri_lon.reshape(ny_loc, w_z_lin_blk_size, k_tri_pad, nx_blk)
+              * w_z_lin_mat[:, :, jnp.newaxis, :]
+          ).sum(axis=1)
+          val_lin_jci = (
+              tri_after_z[:, :k_tri_raw, :].reshape(
+                  ny_loc, c_tri, w_lat_size, nx_blk
               )
-              * w_z_lin_mat[..., jnp.newaxis]
-          ).sum(axis=-2)
-          if c_tri == 1:
-            val_lin = (
-                (tri_after_z * w_lat_lin_mat)
-                .sum(axis=-1)
-                .swapaxes(1, 2)[:, jnp.newaxis, :, :]
+              * w_lat_lin_mat[:, jnp.newaxis, :, :]
+          ).sum(axis=2)
+
+        f_patch = f_win.reshape(ny_loc, w_z_blk_size * k_pad, n_lon)
+        if fuse_gath_blk:
+          gathered_lon = jnp.einsum(
+              'jkm,jmi->jki', f_patch, w_lon_mat, precision=dot_prec_f32
+          )
+          after_z = (
+              gathered_lon.reshape(ny_loc, w_z_blk_size, k_pad, nx_blk)
+              * w_z_mat[:, :, jnp.newaxis, :]
+          ).sum(axis=1)
+          val_jci = (
+              after_z[:, :k_raw, :].reshape(ny_loc, c_cur, w_lat_size, nx_blk)
+              * w_lat_mat[:, jnp.newaxis, :, :]
+          ).sum(axis=2)
+        else:
+          val_parts = []
+          f_patch_cur = f_patch
+          for b_idx in range(b_len):
+            s0 = b_idx * nx_loc
+            s1 = s0 + nx_loc
+            g_b = jnp.einsum(
+                'jkm,jmi->jki',
+                f_patch_cur,
+                w_lon_mat[:, :, s0:s1],
+                precision=dot_prec_f32,
             )
+            az_b = (
+                g_b.reshape(ny_loc, w_z_blk_size, k_pad, nx_loc)
+                * w_z_mat[:, :, jnp.newaxis, s0:s1]
+            ).sum(axis=1)
+            v_b = (
+                az_b[:, :k_raw, :].reshape(ny_loc, c_cur, w_lat_size, nx_loc)
+                * w_lat_mat[:, jnp.newaxis, :, s0:s1]
+            ).sum(axis=2)
+            if b_idx + 1 < b_len:
+              v_b, f_patch_cur = lax.optimization_barrier((v_b, f_patch_cur))
+            val_parts.append(v_b)
+          val_jci = jnp.concatenate(val_parts, axis=2)
+
+        if c_tri > 0 and not need_separate_trilinear:
+          val_lin_jci = val_jci[:, tri_start:, :]
+
+        if c_lim > 0:
+          assert (
+              b_lat is not None
+              and win_lat_cell_start is not None
+              and z_cell_blk_arange is not None
+              and lat_cell_arange is not None
+          )
+          if w_z_cell_blk_size == l_src - 1:
+            win_z_cell_start = jnp.int32(0)
           else:
-            val_lin = (
-                (
-                    tri_after_z.reshape(
-                        b_len, ny_loc, nx_loc, c_tri, w_lat_lin_size
-                    )
-                    * w_lat_lin_mat[:, :, :, jnp.newaxis, :]
-                )
-                .sum(axis=-1)
-                .transpose(0, 3, 2, 1)
+            win_z_cell_start = jnp.clip(
+                k_glob - eff_z_shift, 0, (l_src - 1) - w_z_cell_blk_size
             )
-
-      if c_lim > 0:
-        assert b_lat_by_l is not None and win_lat_cell_start is not None
-        if w_z_cell_size == l_src - 1:
-          win_z_cell_start = jnp.zeros_like(k_glob)
-        else:
-          win_z_cell_start = jnp.clip(
-              k_glob - eff_z_shift, 0, (l_src - 1) - w_z_cell_size
+          buf_z_cell_start = jnp.clip(
+              win_z_cell_start - buf_z_origin,
+              0,
+              (l_buf - 1) - w_z_cell_blk_size,
           )
-        buf_z_cell_start = jnp.clip(
-            win_z_cell_start - buf_z_origin, 0, (l_buf - 1) - w_z_cell_size
-        )
-        p_lon_mat = oh_lon[c0_lon_pos]
-        p_z_mat = jax.nn.one_hot(
-            jnp.swapaxes(lvl_c0, 1, 2)
-            - win_z_cell_start[:, jnp.newaxis, jnp.newaxis],
-            w_z_cell_size,
-            dtype=dtype,
-        )
-        p_lat_mat = jax.nn.one_hot(
-            jnp.swapaxes(lat_c0, 1, 2)
-            - win_lat_cell_start[jnp.newaxis, :, jnp.newaxis],
-            w_lat_cell_size,
-            dtype=dtype,
-        )
-        m_z_cell_win = jax.nn.one_hot(
-            buf_z_cell_start[:, jnp.newaxis]
-            + jnp.arange(w_z_cell_size, dtype=jnp.int32)[jnp.newaxis, :],
-            l_buf - 1,
-            dtype=dtype,
-        ).reshape(b_len * w_z_cell_size, l_buf - 1)
-        b_win = jnp.dot(
-            m_z_cell_win, b_lat_by_l, precision=dot_prec_lhs_bf16
-        ).reshape(
-            b_len, w_z_cell_size, n_lon, 2 * c_lim * w_lat_cell_size, ny_loc
-        )
-        b_patch_flat = b_win.transpose(0, 4, 2, 1, 3).reshape(
-            b_len * ny_loc, n_lon, w_z_cell_size * 2 * c_lim * w_lat_cell_size
-        )
-        b_lon = jnp.einsum(
-            'bim,bmk->bik',
-            p_lon_mat.reshape(b_len * ny_loc, nx_loc, n_lon),
-            b_patch_flat,
-            precision=dot_prec_lhs_bf16,
-        )
-        b_after_z = (
-            b_lon.reshape(
-                b_len,
-                ny_loc,
-                nx_loc,
-                w_z_cell_size,
-                2 * c_lim * w_lat_cell_size,
+          p_lon_mat = oh_lon[c0_lon_pos]
+          p_z_mat = (
+              (lvl_c0 - win_z_cell_start)[:, jnp.newaxis, :]
+              == z_cell_blk_arange
+          ).astype(dtype)
+          p_lat_mat = (
+              (lat_c0 - win_lat_cell_start[:, jnp.newaxis])[:, jnp.newaxis, :]
+              == lat_cell_arange
+          ).astype(dtype)
+          b_win = lax.dynamic_slice_in_dim(
+              b_lat, buf_z_cell_start, w_z_cell_blk_size, axis=1
+          )
+          b_patch = b_win.reshape(ny_loc, w_z_cell_blk_size * k_lim_pad, n_lon)
+          b_lon = jnp.einsum(
+              'jkm,jmi->jki', b_patch, p_lon_mat, precision=dot_prec_tri
+          )
+          b_after_z = (
+              b_lon.reshape(ny_loc, w_z_cell_blk_size, k_lim_pad, nx_blk)
+              * p_z_mat[:, :, jnp.newaxis, :]
+          ).sum(axis=1)
+          b_jci = (
+              b_after_z[:, :k_lim_raw, :].reshape(
+                  ny_loc, 2 * c_lim, w_lat_cell_size, nx_blk
+              )
+              * p_lat_mat[:, jnp.newaxis, :, :]
+          ).sum(axis=2)
+          lo_jci, hi_jci = b_jci[:, :c_lim, :], b_jci[:, c_lim:, :]
+          val_lim = val_jci[:, lim_start:, :]
+          if ref_buf is not None:
+            ref_win = lax.dynamic_slice_in_dim(
+                ref_buf, buf_z_start, w_z_blk_size, axis=0
             )
-            * p_z_mat[..., jnp.newaxis]
-        ).sum(axis=-2)
-        b_val = (
-            (
-                b_after_z.reshape(
-                    b_len, ny_loc, nx_loc, 2 * c_lim, w_lat_cell_size
-                )
-                * p_lat_mat[:, :, :, jnp.newaxis, :]
-            )
-            .sum(axis=-1)
-            .transpose(0, 3, 2, 1)
-        )
-        lo_b, hi_b = b_val[:, :c_lim], b_val[:, c_lim:]
-        val_lim = val[:, lim_start:]
-        if ref_centered is not None:
-          ref_b = sum(
-              w * _take_1d(ref_centered, idx)
-              for idx, w in zip(lvl_idx, lvl_w)
+            ref_ji = (w_z_mat * ref_win[jnp.newaxis, :, jnp.newaxis]).sum(
+                axis=1
+            )[:, jnp.newaxis, :]
+            val_lim = jnp.clip(val_lim + ref_ji, lo_jci, hi_jci) - ref_ji
+          else:
+            val_lim = jnp.clip(val_lim, lo_jci, hi_jci)
+          val_jci = (
+              val_lim
+              if lim_start == 0
+              else jnp.concatenate([val_jci[:, :lim_start, :], val_lim], axis=1)
           )
-          val_lim = (
-              jnp.clip(val_lim + ref_b[:, jnp.newaxis, :, :], lo_b, hi_b)
-              - ref_b[:, jnp.newaxis, :, :]
-          )
-        else:
-          val_lim = jnp.clip(val_lim, lo_b, hi_b)
-        val = (
-            val_lim
-            if lim_start == 0
-            else jnp.concatenate([val[:, :lim_start], val_lim], axis=1)
+
+        if b_len == 1:
+          if c_tri > 0:
+            return jnp.swapaxes(val_jci, 0, 1), jnp.swapaxes(val_lin_jci, 0, 1)
+          return jnp.swapaxes(val_jci, 0, 1)
+
+        out_blk = val_jci.reshape(ny_loc, c_cur, b_len, nx_loc).transpose(
+            2, 1, 0, 3
         )
+        if c_tri > 0:
+          out_lin_blk = val_lin_jci.reshape(
+              ny_loc, c_tri, b_len, nx_loc
+          ).transpose(2, 1, 0, 3)
+          return out_blk, out_lin_blk
+        return out_blk
 
-      if c_tri > 0:
-        return val, val_lin
-      return val
+      return _scan_block
 
-    if n_lvl_chunks == 1:
-      chunk_res = _eval_level_chunk(
-          (k_arr, lon_pad_q, sin_lat_pad_q, sigma_pad_q)
+    if l_q_loc == 1:
+      _scan_1 = _eval_levels_grouped(1)
+      res_0 = _scan_1(
+          (jnp.int32(0), lon_q_t[0], sin_lat_q_t[0], sigma_q_t[0])
       )
       if c_tri > 0:
-        out_l, out_lin_l = chunk_res
+        out_0, out_lin_0 = res_0
         return (
-            out_l[:l_q_loc].transpose(1, 0, 2, 3),
-            out_lin_l[:l_q_loc].transpose(1, 0, 2, 3),
+            jnp.swapaxes(out_0, 1, 2)[:, jnp.newaxis, :, :],
+            jnp.swapaxes(out_lin_0, 1, 2)[:, jnp.newaxis, :, :],
         )
-      return chunk_res[:l_q_loc].transpose(1, 0, 2, 3)
+      out_single = jnp.swapaxes(res_0, 1, 2)[:, jnp.newaxis, :, :]
+      if tri_start is not None:
+        return out_single, jnp.zeros((0, 1, nx_loc, ny_loc), dtype=dtype)
+      return out_single
 
-    grouped_inputs = (
-        k_arr.reshape(n_lvl_chunks, b_len),
-        lon_pad_q.reshape(n_lvl_chunks, b_len, nx_loc, ny_loc),
-        sin_lat_pad_q.reshape(n_lvl_chunks, b_len, nx_loc, ny_loc),
-        sigma_pad_q.reshape(n_lvl_chunks, b_len, nx_loc, ny_loc),
-    )
-    _, chunk_res = lax.scan(
-        lambda _, inp: (None, _eval_level_chunk(inp)), None, grouped_inputs
-    )
-    if c_tri > 0:
-      out_chunks, out_lin_chunks = chunk_res
-      out_l = out_chunks.reshape(l_q_pad, c_cur, nx_loc, ny_loc)[:l_q_loc]
-      out_lin_l = out_lin_chunks.reshape(l_q_pad, c_tri, nx_loc, ny_loc)[
-          :l_q_loc
-      ]
-      return out_l.transpose(1, 0, 2, 3), out_lin_l.transpose(1, 0, 2, 3)
-    out_l = chunk_res.reshape(l_q_pad, c_cur, nx_loc, ny_loc)[:l_q_loc]
-    return out_l.transpose(1, 0, 2, 3)
+    b_len = 1
+    if is_tpu:
+      for b_cand in (4, 2):
+        if l_q_loc < b_cand:
+          continue
+        w_z_c = min(l_buf, min(l_src, w_z_size + b_cand - 1))
+        f_blk_vmem = ny_loc * w_z_c * k_pad * n_lon_pad128 * item_bytes
+        g_1_vmem = ny_loc * w_z_c * k_pad * nx_pad128 * item_bytes
+        nx_c_pad128 = _round_to_multiple(b_cand * nx_loc, 128)
+        w_lon_c_vmem = (
+            ny_loc * _round_to_multiple(n_lon, 8) * nx_c_pad128 * item_bytes
+        )
+        b_vmem = 0
+        if c_lim > 0:
+          w_zc_c = min(
+              max(1, l_buf - 1),
+              min(max(1, l_src - 1), w_z_cell_size + b_cand - 1),
+          )
+          b_blk_vmem = ny_loc * w_zc_c * k_lim_pad * n_lon_pad128 * item_bytes
+          b_lon_vmem = ny_loc * w_zc_c * k_lim_pad * nx_c_pad128 * item_bytes
+          b_vmem = b_blk_vmem + w_lon_c_vmem + b_lon_vmem
+        if (
+            max(f_blk_vmem + w_lon_vmem_b + g_1_vmem, b_vmem)
+            <= 116 * 1024 * 1024
+        ):
+          b_len = b_cand
+          break
+
+    _scan_fn = _eval_levels_grouped(b_len)
+    if b_len == 1:
+      _, scan_res = lax.scan(
+          lambda _, inp: (None, _scan_fn(inp)),
+          None,
+          (k_arr, lon_q_t, sin_lat_q_t, sigma_q_t),
+      )
+      if c_tri > 0:
+        out_l, out_lin_l = scan_res
+        return out_l.transpose(1, 0, 3, 2), out_lin_l.transpose(1, 0, 3, 2)
+      out_all = scan_res.transpose(1, 0, 3, 2)
+    else:
+      n_blocks = (l_q_loc + b_len - 1) // b_len
+      pad_l = n_blocks * b_len - l_q_loc
+      if pad_l > 0:
+        k_in = jnp.pad(k_arr, (0, pad_l), mode='edge').reshape(n_blocks, b_len)
+        lon_in = jnp.pad(
+            lon_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
+        ).reshape(n_blocks, b_len, ny_loc, nx_loc)
+        sin_lat_in = jnp.pad(
+            sin_lat_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
+        ).reshape(n_blocks, b_len, ny_loc, nx_loc)
+        sigma_in = jnp.pad(
+            sigma_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
+        ).reshape(n_blocks, b_len, ny_loc, nx_loc)
+      else:
+        k_in = k_arr.reshape(n_blocks, b_len)
+        lon_in = lon_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
+        sin_lat_in = sin_lat_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
+        sigma_in = sigma_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
+      _, scan_res = lax.scan(
+          lambda _, inp: (None, _scan_fn(inp)),
+          None,
+          (k_in, lon_in, sin_lat_in, sigma_in),
+      )
+      if c_tri > 0:
+        out_blk, out_lin_blk = scan_res
+        out_l = out_blk.reshape(
+            n_blocks * b_len, c_cur, ny_loc, nx_loc
+        )[:l_q_loc]
+        out_lin_l = out_lin_blk.reshape(
+            n_blocks * b_len, c_tri, ny_loc, nx_loc
+        )[:l_q_loc]
+        return out_l.transpose(1, 0, 3, 2), out_lin_l.transpose(1, 0, 3, 2)
+      out_all = (
+          scan_res.reshape(n_blocks * b_len, c_cur, ny_loc, nx_loc)[:l_q_loc]
+          .transpose(1, 0, 3, 2)
+      )
+
+    if tri_start is not None:
+      return out_all, jnp.zeros((0, l_q_loc, nx_loc, ny_loc), dtype=dtype)
+    return out_all
 
   if num_channels <= chunk_size:
     return _eval_channel_chunk(
@@ -2940,230 +2998,212 @@ def _matmul_3d_wind_and_sigma_dot_local(
       win_lat_start - buf_lat_origin, 0, n_lat_buf - w_lat_size
   )
   m_lat_win = jax.nn.one_hot(
-      jnp.arange(w_lat_size, dtype=jnp.int32)[:, jnp.newaxis]
-      + buf_lat_start[jnp.newaxis, :],
+      buf_lat_start[:, jnp.newaxis]
+      + jnp.arange(w_lat_size, dtype=jnp.int32)[jnp.newaxis, :],
       n_lat_buf,
       dtype=dtype,
   )
-  m_lat_2d_t = m_lat_win.reshape(w_lat_size * ny_loc, n_lat_buf).T
+  m_lat_2d = m_lat_win.reshape(ny_loc * w_lat_size, n_lat_buf)
 
   dot_prec_lhs_bf16 = jax_numpy_utils.resolve_dot_precision(
-      None, m_lat_win, wind_buf, lhs_exact_in_bf16=True
+      None, m_lat_2d, wind_buf, lhs_exact_in_bf16=True
   )
-  dot_prec_rhs_bf16 = _resolve_rhs_binary_dot_precision(wind_buf, m_lat_2d_t)
   dot_prec_f32 = jax_numpy_utils.resolve_dot_precision(None, wind_buf, wind_buf)
 
-  wind_2d = wind_buf.transpose(1, 2, 0, 3).reshape(
-      l_buf_c * n_lon * 3, n_lat_buf
+  k_w_raw = 3 * w_lat_size
+  k_w_pad = _round_to_multiple(k_w_raw, 8)
+  wind_2d_t = (
+      wind_buf.swapaxes(0, 1)
+      .reshape(l_buf_c * 3, n_lon, n_lat_buf)
+      .transpose(2, 0, 1)
+      .reshape(n_lat_buf, l_buf_c * 3 * n_lon)
   )
-  wind_lat_by_l = jnp.dot(
-      wind_2d, m_lat_2d_t, precision=dot_prec_rhs_bf16
-  ).reshape(l_buf_c, n_lon * 3 * w_lat_size * ny_loc)
+  wind_lat = (
+      jnp.dot(m_lat_2d, wind_2d_t, precision=dot_prec_lhs_bf16)
+      .reshape(ny_loc, w_lat_size, l_buf_c * 3, n_lon)
+      .transpose(0, 2, 1, 3)
+      .reshape(ny_loc, l_buf_c, k_w_raw, n_lon)
+  )
+  if k_w_pad > k_w_raw:
+    wind_lat = jnp.pad(wind_lat, [(0, 0), (0, 0), (0, k_w_pad - k_w_raw), (0, 0)])
 
-  sd_2d = sd_buf.transpose(1, 2, 0, 3).reshape(l_buf_b * n_lon, n_lat_buf)
-  sd_lat_by_l = jnp.dot(
-      sd_2d, m_lat_2d_t, precision=dot_prec_rhs_bf16
-  ).reshape(l_buf_b, n_lon * w_lat_size * ny_loc)
+  k_sd_raw = w_lat_size
+  k_sd_pad = _round_to_multiple(k_sd_raw, 8)
+  sd_2d_t = sd_buf[0].transpose(2, 0, 1).reshape(n_lat_buf, l_buf_b * n_lon)
+  sd_lat = (
+      jnp.dot(m_lat_2d, sd_2d_t, precision=dot_prec_lhs_bf16)
+      .reshape(ny_loc, w_lat_size, l_buf_b, n_lon)
+      .transpose(0, 2, 1, 3)
+  )
+  if k_sd_pad > k_sd_raw:
+    sd_lat = jnp.pad(sd_lat, [(0, 0), (0, 0), (0, k_sd_pad - k_sd_raw), (0, 0)])
 
-  k_wind = w_z_c_size * 3 * w_lat_size
-  k_tot = k_wind + w_z_b_size * w_lat_size
+  lon_q_t = jnp.swapaxes(lon_q, 1, 2)
+  sin_lat_q_t = jnp.swapaxes(sin_lat_q, 1, 2)
+  sigma_q_t = jnp.swapaxes(sigma_q, 1, 2)
+  k_arr = jnp.arange(l_q_loc, dtype=jnp.int32)
+  m_arange = jnp.arange(n_lon, dtype=jnp.int32)[:, jnp.newaxis]
+  lat_arange = jnp.arange(w_lat_size, dtype=jnp.int32)[:, jnp.newaxis]
+
+  item_bytes = 8 if dtype == jnp.float64 else 4
+  n_lon_pad128 = _round_to_multiple(n_lon, 128)
+  b_len = 1
   if is_tpu and l_q_loc > 1:
-    item_bytes = 8 if dtype == jnp.float64 else 4
-    w_lon_b = (
-        ny_loc
-        * _round_to_multiple(nx_loc, 8)
-        * _round_to_multiple(n_lon, 128)
-        * item_bytes
-    )
-    patch_b = (
-        ny_loc
-        * _round_to_multiple(n_lon, 8)
-        * _round_to_multiple(k_tot, 128)
-        * item_bytes
-    )
-    gath_b = (
-        ny_loc
-        * _round_to_multiple(nx_loc, 8)
-        * _round_to_multiple(k_tot, 128)
-        * item_bytes
-    )
-    wind_transp_b = (
-        ny_loc
-        * n_lon
-        * _round_to_multiple(w_z_c_size, 8)
-        * _round_to_multiple(3 * w_lat_size, 128)
-        * item_bytes
-    )
-    sd_transp_b = (
-        ny_loc
-        * n_lon
-        * _round_to_multiple(w_z_b_size, 8)
-        * _round_to_multiple(w_lat_size, 128)
-        * item_bytes
-    )
-    wind_red_b = (
-        ny_loc
-        * nx_loc
-        * 8
-        * _round_to_multiple(w_lat_size, 128)
-        * item_bytes
-    )
-    max_single_lvl = max(1, wind_transp_b, sd_transp_b, wind_red_b)
-    per_lvl_ws = max(1, w_lon_b + patch_b + gath_b + wind_transp_b + sd_transp_b)
-    max_b_single = max(1, (600 * 1024 * 1024) // max_single_lvl)
-    max_b_ws = max(1, (900 * 1024 * 1024) // per_lvl_ws)
-    max_b = min(8, max_b_single, max_b_ws)
-    if l_q_loc >= 16:
-      n_lvl_chunks = max(4, math.ceil(l_q_loc / max_b))
-    else:
-      n_lvl_chunks = math.ceil(l_q_loc / max_b)
-    b_len = math.ceil(l_q_loc / n_lvl_chunks)
-  else:
-    n_lvl_chunks = l_q_loc
-    b_len = 1
+    for b_cand in (4, 2):
+      if l_q_loc < b_cand:
+        continue
+      wz_c = min(l_buf_c, min(l_src_c, w_z_c_size + b_cand - 1))
+      wz_b = min(l_buf_b, min(l_src_b, w_z_b_size + b_cand - 1))
+      k_tot = wz_c * k_w_pad + wz_b * k_sd_pad
+      nx_c_pad128 = _round_to_multiple(b_cand * nx_loc, 128)
+      lhs_b = ny_loc * k_tot * n_lon_pad128 * item_bytes
+      rhs_b = ny_loc * _round_to_multiple(n_lon, 8) * nx_c_pad128 * item_bytes
+      out_b = ny_loc * k_tot * nx_c_pad128 * item_bytes
+      if lhs_b + rhs_b + out_b <= 118 * 1024 * 1024:
+        b_len = b_cand
+        break
 
-  l_q_pad = n_lvl_chunks * b_len
-  k_arr = jnp.minimum(
-      jnp.arange(l_q_pad, dtype=jnp.int32), max(0, l_q_loc - 1)
-  )
-  if l_q_pad > l_q_loc:
-    pad_n = l_q_pad - l_q_loc
-    q_pad = [(0, pad_n), (0, 0), (0, 0)]
-    lon_pad_q = jnp.pad(lon_q, q_pad)
-    sin_lat_pad_q = jnp.pad(sin_lat_q, q_pad)
-    sigma_pad_q = jnp.pad(sigma_q, q_pad, constant_values=centers[0])
-  else:
-    lon_pad_q, sin_lat_pad_q, sigma_pad_q = lon_q, sin_lat_q, sigma_q
+  w_z_c_blk = min(l_buf_c, min(l_src_c, w_z_c_size + b_len - 1))
+  w_z_b_blk = min(l_buf_b, min(l_src_b, w_z_b_size + b_len - 1))
+  z_c_arange = jnp.arange(w_z_c_blk, dtype=jnp.int32)[:, jnp.newaxis]
+  z_b_arange = jnp.arange(w_z_b_blk, dtype=jnp.int32)[:, jnp.newaxis]
+  k_wind_flat = w_z_c_blk * k_w_pad
+  nx_blk = b_len * nx_loc
 
-  def _eval_level_chunk(inputs):
+  def _scan_block(inputs):
     k_b, lon_b, sin_lat_b, sigma_b = inputs
+    if b_len == 1:
+      k0_s = k_b
+      lon_s, sin_lat_s, sigma_s = lon_b, sin_lat_b, sigma_b
+    else:
+      k0_s = k_b[0]
+      lon_s = jnp.swapaxes(lon_b, 0, 1).reshape(ny_loc, nx_blk)
+      sin_lat_s = jnp.swapaxes(sin_lat_b, 0, 1).reshape(ny_loc, nx_blk)
+      sigma_s = jnp.swapaxes(sigma_b, 0, 1).reshape(ny_loc, nx_blk)
+
     lon_idx, lon_w, lat_idx, lat_w, _, _, _ = _horizontal_stencil_tuple(
-        grid, lon_b, sin_lat_b, 'linear'
+        grid, lon_s, sin_lat_s, 'linear'
     )
     lvl_c_idx, lvl_c_w, _, _ = _vertical_stencil_tuple(
-        sigma_b, centers, 'linear'
+        sigma_s, centers, 'linear'
     )
     lvl_b_idx, lvl_b_w, _, _ = _vertical_stencil_tuple(
-        sigma_b, boundaries, 'linear'
+        sigma_s, boundaries, 'linear'
     )
 
-    k_glob_c = jnp.minimum(k_b, l_src_c - 1)
+    k_glob_c = jnp.minimum(k0_s, l_src_c - 1)
     win_z_c_start = (
-        jnp.zeros_like(k_glob_c)
-        if w_z_c_size == l_src_c
-        else jnp.clip(k_glob_c - eff_z_shift, 0, l_src_c - w_z_c_size)
+        jnp.int32(0)
+        if w_z_c_blk == l_src_c
+        else jnp.clip(k_glob_c - eff_z_shift, 0, l_src_c - w_z_c_blk)
     )
     win_z_b_start = (
-        jnp.zeros_like(k_glob_c)
-        if w_z_b_size == l_src_b
-        else jnp.clip(k_glob_c - eff_z_shift, 0, l_src_b - w_z_b_size)
+        jnp.int32(0)
+        if w_z_b_blk == l_src_b
+        else jnp.clip(k_glob_c - eff_z_shift, 0, l_src_b - w_z_b_blk)
     )
 
     w_lon_mat = sum(
-        jnp.swapaxes(w, 1, 2)[..., jnp.newaxis]
-        * jax.nn.one_hot(jnp.swapaxes(idx, 1, 2), n_lon, dtype=dtype)
+        w[:, jnp.newaxis, :]
+        * (idx[:, jnp.newaxis, :] == m_arange).astype(dtype)
         for idx, w in zip(lon_idx, lon_w)
     )
     w_lat_mat = sum(
-        jnp.swapaxes(w, 1, 2)[..., jnp.newaxis]
-        * jax.nn.one_hot(
-            jnp.swapaxes(idx, 1, 2)
-            - win_lat_start[jnp.newaxis, :, jnp.newaxis],
-            w_lat_size,
-            dtype=dtype,
-        )
+        w[:, jnp.newaxis, :]
+        * (
+            (idx - win_lat_start[:, jnp.newaxis])[:, jnp.newaxis, :]
+            == lat_arange
+        ).astype(dtype)
         for idx, w in zip(lat_idx, lat_w)
     )
     w_z_c_mat = sum(
-        jnp.swapaxes(w, 1, 2)[..., jnp.newaxis]
-        * jax.nn.one_hot(
-            jnp.swapaxes(idx, 1, 2)
-            - win_z_c_start[:, jnp.newaxis, jnp.newaxis],
-            w_z_c_size,
-            dtype=dtype,
-        )
+        w[:, jnp.newaxis, :]
+        * ((idx - win_z_c_start)[:, jnp.newaxis, :] == z_c_arange).astype(dtype)
         for idx, w in zip(lvl_c_idx, lvl_c_w)
     )
     w_z_b_mat = sum(
-        jnp.swapaxes(w, 1, 2)[..., jnp.newaxis]
-        * jax.nn.one_hot(
-            jnp.swapaxes(idx, 1, 2)
-            - win_z_b_start[:, jnp.newaxis, jnp.newaxis],
-            w_z_b_size,
-            dtype=dtype,
-        )
+        w[:, jnp.newaxis, :]
+        * ((idx - win_z_b_start)[:, jnp.newaxis, :] == z_b_arange).astype(dtype)
         for idx, w in zip(lvl_b_idx, lvl_b_w)
     )
 
-    m_z_c = jax.nn.one_hot(
-        win_z_c_start[:, jnp.newaxis]
-        + jnp.arange(w_z_c_size, dtype=jnp.int32)[jnp.newaxis, :],
-        l_buf_c,
-        dtype=dtype,
-    ).reshape(b_len * w_z_c_size, l_buf_c)
-    wind_win = jnp.dot(
-        m_z_c, wind_lat_by_l, precision=dot_prec_lhs_bf16
-    ).reshape(b_len, w_z_c_size, n_lon, 3 * w_lat_size, ny_loc)
-    wind_patch = wind_win.transpose(0, 4, 2, 1, 3).reshape(
-        b_len * ny_loc, n_lon, k_wind
+    wind_win = lax.dynamic_slice_in_dim(
+        wind_lat, win_z_c_start, w_z_c_blk, axis=1
     )
-
-    m_z_b = jax.nn.one_hot(
-        win_z_b_start[:, jnp.newaxis]
-        + jnp.arange(w_z_b_size, dtype=jnp.int32)[jnp.newaxis, :],
-        l_buf_b,
-        dtype=dtype,
-    ).reshape(b_len * w_z_b_size, l_buf_b)
-    sd_win = jnp.dot(
-        m_z_b, sd_lat_by_l, precision=dot_prec_lhs_bf16
-    ).reshape(b_len, w_z_b_size, n_lon, w_lat_size, ny_loc)
-    sd_patch = sd_win.transpose(0, 4, 2, 1, 3).reshape(
-        b_len * ny_loc, n_lon, w_z_b_size * w_lat_size
+    wind_patch = wind_win.reshape(ny_loc, k_wind_flat, n_lon)
+    sd_win = lax.dynamic_slice_in_dim(
+        sd_lat, win_z_b_start, w_z_b_blk, axis=1
     )
+    sd_patch = sd_win.reshape(ny_loc, w_z_b_blk * k_sd_pad, n_lon)
 
-    both_patch = jnp.concatenate([wind_patch, sd_patch], axis=-1)
+    both_patch = jnp.concatenate([wind_patch, sd_patch], axis=1)
     gathered = jnp.einsum(
-        'bim,bmk->bik',
-        w_lon_mat.reshape(b_len * ny_loc, nx_loc, n_lon),
-        both_patch,
-        precision=dot_prec_f32,
+        'jkm,jmi->jki', both_patch, w_lon_mat, precision=dot_prec_f32
     )
     wind_after_z = (
-        gathered[..., :k_wind].reshape(
-            b_len, ny_loc, nx_loc, w_z_c_size, 3 * w_lat_size
+        gathered[:, :k_wind_flat, :].reshape(
+            ny_loc, w_z_c_blk, k_w_pad, nx_blk
         )
-        * w_z_c_mat[..., jnp.newaxis]
-    ).sum(axis=-2)
-    wind_val = (
-        wind_after_z.reshape(b_len, ny_loc, nx_loc, 3, w_lat_size)
-        * w_lat_mat[:, :, :, jnp.newaxis, :]
-    ).sum(axis=-1)
+        * w_z_c_mat[:, :, jnp.newaxis, :]
+    ).sum(axis=1)
+    wind_jci = (
+        wind_after_z[:, :k_w_raw, :].reshape(ny_loc, 3, w_lat_size, nx_blk)
+        * w_lat_mat[:, jnp.newaxis, :, :]
+    ).sum(axis=2)
     sd_after_z = (
-        gathered[..., k_wind:].reshape(
-            b_len, ny_loc, nx_loc, w_z_b_size, w_lat_size
+        gathered[:, k_wind_flat:, :].reshape(
+            ny_loc, w_z_b_blk, k_sd_pad, nx_blk
         )
-        * w_z_b_mat[..., jnp.newaxis]
-    ).sum(axis=-2)
-    sd_val = (sd_after_z * w_lat_mat).sum(axis=-1)[..., jnp.newaxis]
-    return jnp.concatenate([wind_val, sd_val], axis=-1).transpose(0, 3, 2, 1)
+        * w_z_b_mat[:, :, jnp.newaxis, :]
+    ).sum(axis=1)
+    sd_jci = (sd_after_z[:, :k_sd_raw, :] * w_lat_mat).sum(axis=1)[
+        :, jnp.newaxis, :
+    ]
+    both_jci = jnp.concatenate([wind_jci, sd_jci], axis=1)
+    if b_len == 1:
+      return jnp.swapaxes(both_jci, 0, 1)
+    return both_jci.reshape(ny_loc, 4, b_len, nx_loc).transpose(2, 1, 0, 3)
 
-  if n_lvl_chunks == 1:
-    out_l = _eval_level_chunk(
-        (k_arr, lon_pad_q, sin_lat_pad_q, sigma_pad_q)
-    )[:l_q_loc]
+  if l_q_loc == 1:
+    out_0 = _scan_block(
+        (jnp.int32(0), lon_q_t[0], sin_lat_q_t[0], sigma_q_t[0])
+    )
+    out_4d = jnp.swapaxes(out_0, 1, 2)[:, jnp.newaxis, :, :]
+  elif b_len == 1:
+    _, out_l = lax.scan(
+        lambda _, inp: (None, _scan_block(inp)),
+        None,
+        (k_arr, lon_q_t, sin_lat_q_t, sigma_q_t),
+    )
+    out_4d = out_l.transpose(1, 0, 3, 2)
   else:
-    grouped_inputs = (
-        k_arr.reshape(n_lvl_chunks, b_len),
-        lon_pad_q.reshape(n_lvl_chunks, b_len, nx_loc, ny_loc),
-        sin_lat_pad_q.reshape(n_lvl_chunks, b_len, nx_loc, ny_loc),
-        sigma_pad_q.reshape(n_lvl_chunks, b_len, nx_loc, ny_loc),
+    n_blocks = (l_q_loc + b_len - 1) // b_len
+    pad_l = n_blocks * b_len - l_q_loc
+    if pad_l > 0:
+      k_in = jnp.pad(k_arr, (0, pad_l), mode='edge').reshape(n_blocks, b_len)
+      lon_in = jnp.pad(
+          lon_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
+      ).reshape(n_blocks, b_len, ny_loc, nx_loc)
+      sin_lat_in = jnp.pad(
+          sin_lat_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
+      ).reshape(n_blocks, b_len, ny_loc, nx_loc)
+      sigma_in = jnp.pad(
+          sigma_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
+      ).reshape(n_blocks, b_len, ny_loc, nx_loc)
+    else:
+      k_in = k_arr.reshape(n_blocks, b_len)
+      lon_in = lon_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
+      sin_lat_in = sin_lat_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
+      sigma_in = sigma_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
+    _, out_blk = lax.scan(
+        lambda _, inp: (None, _scan_block(inp)),
+        None,
+        (k_in, lon_in, sin_lat_in, sigma_in),
     )
-    _, out_chunks = lax.scan(
-        lambda _, inp: (None, _eval_level_chunk(inp)), None, grouped_inputs
+    out_4d = (
+        out_blk.reshape(n_blocks * b_len, 4, ny_loc, nx_loc)[:l_q_loc]
+        .transpose(1, 0, 3, 2)
     )
-    out_l = out_chunks.reshape(l_q_pad, 4, nx_loc, ny_loc)[:l_q_loc]
-
-  out_4d = out_l.transpose(1, 0, 2, 3)
   return out_4d[:3], out_4d[3]
 
 
@@ -3359,20 +3399,34 @@ def horizontal_departure_points(
   wind = cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
   angular_dt = dt / grid.radius
 
+  can_eval_at_arrival = (
+      initial_guess is None
+      and grid.nodal_padding == (0, 0)
+      and u.shape[-2:] == grid.nodal_shape
+  )
+  mid_lat_shift = (
+      None if max_lat_shift is None else max(1, (max_lat_shift + 1) // 2)
+  )
   departure = arrival if initial_guess is None else initial_guess.cartesian
-  for _ in range(iterations):
-    midpoint = _normalize((arrival + departure) / 2)
-    lon_mid, sin_lat_mid = cartesian_to_lon_sin_lat(midpoint)
-    wind_mid = _interpolate_2d_multi(
-        wind,
-        grid,
-        lon_mid,
-        sin_lat_mid,
-        order='linear',
-        limiter=None,
-        method=method,
-        max_lat_shift=max_lat_shift,
-    )
+  for iter_idx in range(iterations):
+    if iter_idx == 0 and can_eval_at_arrival:
+      # On a cold first iteration, `midpoint == arrival` sits directly on the
+      # horizontal grid nodes, where bilinear Lagrange interpolation is the
+      # identity.
+      wind_mid = wind
+    else:
+      midpoint = _normalize((arrival + departure) / 2)
+      lon_mid, sin_lat_mid = cartesian_to_lon_sin_lat(midpoint)
+      wind_mid = _interpolate_2d_multi(
+          wind,
+          grid,
+          lon_mid,
+          sin_lat_mid,
+          order='linear',
+          limiter=None,
+          method=method,
+          max_lat_shift=mid_lat_shift,
+      )
     departure = _normalize(arrival - angular_dt * wind_mid)
 
   return DeparturePoints(cartesian=departure, sigma=None)
@@ -3433,6 +3487,8 @@ def departure_points_3d(
     )
   centers = vertical_nodes.centers
   boundaries = vertical_nodes.boundaries
+  centers_np = np.asarray(centers)
+  boundaries_np = np.asarray(boundaries)
   u = jnp.asarray(u)
 
   lon_mesh, sin_lat_mesh = grid.nodal_mesh
@@ -3441,20 +3497,44 @@ def departure_points_3d(
       jnp.broadcast_to(sin_lat_mesh, u.shape),
   )
   sigma_arrival = jnp.broadcast_to(
-      jnp.asarray(centers, dtype=u.dtype)[:, jnp.newaxis, jnp.newaxis], u.shape
+      jnp.asarray(centers_np, dtype=u.dtype)[:, jnp.newaxis, jnp.newaxis],
+      u.shape,
   )
   wind = cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
   angular_dt = dt / grid.radius
   sigma_dot_arr = jnp.asarray(sigma_dot)
+  mid_lat_shift = (
+      None if max_lat_shift is None else max(1, (max_lat_shift + 1) // 2)
+  )
+  mid_vertical_shift = (
+      None
+      if max_vertical_shift is None
+      else max(1, (max_vertical_shift + 1) // 2)
+  )
+  can_eval_at_arrival = (
+      initial_guess is None
+      and grid.nodal_padding == (0, 0)
+      and u.ndim == 3
+      and u.shape == (len(centers_np),) + grid.nodal_shape
+      and sigma_dot_arr.shape == (len(boundaries_np),) + grid.nodal_shape
+      and len(boundaries_np) == len(centers_np) + 1
+      and bool(np.all(np.diff(boundaries_np) > 0))
+      and bool(
+          np.all(
+              (centers_np >= boundaries_np[:-1])
+              & (centers_np <= boundaries_np[1:])
+          )
+      )
+  )
   use_fused_matmul = (
       _resolve_interpolation_method(method, grid) == 'matmul'
       and u.ndim == 3
-      and u.shape == (len(centers),) + grid.nodal_shape
-      and sigma_dot_arr.shape == (len(boundaries),) + grid.nodal_shape
-      and len(centers) >= 2
-      and len(boundaries) >= 2
-      and max_lat_shift is not None
-      and max_vertical_shift is not None
+      and u.shape == (len(centers_np),) + grid.nodal_shape
+      and sigma_dot_arr.shape == (len(boundaries_np),) + grid.nodal_shape
+      and len(centers_np) >= 2
+      and len(boundaries_np) >= 2
+      and mid_lat_shift is not None
+      and mid_vertical_shift is not None
       and (
           grid.spmd_mesh is None
           or 'z' not in grid.spmd_mesh.axis_names
@@ -3466,8 +3546,8 @@ def departure_points_3d(
       grid=grid,
       order='linear',
       method=method,
-      max_lat_shift=max_lat_shift,
-      max_vertical_shift=max_vertical_shift,
+      max_lat_shift=mid_lat_shift,
+      max_vertical_shift=mid_vertical_shift,
   )
 
   if initial_guess is None:
@@ -3476,30 +3556,47 @@ def departure_points_3d(
   else:
     departure = initial_guess.cartesian
     sigma_departure = initial_guess.sigma
-  for _ in range(iterations):
-    midpoint = _normalize((arrival + departure) / 2)
-    sigma_mid = (sigma_arrival + sigma_departure) / 2
-    lon_mid, sin_lat_mid = cartesian_to_lon_sin_lat(midpoint)
-    if use_fused_matmul:
-      wind_mid, sigma_dot_mid = _interpolate_3d_wind_and_sigma_dot_matmul(
-          wind,
-          sigma_dot_arr,
-          grid,
-          lon_mid,
-          sin_lat_mid,
-          sigma_mid,
-          centers,
-          boundaries,
-          max_lat_shift=max_lat_shift,
-          max_vertical_shift=max_vertical_shift,
-      )
+  for iter_idx in range(iterations):
+    if iter_idx == 0 and can_eval_at_arrival:
+      # On a cold first iteration, `midpoint == arrival` and `sigma_mid == centers`,
+      # so 3-D trilinear interpolation reduces identically to `wind` at layer
+      # centers and 1-D vertical linear interpolation of `sigma_dot` from
+      # layer boundaries to centers.
+      wind_mid = wind
+      w_hi = jnp.asarray(
+          (centers_np - boundaries_np[:-1])
+          / (boundaries_np[1:] - boundaries_np[:-1]),
+          dtype=sigma_dot_arr.dtype,
+      )[:, jnp.newaxis, jnp.newaxis]
+      sigma_dot_mid = (1.0 - w_hi) * sigma_dot_arr[:-1] + w_hi * sigma_dot_arr[1:]
     else:
-      point = dict(lon=lon_mid, sin_lat=sin_lat_mid, sigma=sigma_mid)
-      wind_mid = interpolate(wind, sigma_nodes=centers, **point)
-      sigma_dot_mid = interpolate(sigma_dot_arr, sigma_nodes=boundaries, **point)
+      midpoint = _normalize((arrival + departure) / 2)
+      sigma_mid = (sigma_arrival + sigma_departure) / 2
+      lon_mid, sin_lat_mid = cartesian_to_lon_sin_lat(midpoint)
+      if use_fused_matmul:
+        wind_mid, sigma_dot_mid = _interpolate_3d_wind_and_sigma_dot_matmul(
+            wind,
+            sigma_dot_arr,
+            grid,
+            lon_mid,
+            sin_lat_mid,
+            sigma_mid,
+            centers_np,
+            boundaries_np,
+            max_lat_shift=mid_lat_shift,
+            max_vertical_shift=mid_vertical_shift,
+        )
+      else:
+        point = dict(lon=lon_mid, sin_lat=sin_lat_mid, sigma=sigma_mid)
+        wind_mid = interpolate(wind, sigma_nodes=centers_np, **point)
+        sigma_dot_mid = interpolate(
+            sigma_dot_arr, sigma_nodes=boundaries_np, **point
+        )
     departure = _normalize(arrival - angular_dt * wind_mid)
     sigma_departure = jnp.clip(
-        sigma_arrival - dt * sigma_dot_mid, float(centers[0]), float(centers[-1])
+        sigma_arrival - dt * sigma_dot_mid,
+        float(centers_np[0]),
+        float(centers_np[-1]),
     )
 
   return DeparturePoints(cartesian=departure, sigma=sigma_departure)
