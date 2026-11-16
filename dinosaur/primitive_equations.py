@@ -2216,9 +2216,6 @@ def _semi_lagrangian_transport(
       *modal_tracers_nodal,
       *(jnp.asarray(state.tracers[k]) for k in nodal_names),
   ]
-  resolved_method = semi_lagrangian._resolve_interpolation_method(
-      equation.interpolation_method, grid
-  )
   can_fuse_tracers = (
       not dynamics_limiter
       and bool(tracer_arrays)
@@ -2226,7 +2223,6 @@ def _semi_lagrangian_transport(
           a.shape == t_nodal.shape and a.dtype == t_nodal.dtype
           for a in tracer_arrays
       )
-      and (resolved_method == 'matmul' or not equation.monotone_tracers)
   )
 
   modal_tracers = {}

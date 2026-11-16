@@ -1530,76 +1530,273 @@ def _interpolate_3d_gather(
     lon: jax.Array,
     sin_lat: jax.Array,
     sigma: jax.Array,
-    sigma_nodes: np.ndarray,
+    sigma_nodes: Array,
     *,
     order: str,
     limiter: str | None,
     vertical_order: Literal['linear', 'cubic'],
     limiter_bound_reference: Array | None,
-) -> jnp.ndarray:
-  """Gather-based 3-D interpolation of [C, L_src, nx, ny] sharing one stencil."""
-  stencil = _horizontal_stencil(grid, lon, sin_lat, order)
-  level_index, level_weights, bracket_offset = _vertical_stencil(
-      sigma, jnp.asarray(sigma_nodes), vertical_order
+    limited_channel_start: int = 0,
+    trilinear_channel_start: int | None = None,
+) -> jnp.ndarray | tuple[jnp.ndarray, jnp.ndarray]:
+  """Gather-based 3-D interpolation on channel-minor layout sharing one stencil.
+
+  Packs channels into the contiguous minor axis (`[N_grid, C]`) so all channels
+  at each stencil corner share a single cache line, contracts the 3-D Lagrange
+  weights in a cascaded reduction without materializing `[..., 4, 4, 4]` index
+  or value tensors, and extracts both quasi-monotone cell bounds and optional
+  trilinear values (`trilinear_channel_start`) from the already-gathered
+  interior `2x2x2` corners with zero extra gathers.
+  """
+  c_total = fields_4d.shape[0]
+  eff_lim_start = (
+      min(c_total, max(0, limited_channel_start))
+      if limiter is not None
+      else c_total
   )
-  extended = _extend_with_pole_halo(fields_4d, grid)
-  extended_latitude_size = extended.shape[-1]
-  # One 1-D gather per channel on the flattened field with precomputed linear
-  # indices shared across all channels.
-  flat_index = (
-      level_index[..., :, jnp.newaxis, jnp.newaxis] * grid.longitude_nodes
-      + stencil.lon_index[..., jnp.newaxis, :, jnp.newaxis]
-  ) * extended_latitude_size + stencil.lat_index[
-      ..., jnp.newaxis, jnp.newaxis, :
-  ]
+  has_lim = limiter is not None and eff_lim_start < c_total
+  if has_lim and limiter != 'quasi_monotone':
+    raise ValueError(f'unimplemented interpolation {limiter=}')
 
-  reference_corners = None
-  reference_at_departure = 0.0
-  if limiter is not None and limiter_bound_reference is not None:
-    ref_arr = jnp.asarray(limiter_bound_reference, dtype=extended.dtype)
-    ref_centered = ref_arr - jnp.mean(ref_arr)
-    reference_corners = ref_centered[level_index]
-    reference_at_departure = (level_weights * reference_corners).sum(-1)
+  need_tri = trilinear_channel_start is not None
+  eff_tri_start = (
+      min(c_total, max(0, trilinear_channel_start)) if need_tri else c_total
+  )
+  c_tri = c_total - eff_tri_start
+  reuse_raw_for_tri = (
+      need_tri and order == 'linear' and vertical_order == 'linear'
+  )
+  need_tri_box = need_tri and c_tri > 0 and not reuse_raw_for_tri
 
-  def _eval_one(ext_one):
-    values = jnp.take(ext_one.ravel(), flat_index, mode='clip')
-    result = _contract_stencil(
-        values, level_weights, stencil.lon_weights, stencil.lat_weights
+  if need_tri_box:
+    (
+        lon_idx,
+        lon_w,
+        lat_idx,
+        lat_w,
+        _,
+        _,
+        ext_size,
+        (a_lon, a_lat),
+    ) = _horizontal_stencil_tuple(
+        grid, lon, sin_lat, order, include_linear_fractions=True
     )
-    if limiter is not None:
-      if limiter != 'quasi_monotone':
-        raise ValueError(f'unimplemented interpolation {limiter=}')
-      cell = _linear_cell_slice(order)
-      corners = values[..., :, cell, cell]
-      if reference_corners is not None:
-        corners = corners + reference_corners[..., :, jnp.newaxis, jnp.newaxis]
-        result = result + reference_at_departure
-      corners = _bracketing_level_corners(corners, bracket_offset)
-      result = jnp.clip(
-          result,
-          corners.min(axis=(-3, -2, -1)),
-          corners.max(axis=(-3, -2, -1)),
-      )
-      result = result - reference_at_departure
-    return result
+    lvl_idx, lvl_w, b_off, _, f_lvl = _vertical_stencil_tuple(
+        sigma,
+        jnp.asarray(sigma_nodes),
+        vertical_order,
+        include_linear_fractions=True,
+    )
+  else:
+    lon_idx, lon_w, lat_idx, lat_w, _, _, ext_size = _horizontal_stencil_tuple(
+        grid, lon, sin_lat, order
+    )
+    lvl_idx, lvl_w, b_off, _ = _vertical_stencil_tuple(
+        sigma, jnp.asarray(sigma_nodes), vertical_order
+    )
+    a_lon = a_lat = f_lvl = None
 
-  c_total = extended.shape[0]
-  if c_total == 1:
-    return _eval_one(extended[0])[jnp.newaxis, ...]
-  if c_total <= 4:
-    return jax.vmap(_eval_one)(extended)
-  chunk = 4
-  c_pad = _round_to_multiple(c_total, chunk)
-  ext_pad = (
-      jnp.pad(extended, [(0, c_pad - c_total), (0, 0), (0, 0), (0, 0)])
-      if c_pad > c_total
-      else extended
+  extended = _extend_with_pole_halo(fields_4d, grid)
+  dtype = extended.dtype
+  ext_c = jnp.moveaxis(extended, 0, -1).reshape(-1, c_total)
+  n_lon = grid.longitude_nodes
+  q_shape = lon.shape
+
+  ref_levels = None
+  ref_at_dep = None
+  if has_lim and limiter_bound_reference is not None:
+    ref_arr = jnp.asarray(limiter_bound_reference, dtype=dtype)
+    ref_centered = ref_arr - jnp.mean(ref_arr)
+    ref_levels = [ref_centered[zi][..., jnp.newaxis] for zi in lvl_idx]
+    ref_at_dep = sum(
+        lw_a * ref_centered[zi] for zi, lw_a in zip(lvl_idx, lvl_w)
+    )[..., jnp.newaxis]
+
+  s_lvl = len(lvl_idx)
+  s_lon = len(lon_idx)
+  s_lat = len(lat_idx)
+  c_cell0 = 0 if order == 'linear' else 1
+  need_box = has_lim or need_tri_box
+  box_start = (
+      min(
+          eff_lim_start if has_lim else c_total,
+          eff_tri_start if need_tri_box else c_total,
+      )
+      if need_box
+      else c_total
   )
-  ext_grouped = ext_pad.reshape((c_pad // chunk, chunk) + extended.shape[1:])
-  _, out_grouped = lax.scan(
-      lambda _, grp: (None, jax.vmap(_eval_one)(grp)), None, ext_grouped
-  )
-  return out_grouped.reshape((c_pad,) + lon.shape)[:c_total]
+  lim_rel = eff_lim_start - box_start
+  tri_rel = eff_tri_start - box_start
+  c_lim = c_total - eff_lim_start
+
+  stride_z = n_lon * ext_size
+  x_base = [xi * ext_size for xi in lon_idx]
+  lat_w_exp = [w[..., jnp.newaxis] for w in lat_w]
+  lon_w_exp = [w[..., jnp.newaxis] for w in lon_w]
+  if need_tri_box:
+    w_xl0 = (1.0 - a_lon)[..., jnp.newaxis]
+    w_xl1 = a_lon[..., jnp.newaxis]
+    w_yl0 = (1.0 - a_lat)[..., jnp.newaxis]
+    w_yl1 = a_lat[..., jnp.newaxis]
+
+  def _eval_level(za, ref_a):
+    acc_x = 0.0
+    cell_rows = []
+    for bi in range(s_lon):
+      zxb = za + x_base[bi]
+      acc_y = 0.0
+      row_c = []
+      in_b = need_box and bi in (c_cell0, c_cell0 + 1)
+      for ci in range(s_lat):
+        v_abc = jnp.take(ext_c, zxb + lat_idx[ci], axis=0, mode='clip')
+        acc_y = acc_y + v_abc * lat_w_exp[ci]
+        if in_b and ci in (c_cell0, c_cell0 + 1):
+          row_c.append(v_abc[..., box_start:])
+      acc_x = acc_x + acc_y * lon_w_exp[bi]
+      if in_b:
+        cell_rows.append(row_c)
+
+    lo_a = hi_a = tri_a = None
+    if need_box:
+      c00, c01 = cell_rows[0]
+      c10, c11 = cell_rows[1]
+      if has_lim:
+        l00, l01 = c00[..., lim_rel:], c01[..., lim_rel:]
+        l10, l11 = c10[..., lim_rel:], c11[..., lim_rel:]
+        lo_a = jnp.minimum(jnp.minimum(l00, l01), jnp.minimum(l10, l11))
+        hi_a = jnp.maximum(jnp.maximum(l00, l01), jnp.maximum(l10, l11))
+        if ref_a is not None:
+          lo_a = lo_a + ref_a
+          hi_a = hi_a + ref_a
+      if need_tri_box:
+        t00, t01 = c00[..., tri_rel:], c01[..., tri_rel:]
+        t10, t11 = c10[..., tri_rel:], c11[..., tri_rel:]
+        t0 = t00 * w_yl0 + t01 * w_yl1
+        t1 = t10 * w_yl0 + t11 * w_yl1
+        tri_a = t0 * w_xl0 + t1 * w_xl1
+    return acc_x, lo_a, hi_a, tri_a
+
+  if s_lvl * s_lon * s_lat <= 32:
+    acc_z = 0.0
+    lo_list = []
+    hi_list = []
+    tri_list = []
+    for a in range(s_lvl):
+      ref_a = ref_levels[a] if ref_levels is not None else None
+      acc_x, lo_a, hi_a, tri_a = _eval_level(lvl_idx[a] * stride_z, ref_a)
+      acc_z = acc_z + acc_x * lvl_w[a][..., jnp.newaxis]
+      if has_lim:
+        lo_list.append(lo_a)
+        hi_list.append(hi_a)
+      if need_tri_box:
+        tri_list.append(tri_a)
+    if s_lvl == 2:
+      if has_lim:
+        lo = jnp.minimum(lo_list[0], lo_list[1])
+        hi = jnp.maximum(hi_list[0], hi_list[1])
+      if need_tri_box:
+        tri = (
+            tri_list[0] * (1.0 - f_lvl)[..., jnp.newaxis]
+            + tri_list[1] * f_lvl[..., jnp.newaxis]
+        )
+    else:
+      is0 = (b_off == 0)[..., jnp.newaxis]
+      is1 = (b_off == 1)[..., jnp.newaxis]
+      if has_lim:
+        lo0 = jnp.where(is0, lo_list[0], jnp.where(is1, lo_list[1], lo_list[2]))
+        lo1 = jnp.where(is0, lo_list[1], jnp.where(is1, lo_list[2], lo_list[3]))
+        hi0 = jnp.where(is0, hi_list[0], jnp.where(is1, hi_list[1], hi_list[2]))
+        hi1 = jnp.where(is0, hi_list[1], jnp.where(is1, hi_list[2], hi_list[3]))
+        lo = jnp.minimum(lo0, lo1)
+        hi = jnp.maximum(hi0, hi1)
+      if need_tri_box:
+        tr0 = jnp.where(
+            is0, tri_list[0], jnp.where(is1, tri_list[1], tri_list[2])
+        )
+        tr1 = jnp.where(
+            is0, tri_list[1], jnp.where(is1, tri_list[2], tri_list[3])
+        )
+        tri = (
+            tr0 * (1.0 - f_lvl)[..., jnp.newaxis]
+            + tr1 * f_lvl[..., jnp.newaxis]
+        )
+  else:
+    z_stack = jnp.stack([zi * stride_z for zi in lvl_idx], axis=0)
+    lw_stack = jnp.stack(lvl_w, axis=0)[..., jnp.newaxis]
+    ref_stack = jnp.stack(ref_levels, axis=0) if ref_levels is not None else None
+
+    def _scan_level(carry, x_a):
+      acc_cur, lo_cur, hi_cur, tri_cur = carry
+      a, za, lw_a, ref_a = x_a
+      acc_x, lo_a, hi_a, tri_a = _eval_level(za, ref_a)
+      acc_cur = acc_cur + acc_x * lw_a
+      if has_lim:
+        is_first = (a == b_off)[..., jnp.newaxis]
+        is_second = (a == b_off + 1)[..., jnp.newaxis]
+        lo_cur = jnp.where(
+            is_first,
+            lo_a,
+            jnp.where(is_second, jnp.minimum(lo_cur, lo_a), lo_cur),
+        )
+        hi_cur = jnp.where(
+            is_first,
+            hi_a,
+            jnp.where(is_second, jnp.maximum(hi_cur, hi_a), hi_cur),
+        )
+      if need_tri_box:
+        w_tri_a = jnp.where(
+            a == b_off,
+            1 - f_lvl,
+            jnp.where(a == b_off + 1, f_lvl, jnp.zeros_like(f_lvl)),
+        )[..., jnp.newaxis]
+        tri_cur = tri_cur + tri_a * w_tri_a
+      return (acc_cur, lo_cur, hi_cur, tri_cur), None
+
+    acc_dtype = jnp.result_type(dtype, lon_w[0], lat_w[0], lvl_w[0])
+    lo_dtype = (
+        jnp.result_type(dtype, ref_levels[0]) if ref_levels is not None else dtype
+    )
+    tri_dtype = (
+        jnp.result_type(dtype, w_xl0, w_yl0, f_lvl) if need_tri_box else dtype
+    )
+    init_carry = (
+        jnp.zeros((*q_shape, c_total), dtype=acc_dtype),
+        jnp.zeros((*q_shape, c_lim), dtype=lo_dtype) if has_lim else None,
+        jnp.zeros((*q_shape, c_lim), dtype=lo_dtype) if has_lim else None,
+        jnp.zeros((*q_shape, c_tri), dtype=tri_dtype) if need_tri_box else None,
+    )
+    (acc_z, lo, hi, tri), _ = lax.scan(
+        _scan_level,
+        init_carry,
+        (jnp.arange(s_lvl, dtype=jnp.int32), z_stack, lw_stack, ref_stack),
+    )
+
+  if reuse_raw_for_tri:
+    out_tri = jnp.moveaxis(acc_z[..., eff_tri_start:], -1, 0)
+  elif need_tri:
+    out_tri = (
+        jnp.moveaxis(tri, -1, 0)
+        if c_tri > 0
+        else jnp.zeros((0, *q_shape), dtype=dtype)
+    )
+
+  if has_lim:
+    lim_vals = acc_z[..., eff_lim_start:]
+    if ref_at_dep is not None:
+      lim_vals = lim_vals + ref_at_dep
+    lim_vals = jnp.clip(lim_vals, lo, hi)
+    if ref_at_dep is not None:
+      lim_vals = lim_vals - ref_at_dep
+    out_c = (
+        lim_vals
+        if eff_lim_start == 0
+        else jnp.concatenate([acc_z[..., :eff_lim_start], lim_vals], axis=-1)
+    )
+  else:
+    out_c = acc_z
+
+  out = jnp.moveaxis(out_c, -1, 0)
+  return (out, out_tri) if need_tri else out
 
 
 def _matmul_3d_points(
@@ -2870,6 +3067,50 @@ def _interpolate_3d_mixed(
   c_total = fields_4d.shape[0]
   eff_lim_start = min(c_total, max(0, limited_channel_start))
 
+  if resolved == 'gather':
+    min_levels = 2 if vertical_order == 'linear' else 4
+    if len(sigma_nodes) < min_levels:
+      raise ValueError(
+          f'{vertical_order} vertical interpolation requires at least'
+          f' {min_levels} levels'
+      )
+    if (
+        fields_4d.ndim != 4
+        or fields_4d.shape[1] != len(sigma_nodes)
+        or fields_4d.shape[2:] != grid.nodal_shape
+    ):
+      raise ValueError(
+          f'expected fields_4d of shape [C, {len(sigma_nodes)}, '
+          f'{grid.nodal_shape[0]}, {grid.nodal_shape[1]}]; got'
+          f' {fields_4d.shape}'
+      )
+    if c_total == 0 or lon.size == 0:
+      out_zero = jnp.zeros((c_total, *lon.shape), dtype=fields_4d.dtype)
+      if trilinear_channel_start is not None:
+        eff_tri = min(c_total, max(0, trilinear_channel_start))
+        return out_zero, jnp.zeros(
+            (c_total - eff_tri, *lon.shape), dtype=fields_4d.dtype
+        )
+      return out_zero
+    return _interpolate_3d_gather(
+        fields_4d,
+        grid,
+        lon,
+        sin_lat,
+        sigma,
+        sigma_nodes,
+        order=order,
+        limiter=limiter if eff_lim_start < c_total else None,
+        vertical_order=vertical_order,
+        limiter_bound_reference=(
+            limiter_bound_reference
+            if limiter is not None and eff_lim_start < c_total
+            else None
+        ),
+        limited_channel_start=eff_lim_start,
+        trilinear_channel_start=trilinear_channel_start,
+    )
+
   if (
       resolved == 'matmul'
       and c_total > 0
@@ -3432,6 +3673,64 @@ def horizontal_departure_points(
   return DeparturePoints(cartesian=departure, sigma=None)
 
 
+def _interpolate_3d_wind_and_sigma_dot_gather(
+    wind: jax.Array,
+    sigma_dot: jax.Array,
+    grid: spherical_harmonic.Grid,
+    lon: jax.Array,
+    sin_lat: jax.Array,
+    sigma: jax.Array,
+    centers: Array,
+    boundaries: Array,
+) -> tuple[jax.Array, jax.Array]:
+  """Fused trilinear gather of 3-component `wind` and `sigma_dot` sharing one horizontal stencil."""
+  lon_idx, lon_w, lat_idx, lat_w, _, _, ext_size = _horizontal_stencil_tuple(
+      grid, lon, sin_lat, 'linear'
+  )
+  lvl_c_idx, lvl_c_w, _, _ = _vertical_stencil_tuple(
+      sigma, jnp.asarray(centers), 'linear'
+  )
+  lvl_b_idx, lvl_b_w, _, _ = _vertical_stencil_tuple(
+      sigma, jnp.asarray(boundaries), 'linear'
+  )
+  wind_ext = _extend_with_pole_halo(wind, grid)
+  wind_c = jnp.moveaxis(wind_ext, 0, -1).reshape(-1, wind.shape[0])
+  sd_flat = _extend_with_pole_halo(sigma_dot, grid).reshape(-1)
+  stride_z = grid.longitude_nodes * ext_size
+  x_base = [xi * ext_size for xi in lon_idx]
+  lat_w_exp = [w[..., jnp.newaxis] for w in lat_w]
+  lon_w_exp = [w[..., jnp.newaxis] for w in lon_w]
+
+  acc_w = 0.0
+  acc_sd = 0.0
+  for a in range(2):
+    zc_a = lvl_c_idx[a] * stride_z
+    zb_a = lvl_b_idx[a] * stride_z
+    wx = 0.0
+    sx = 0.0
+    for b in range(2):
+      zxcb = zc_a + x_base[b]
+      zxbb = zb_a + x_base[b]
+      wy = 0.0
+      sy = 0.0
+      for c in range(2):
+        wy = (
+            wy
+            + jnp.take(wind_c, zxcb + lat_idx[c], axis=0, mode='clip')
+            * lat_w_exp[c]
+        )
+        sy = (
+            sy
+            + jnp.take(sd_flat, zxbb + lat_idx[c], axis=0, mode='clip')
+            * lat_w[c]
+        )
+      wx = wx + wy * lon_w_exp[b]
+      sx = sx + sy * lon_w[b]
+    acc_w = acc_w + wx * lvl_c_w[a][..., jnp.newaxis]
+    acc_sd = acc_sd + sx * lvl_b_w[a]
+  return jnp.moveaxis(acc_w, -1, 0), acc_sd
+
+
 def departure_points_3d(
     u: Array,
     v: Array,
@@ -3526,13 +3825,17 @@ def departure_points_3d(
           )
       )
   )
-  use_fused_matmul = (
-      _resolve_interpolation_method(method, grid) == 'matmul'
-      and u.ndim == 3
+  resolved_mid_method = _resolve_interpolation_method(method, grid)
+  can_fuse_midpoint = (
+      u.ndim == 3
       and u.shape == (len(centers_np),) + grid.nodal_shape
       and sigma_dot_arr.shape == (len(boundaries_np),) + grid.nodal_shape
       and len(centers_np) >= 2
       and len(boundaries_np) >= 2
+  )
+  use_fused_matmul = (
+      resolved_mid_method == 'matmul'
+      and can_fuse_midpoint
       and mid_lat_shift is not None
       and mid_vertical_shift is not None
       and (
@@ -3541,6 +3844,7 @@ def departure_points_3d(
           or grid.spmd_mesh.shape['z'] == 1
       )
   )
+  use_fused_gather = resolved_mid_method == 'gather' and can_fuse_midpoint
   interpolate = functools.partial(
       interpolate_3d,
       grid=grid,
@@ -3585,6 +3889,17 @@ def departure_points_3d(
             boundaries_np,
             max_lat_shift=mid_lat_shift,
             max_vertical_shift=mid_vertical_shift,
+        )
+      elif use_fused_gather:
+        wind_mid, sigma_dot_mid = _interpolate_3d_wind_and_sigma_dot_gather(
+            wind,
+            sigma_dot_arr,
+            grid,
+            lon_mid,
+            sin_lat_mid,
+            sigma_mid,
+            centers_np,
+            boundaries_np,
         )
       else:
         point = dict(lon=lon_mid, sin_lat=sin_lat_mid, sigma=sigma_mid)
