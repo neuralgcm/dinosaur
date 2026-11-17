@@ -1482,7 +1482,9 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
       include_coriolis: whether to include the Coriolis term. Semi-Lagrangian
         solvers that transport planetary momentum (`v + 2Ω✕R`) absorb the
         Coriolis force into transport and exclude it here.
-      aux_state: optional pre-computed diagnostic state.
+      aux_state: optional diagnostic state of `state`, as from
+        `compute_diagnostic_state_sigma`. It must equal what this method would
+        compute itself; passing it only saves recomputing it.
       nodal_surface_pressure: unused on sigma levels; accepted for signature
         parity with `PrimitiveEquationsHybrid`.
 
@@ -1552,8 +1554,10 @@ class PrimitiveEquationsSigma(PrimitiveEquationsBase):
 
     Args:
       state: the (modal) state from which to compute velocities.
-      aux_state: optional pre-computed diagnostic state, to avoid recomputing
-        spherical harmonic transforms.
+      aux_state: optional diagnostic state of `state`, as from
+        `compute_diagnostic_state_sigma`. It must equal what this method would
+        compute itself; passing it only saves recomputing its spherical
+        harmonic transforms.
 
     Returns:
       A `NodalVelocities` holding true (not cosθ-scaled) horizontal winds at
@@ -3169,7 +3173,18 @@ def compute_diagnostic_state_hybrid(
     *,
     nodal_surface_pressure: Array | None = None,
 ) -> DiagnosticStateHybrid:
-  """Computes DiagnosticState in nodal basis based on the modal `state`."""
+  """Computes DiagnosticState in nodal basis based on the modal `state`.
+
+  Args:
+    state: the (modal) state.
+    coords: coordinate system with hybrid vertical levels.
+    nodal_surface_pressure: optional nodal surface pressure of `state`, `exp`
+      of the nodal `log_surface_pressure`. It must equal what this function
+      would compute itself; passing it only saves recomputing it.
+
+  Returns:
+    The diagnostic state in nodal space.
+  """
   diag, _ = _compute_diagnostic_state_and_sp_hybrid(
       state, coords, nodal_surface_pressure=nodal_surface_pressure
   )
@@ -3209,7 +3224,25 @@ def get_geopotential_diff_hybrid(
     *,
     vertical_coeffs: tuple[Array, Array] | None = None,
 ) -> jax.Array:
-  """Calculate the implicit geopotential term."""
+  """Calculate the implicit geopotential term.
+
+  Args:
+    temperature: temperature (variation) to which the hydrostatic weights are
+      applied.
+    coordinates: hybrid vertical coordinates.
+    ideal_gas_constant: specific gas constant `R`.
+    p_surface: surface pressure, a scalar (reference) or a nodal array.
+    method: `'dense'` or `'sparse'` vertical matrix-vector product; `'dense'`
+      requires a scalar `p_surface`.
+    sharding: optional sharding for the vertical cumulative sums.
+    vertical_coeffs: used only by the `'sparse'` method: optional precomputed `(alpha, log_p_interface_ratio)` pair, as returned
+      by `_get_vertical_discretization_coeffs` for the same coordinates and
+      surface pressure. It must equal what this function would compute
+      itself; passing it only saves recomputing it.
+
+  Returns:
+    The geopotential difference, shaped like `temperature`.
+  """
   # If p_surface is spatially varying, we cannot use the dense matrix method
   # because the matrix would be spatially dependent.
   is_variable_ps = np.ndim(p_surface) > 0
@@ -3747,6 +3780,24 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
     coordinate class: semi-Lagrangian solvers handle the advective terms
     (the `ζ` in `ζ + f`, and vertical advection) via trajectories, keeping
     only the Coriolis and explicit pressure-gradient forcing.
+
+    Args:
+      aux_state: diagnostic state of the state being evaluated.
+      nodal_surface_pressure: nodal surface pressure of that state.
+      include_vorticity_advection: whether to include the relative vorticity
+        in the absolute vorticity `ζ + f`.
+      include_coriolis: whether to include the Coriolis parameter `f`.
+      include_vertical_advection: whether to include vertical advection of
+        the horizontal wind.
+      include_pressure_gradient: whether to include the explicit
+        pressure-gradient term.
+      vertical_coeffs: optional precomputed `(alpha, log_p_interface_ratio)` pair, as returned
+        by `_get_vertical_discretization_coeffs` for the same coordinates and
+        surface pressure. It must equal what this function would compute
+        itself; passing it only saves recomputing it.
+
+    Returns:
+      The modal `(vorticity, divergence)` tendencies.
     """
     nodal_u, nodal_v = self._nodal_curl_and_div_terms(
         aux_state,
@@ -3819,6 +3870,17 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
     the reference temperature: `_implicit_temperature_complement` removes
     its linearization, so that explicit plus implicit terms reproduce the
     S&B tendency at any surface pressure.
+
+    Args:
+      aux_state: diagnostic state of the state being evaluated.
+      nodal_surface_pressure: nodal surface pressure of that state.
+      vertical_coeffs: optional precomputed `(alpha, log_p_interface_ratio)` pair, as returned
+        by `_get_vertical_discretization_coeffs` for the same coordinates and
+        surface pressure. It must equal what this function would compute
+        itself; passing it only saves recomputing it.
+
+    Returns:
+      The nodal temperature tendency.
     """
     levels = self.nondim_levels
     if vertical_coeffs is not None:
@@ -4150,8 +4212,12 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
       state: the (modal) state from which to compute tendencies.
       include_coriolis: whether to include the Coriolis term. Semi-Lagrangian
         solvers in planetary-momentum mode absorb it into transport.
-      aux_state: optional pre-computed diagnostic state.
-      nodal_surface_pressure: optional pre-computed nodal surface pressure.
+      aux_state: optional diagnostic state of `state`, as from
+        `compute_diagnostic_state_hybrid`. It must equal what this method would
+        compute itself; passing it only saves recomputing it.
+      nodal_surface_pressure: optional nodal surface pressure of `state`,
+        `exp` of the nodal `log_surface_pressure`. It must equal what this
+        method would compute itself; passing it only saves recomputing it.
 
     Returns:
       A `State` of non-advective explicit tendencies.
@@ -4305,8 +4371,12 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
 
     Args:
       state: the (modal) state from which to compute velocities.
-      aux_state: optional pre-computed diagnostic state.
-      nodal_surface_pressure: optional pre-computed nodal surface pressure.
+      aux_state: optional diagnostic state of `state`, as from
+        `compute_diagnostic_state_hybrid`. It must equal what this method would
+        compute itself; passing it only saves recomputing it.
+      nodal_surface_pressure: optional nodal surface pressure of `state`,
+        `exp` of the nodal `log_surface_pressure`. It must equal what this
+        method would compute itself; passing it only saves recomputing it.
 
     Returns:
       A `NodalVelocities` holding true horizontal winds at layer centers,
