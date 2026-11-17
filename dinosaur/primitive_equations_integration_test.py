@@ -23,6 +23,8 @@ from dinosaur import primitive_equations
 from dinosaur import primitive_equations_states
 from dinosaur import pytree_utils
 from dinosaur import scales
+from dinosaur import semi_lagrangian
+from dinosaur import semi_lagrangian_test
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
@@ -503,6 +505,101 @@ class IntegrationTest(absltest.TestCase):
     self.assertTrue(np.all(np.isfinite(np.asarray(grad_dist))))
     self.assertGreater(float(np.max(np.abs(np.asarray(grad_dist)))), 0.0)
     np.testing.assert_allclose(grad_dist, grad_ref, rtol=1e-4, atol=1e-5)
+
+  def test_semi_lagrangian_window_clamp_sharded(self):
+    """Departures beyond the windows are clamped identically under a mesh."""
+    num_layers = 16
+    shift = semi_lagrangian_test._SHIFT
+
+    def build_coords(mesh):
+      return coordinate_systems.CoordinateSystem(
+          spherical_harmonic.Grid.T31(
+              spherical_harmonics_impl=spherical_harmonic.FastSphericalHarmonics
+          ),
+          sigma_coordinates.SigmaCoordinates.equidistant(num_layers),
+          spmd_mesh=mesh,
+      )
+
+    coords = build_coords(None)
+    grid = coords.horizontal
+    nx, ny = grid.nodal_shape
+    centers = coords.vertical.centers
+    lon, sin_lat, sigma = semi_lagrangian_test._far_queries(
+        grid, num_layers, seed=3
+    )
+    rng = np.random.RandomState(4)
+    fields = jnp.asarray(
+        1.0 + np.abs(rng.normal(size=(2, num_layers) + grid.nodal_shape)),
+        jnp.float32,
+    )
+    lon_mesh, sin_lat_mesh = grid.nodal_mesh
+    cos_lat = np.sqrt(1 - sin_lat_mesh**2)
+    k = np.arange(num_layers)[:, np.newaxis, np.newaxis]
+    # winds carrying the trajectory midpoints beyond their windows.
+    u = jnp.asarray(
+        0.6 * cos_lat * (1 + 0.3 * np.sin(2 * lon_mesh + k)), jnp.float32
+    )
+    v = jnp.asarray(0.6 * cos_lat * np.sin(lon_mesh + 0.5 * k), jnp.float32)
+    b = coords.vertical.boundaries[:, np.newaxis, np.newaxis]
+    sigma_dot = jnp.asarray(
+        np.broadcast_to(
+            0.25 * np.sin(np.pi * b) * (1 + 0.5 * np.cos(lon_mesh)),
+            (num_layers + 1,) + grid.nodal_shape,
+        ),
+        jnp.float32,
+    )
+    kw = dict(
+        order='cubic',
+        limiter='quasi_monotone',
+        vertical_order='cubic',
+        max_lat_shift=shift,
+        max_vertical_shift=shift,
+    )
+
+    def run(c, method, pad):
+      g = c.horizontal
+      interp_3d = semi_lagrangian.interpolate_3d(
+          pad(fields), g, pad(lon), pad(sin_lat), pad(sigma), centers,
+          method=method, **kw,
+      )
+      interp_2d = semi_lagrangian.GridInterpolator(
+          g, 'cubic', 'quasi_monotone', method=method, max_lat_shift=shift
+      )(pad(fields[0]), pad(lon), pad(sin_lat))
+      dep = semi_lagrangian.departure_points_3d(
+          pad(u), pad(v), pad(sigma_dot), c, 1.0, iterations=2,
+          method=method, max_lat_shift=shift, max_vertical_shift=shift,
+      )
+      outs = (interp_3d, interp_2d, dep.cartesian, dep.sigma)
+      return [np.asarray(x)[..., :nx, :ny] for x in outs]
+
+    ref = run(coords, 'gather', lambda x: x)
+    unclamped = semi_lagrangian.interpolate_3d(
+        fields, grid, lon, sin_lat, sigma, centers, method='gather',
+        **(kw | dict(max_lat_shift=None, max_vertical_shift=None)),
+    )
+    self.assertGreater(float(np.max(np.abs(unclamped - ref[0]))), 1e-2)
+    for name, shape in [
+        ('vertical_halo_ppermute', (2, 1, 1)),
+        ('horizontal_halo_ppermute', (1, 2, 4)),
+        ('full_3d_sharding', (2, 2, 2)),
+    ]:
+      with self.subTest(name):
+        mesh = jax.sharding.Mesh(
+            np.array(jax.devices()[: int(np.prod(shape))]).reshape(shape),
+            axis_names=['z', 'x', 'y'],
+        )
+        dist_coords = build_coords(mesh)
+        px, py = dist_coords.horizontal.nodal_padding
+
+        def pad(x, px=px, py=py):
+          widths = [(0, 0)] * (x.ndim - 2) + [(0, px), (0, py)]
+          return jnp.pad(x, widths, mode='edge')
+
+        out = run(dist_coords, None, pad)
+        for o, r in zip(out, ref):
+          np.testing.assert_allclose(
+              o, r, rtol=0, atol=2e-5 * float(np.max(np.abs(r)))
+          )
 
 
 if __name__ == '__main__':
