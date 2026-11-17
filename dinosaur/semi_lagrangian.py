@@ -364,6 +364,69 @@ def _z_window_start(
   return jnp.clip(first_level, 0, n_source - size)
 
 
+def _weighted_one_hot(
+    indices: tuple[jax.Array, ...],
+    weights: tuple[jax.Array, ...],
+    num_classes: int,
+    dtype: jnp.dtype,
+) -> jax.Array:
+  """Matrix of stencil weights placed at their node indices.
+
+  Args:
+    indices: per stencil point, integer node indices of shape [q].
+    weights: per stencil point, interpolation weights of shape [q].
+    num_classes: number of nodes.
+    dtype: dtype of the result.
+
+  Returns:
+    [q, num_classes] matrix whose row `i` holds `weights[k][i]` at column
+    `indices[k][i]`, summed over the stencil points `k` in order.
+  """
+  return sum(
+      w[:, jnp.newaxis] * jax.nn.one_hot(idx, num_classes, dtype=dtype)
+      for idx, w in zip(indices, weights)
+  )
+
+
+def _weighted_window_one_hot(
+    indices: tuple[jax.Array, ...],
+    weights: tuple[jax.Array, ...],
+    window_arange: jax.Array,
+    dtype: jnp.dtype,
+    start: jax.Array | None = None,
+) -> jax.Array:
+  """Stencil weights placed at their node indices within a window.
+
+  Args:
+    indices: per stencil point, integer node indices of shape [ny, nx].
+    weights: per stencil point, interpolation weights of shape [ny, nx].
+    window_arange: [w, 1] window positions `0 ... w - 1`.
+    dtype: dtype of the result.
+    start: optional window start, subtracted from the indices to give window
+      positions: a scalar, or [ny] with one start per row; None when the
+      indices already are window positions.
+
+  Returns:
+    [ny, w, nx] array whose entry `[j, m, i]` is the sum over stencil points
+    `k`, in order, of `weights[k][j, i]` where `indices[k][j, i] - start == m`
+    (the comparison is carried out in the index dtype, then cast).
+  """
+  per_row_start = start is not None and jnp.ndim(start) == 1
+  # The per-row start is expanded inside the loop, once per stencil point.
+  return sum(
+      w[:, jnp.newaxis, :]
+      * (
+          (
+              idx
+              if start is None
+              else idx - (start[:, jnp.newaxis] if per_row_start else start)
+          )[:, jnp.newaxis, :]
+          == window_arange
+      ).astype(dtype)
+      for idx, w in zip(indices, weights)
+  )
+
+
 def _validate_interpolation_method(method: str | None) -> None:
   if method is not None and method not in _INTERPOLATION_METHODS:
     raise ValueError(
@@ -933,16 +996,14 @@ def _matmul_2d_points(
         lat_cell0,
         _,
     ) = _horizontal_stencil_tuple(grid, lon_q, sin_lat_q, order)
-    w_lat_mat = sum(
-        w[:, jnp.newaxis] * jax.nn.one_hot(idx, n_lat_ext, dtype=dtype)
-        for idx, w in zip(lat_indices, lat_weights)
+    w_lat_mat = _weighted_one_hot(
+        lat_indices, lat_weights, n_lat_ext, dtype
     )  # [q, n_lat_ext]
     f_at_lat = jnp.dot(
         w_lat_mat, f_2d.T, precision=dot_prec_f32
     ).reshape(lon_q.shape[0], c_total, n_lon)
-    w_lon_mat = sum(
-        w[:, jnp.newaxis] * jax.nn.one_hot(idx, n_lon, dtype=dtype)
-        for idx, w in zip(lon_indices, lon_weights)
+    w_lon_mat = _weighted_one_hot(
+        lon_indices, lon_weights, n_lon, dtype
     )  # [q, n_lon]
     val = (f_at_lat * w_lon_mat[:, jnp.newaxis, :]).sum(axis=-1).T  # [C, q]
 
@@ -1968,17 +2029,14 @@ def _matmul_3d_points(
         sigma_q, sigma_nodes, vertical_order
     )
 
-    w_lat_mat = sum(
-        w[:, jnp.newaxis] * jax.nn.one_hot(idx, n_lat_ext, dtype=dtype)
-        for idx, w in zip(lat_indices, lat_weights)
+    w_lat_mat = _weighted_one_hot(
+        lat_indices, lat_weights, n_lat_ext, dtype
     )  # [q, n_lat_ext]
-    w_lon_mat = sum(
-        w[:, jnp.newaxis] * jax.nn.one_hot(idx, n_lon, dtype=dtype)
-        for idx, w in zip(lon_indices, lon_weights)
+    w_lon_mat = _weighted_one_hot(
+        lon_indices, lon_weights, n_lon, dtype
     )  # [q, n_lon]
-    w_z_mat = sum(
-        w[:, jnp.newaxis] * jax.nn.one_hot(idx, l_src, dtype=dtype)
-        for idx, w in zip(level_indices, level_weights)
+    w_z_mat = _weighted_one_hot(
+        level_indices, level_weights, l_src, dtype
     )  # [q, l_src]
 
     def _accum_level(acc, inp):
@@ -2466,20 +2524,11 @@ def _matmul_3d_local(
         w_lon_mat = sum(
             w[:, jnp.newaxis, :] * oh for w, oh in zip(lon_w, oh_lon)
         )
-        w_z_mat = sum(
-            w[:, jnp.newaxis, :]
-            * (
-                (idx - win_z_start)[:, jnp.newaxis, :] == z_blk_arange
-            ).astype(dtype)
-            for idx, w in zip(lvl_idx, lvl_w)
+        w_z_mat = _weighted_window_one_hot(
+            lvl_idx, lvl_w, z_blk_arange, dtype, win_z_start
         )
-        w_lat_mat = sum(
-            w[:, jnp.newaxis, :]
-            * (
-                (idx - win_lat_start[:, jnp.newaxis])[:, jnp.newaxis, :]
-                == lat_arange
-            ).astype(dtype)
-            for idx, w in zip(lat_idx, lat_w)
+        w_lat_mat = _weighted_window_one_hot(
+            lat_idx, lat_w, lat_arange, dtype, win_lat_start
         )
 
         # Slice the block vertical window once from `f_lat` across all `b_len`
@@ -3451,28 +3500,15 @@ def _matmul_3d_wind_and_sigma_dot_local(
         k_glob_c - eff_z_shift, l_src_b, w_z_b_blk
     )
 
-    w_lon_mat = sum(
-        w[:, jnp.newaxis, :]
-        * (idx[:, jnp.newaxis, :] == m_arange).astype(dtype)
-        for idx, w in zip(lon_idx, lon_w)
+    w_lon_mat = _weighted_window_one_hot(lon_idx, lon_w, m_arange, dtype)
+    w_lat_mat = _weighted_window_one_hot(
+        lat_idx, lat_w, lat_arange, dtype, win_lat_start
     )
-    w_lat_mat = sum(
-        w[:, jnp.newaxis, :]
-        * (
-            (idx - win_lat_start[:, jnp.newaxis])[:, jnp.newaxis, :]
-            == lat_arange
-        ).astype(dtype)
-        for idx, w in zip(lat_idx, lat_w)
+    w_z_c_mat = _weighted_window_one_hot(
+        lvl_c_idx, lvl_c_w, z_c_arange, dtype, win_z_c_start
     )
-    w_z_c_mat = sum(
-        w[:, jnp.newaxis, :]
-        * ((idx - win_z_c_start)[:, jnp.newaxis, :] == z_c_arange).astype(dtype)
-        for idx, w in zip(lvl_c_idx, lvl_c_w)
-    )
-    w_z_b_mat = sum(
-        w[:, jnp.newaxis, :]
-        * ((idx - win_z_b_start)[:, jnp.newaxis, :] == z_b_arange).astype(dtype)
-        for idx, w in zip(lvl_b_idx, lvl_b_w)
+    w_z_b_mat = _weighted_window_one_hot(
+        lvl_b_idx, lvl_b_w, z_b_arange, dtype, win_z_b_start
     )
 
     wind_win = lax.dynamic_slice_in_dim(
