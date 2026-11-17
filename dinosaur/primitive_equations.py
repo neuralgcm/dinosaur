@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 from typing import Any, Callable, Mapping, Sequence
@@ -208,42 +209,96 @@ class NodalVelocities:
   v_mean: Array
 
 
-def _batch_to_nodal(
-    grid: spherical_harmonic.Grid, arrays: Sequence[Array]
+def _batch_transform(
+    transform: Callable[[Array], Array], arrays: Sequence[Array]
 ) -> tuple[jnp.ndarray, ...]:
-  """Applies `grid.to_nodal` to identically shaped arrays in one stacked call."""
+  """Applies `transform` to `arrays`, stacked into one call when possible.
+
+  Arrays sharing a shape and dtype are stacked along a new leading axis so a
+  single (batched) spectral transform serves them all; otherwise each array
+  is transformed separately. Either way the result holds one array per input,
+  in input order.
+  """
   if not arrays:
     return ()
   if len(arrays) == 1:
-    return (grid.to_nodal(arrays[0]),)
+    return (transform(arrays[0]),)
   first = jnp.asarray(arrays[0])
   if all(
       jnp.asarray(a).shape == first.shape
       and jnp.asarray(a).dtype == first.dtype
       for a in arrays[1:]
   ):
-    stacked = grid.to_nodal(jnp.stack(arrays, axis=0))
+    stacked = transform(jnp.stack(arrays, axis=0))
     return tuple(stacked[i] for i in range(len(arrays)))
-  return tuple(grid.to_nodal(a) for a in arrays)
+  return tuple(transform(a) for a in arrays)
+
+
+def _batch_to_nodal(
+    grid: spherical_harmonic.Grid, arrays: Sequence[Array]
+) -> tuple[jnp.ndarray, ...]:
+  """Applies `grid.to_nodal` to identically shaped arrays in one stacked call."""
+  return _batch_transform(grid.to_nodal, arrays)
 
 
 def _batch_to_modal(
     grid: spherical_harmonic.Grid, arrays: Sequence[Array]
 ) -> tuple[jnp.ndarray, ...]:
   """Applies `grid.to_modal` to identically shaped arrays in one stacked call."""
-  if not arrays:
-    return ()
-  if len(arrays) == 1:
-    return (grid.to_modal(arrays[0]),)
-  first = jnp.asarray(arrays[0])
-  if all(
-      jnp.asarray(a).shape == first.shape
-      and jnp.asarray(a).dtype == first.dtype
-      for a in arrays[1:]
-  ):
-    stacked = grid.to_modal(jnp.stack(arrays, axis=0))
-    return tuple(stacked[i] for i in range(len(arrays)))
-  return tuple(grid.to_modal(a) for a in arrays)
+  return _batch_transform(grid.to_modal, arrays)
+
+
+def _nodal_diagnostic_fields(
+    state: State, grid: spherical_harmonic.Grid
+) -> tuple[Array, Array, Array, tuple[Array, Array], Any]:
+  """Transforms the prognostic fields of a diagnostic state to nodal space.
+
+  Vorticity, divergence, temperature variation, the cos(lat)-weighted winds
+  and every tracer that has the vorticity's shape and dtype go through one
+  stacked transform; any other tracer is transformed on its own.
+
+  Args:
+    state: modal state.
+    grid: horizontal grid.
+
+  Returns:
+    `(vorticity, divergence, temperature_variation, cos_lat_u, tracers)`,
+    all nodal; `tracers` has the structure of `state.tracers`.
+  """
+  cos_lat_u_modal = spherical_harmonic.get_cos_lat_vector(
+      state.vorticity, state.divergence, grid, clip=False
+  )
+  has_tracer_mapping = isinstance(state.tracers, Mapping)
+  if has_tracer_mapping:
+    vor_arr = jnp.asarray(state.vorticity)
+    batched_keys = [
+        k
+        for k, v in state.tracers.items()
+        if isinstance(v, (np.ndarray, jax.Array))
+        and v.shape == vor_arr.shape
+        and v.dtype == vor_arr.dtype
+    ]
+  else:
+    batched_keys = []
+  nodal_3d = _batch_to_nodal(
+      grid,
+      [
+          state.vorticity,
+          state.divergence,
+          state.temperature_variation,
+          *cos_lat_u_modal,
+          *(state.tracers[k] for k in batched_keys),
+      ],
+  )
+  if has_tracer_mapping:
+    batched_tracers = dict(zip(batched_keys, nodal_3d[5:]))
+    tracers = {
+        k: batched_tracers[k] if k in batched_tracers else grid.to_nodal(v)
+        for k, v in state.tracers.items()
+    }
+  else:
+    tracers = grid.to_nodal(state.tracers)
+  return (*nodal_3d[:3], tuple(nodal_3d[3:5]), tracers)
 
 
 @jax.named_call
@@ -256,51 +311,13 @@ def compute_diagnostic_state_sigma(
   # TODO(dkochkov) Investigate clipping hyperparameters.
   # when converting to nodal, we need to clip wavenumbers.
   grid = coords.horizontal
-
-  def to_nodal_fn(x):
-    return grid.to_nodal(x)
-
-  cos_lat_u_modal = spherical_harmonic.get_cos_lat_vector(
-      state.vorticity, state.divergence, grid, clip=False
-  )
-  vor_arr = jnp.asarray(state.vorticity)
-  if isinstance(state.tracers, Mapping):
-    matched_keys = [
-        k
-        for k, v in state.tracers.items()
-        if isinstance(v, (np.ndarray, jax.Array))
-        and v.shape == vor_arr.shape
-        and v.dtype == vor_arr.dtype
-    ]
-  else:
-    matched_keys = []
-  nodal_3d = _batch_to_nodal(
-      grid,
-      [
-          state.vorticity,
-          state.divergence,
-          state.temperature_variation,
-          cos_lat_u_modal[0],
-          cos_lat_u_modal[1],
-          *(state.tracers[k] for k in matched_keys),
-      ],
-  )
   (
       nodal_vorticity,
       nodal_divergence,
       nodal_temperature_variation,
-      cu_nodal,
-      cv_nodal,
-  ) = nodal_3d[:5]
-  nodal_cos_lat_u = (cu_nodal, cv_nodal)
-  if isinstance(state.tracers, Mapping):
-    matched_map = dict(zip(matched_keys, nodal_3d[5:]))
-    tracers = {
-        k: matched_map[k] if k in matched_map else to_nodal_fn(v)
-        for k, v in state.tracers.items()
-    }
-  else:
-    tracers = to_nodal_fn(state.tracers)
+      nodal_cos_lat_u,
+      tracers,
+  ) = _nodal_diagnostic_fields(state, grid)
   cos_lat_grad_log_sp = grid.cos_lat_grad(
       state.log_surface_pressure, clip=False
   )
@@ -1885,32 +1902,43 @@ def _can_eval_static_terrain(
   )
 
 
+def _static_terrain_context(
+    equation: SemiLagrangianPrimitiveEquations
+    | SemiLagrangianPrimitiveEquationsHybrid,
+) -> contextlib.AbstractContextManager[Any]:
+  """Context in which the static terrain correction is evaluated.
+
+  The correction depends only on constants of the equation, so when none of
+  them is a tracer it is evaluated at trace time and enters the compiled
+  program as a constant rather than as per-step spectral transforms.
+  """
+  if _can_eval_static_terrain(equation):
+    return jax.ensure_compile_time_eval()
+  return contextlib.nullcontext()
+
+
 def _nodal_terrain_correction(
     equation: SemiLagrangianPrimitiveEquations
     | SemiLagrangianPrimitiveEquationsHybrid,
 ) -> jnp.ndarray:
-  grid = equation.coords.horizontal
-  if _can_eval_static_terrain(equation):
-    with jax.ensure_compile_time_eval():
-      return grid.to_nodal(_log_sp_terrain_correction_modal(equation))
-  return grid.to_nodal(_log_sp_terrain_correction_modal(equation))
+  """Nodal static terrain correction `C`."""
+  with _static_terrain_context(equation):
+    return equation.coords.horizontal.to_nodal(
+        _log_sp_terrain_correction_modal(equation)
+    )
 
 
 def _nodal_terrain_correction_grad(
     equation: SemiLagrangianPrimitiveEquations
     | SemiLagrangianPrimitiveEquationsHybrid,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
+  """Nodal `cos(lat)·∇C` of the static terrain correction, as `(x, y)`."""
   grid = equation.coords.horizontal
-  if _can_eval_static_terrain(equation):
-    with jax.ensure_compile_time_eval():
-      gx, gy = grid.cos_lat_grad(
-          _log_sp_terrain_correction_modal(equation), clip=False
-      )
-      return _batch_to_nodal(grid, [gx, gy])
-  gx, gy = grid.cos_lat_grad(
-      _log_sp_terrain_correction_modal(equation), clip=False
-  )
-  return _batch_to_nodal(grid, [gx, gy])
+  with _static_terrain_context(equation):
+    gx, gy = grid.cos_lat_grad(
+        _log_sp_terrain_correction_modal(equation), clip=False
+    )
+    return _batch_to_nodal(grid, [gx, gy])
 
 
 def _terrain_advection_tendency(
@@ -1969,44 +1997,92 @@ def _project_coupled_nodal_tracers(
   return modal_state.replace(tracers={**modal_state.tracers, **coupled})
 
 
-def _semi_lagrangian_nonadvective_terms(
+def _uses_library_method(equation: Any, name: str) -> bool:
+  """True if `equation.<name>` is a library implementation, not an override.
+
+  The semi-Lagrangian fast paths in this module (reusing the diagnostic
+  state across `nonadvective_terms` and `nodal_velocities`, handing
+  precomputed values to `explicit_nonadvective_terms`, skipping work on
+  fields no method reads) are written against what the library's own
+  methods read and compute. They are only valid while those methods are
+  the ones in use, so each fast path is gated on this check: a method
+  replaced on the class (by a subclass) or on the instance makes it False.
+
+  Args:
+    equation: an equation instance.
+    name: method name, e.g. `'explicit_nonadvective_terms'`.
+
+  Returns:
+    True if `name` is not set on the instance and the class attribute is
+    the one defined by `PrimitiveEquationsSigma`, `PrimitiveEquationsHybrid`,
+    `SemiLagrangianPrimitiveEquations` or
+    `SemiLagrangianPrimitiveEquationsHybrid`.
+  """
+  if name in getattr(equation, '__dict__', ()):
+    return False
+  library_classes = (
+      PrimitiveEquationsSigma,
+      PrimitiveEquationsHybrid,
+      SemiLagrangianPrimitiveEquations,
+      SemiLagrangianPrimitiveEquationsHybrid,
+  )
+  library_impls = [vars(c)[name] for c in library_classes if name in vars(c)]
+  return getattr(type(equation), name, None) in library_impls
+
+
+def _nonadvective_terms_with_diagnostics(
     equation: SemiLagrangianPrimitiveEquations
     | SemiLagrangianPrimitiveEquationsHybrid,
     state: State,
     mean_wind_weights: np.ndarray,
     *,
-    is_hybrid: bool = False,
-) -> State:
-  """Computes non-advective explicit tendencies ("N")."""
-  modal_state, nodal_tracers = _split_nodal_tracers(equation, state)
+    is_hybrid: bool,
+) -> tuple[State, Any, Array | None, State]:
+  """Evaluates the non-advective tendencies, keeping the diagnostics used.
+
+  When `equation` uses the library's `explicit_nonadvective_terms`, the
+  diagnostic state (and, for hybrid coordinates, the nodal surface pressure)
+  is computed here and handed to it, so callers can reuse both.
+
+  Args:
+    equation: the semi-Lagrangian equation.
+    state: modal state, with any `nodal_tracers` in nodal form.
+    mean_wind_weights: vertical weights of the mean wind used for the
+      terrain-advection forcing.
+    is_hybrid: whether `equation` is on hybrid coordinates.
+
+  Returns:
+    `(tendency, aux_state, nodal_surface_pressure, modal_state)`. `tendency`
+    is the non-advective tendency, zero for nodal tracers. `aux_state` and
+    `nodal_surface_pressure` are None when `equation` overrides
+    `explicit_nonadvective_terms` (and, for sigma coordinates,
+    `nodal_surface_pressure` is always None). `modal_state` is `state`
+    without its nodal tracers, with dynamics-coupled nodal tracers
+    projected into the modal basis.
+  """
+  modal_only, nodal_tracers = _split_nodal_tracers(equation, state)
   modal_state = _project_coupled_nodal_tracers(
-      equation, modal_state, nodal_tracers
+      equation, modal_only, nodal_tracers
   )
-  cls = type(equation)
-  can_pass_aux = 'explicit_nonadvective_terms' not in getattr(
-      equation, '__dict__', ()
-  ) and cls.explicit_nonadvective_terms in (
-      PrimitiveEquationsSigma.explicit_nonadvective_terms,
-      PrimitiveEquationsHybrid.explicit_nonadvective_terms,
-  )
+  include_coriolis = equation.coriolis_mode == 'explicit'
   aux_state = None
-  if can_pass_aux:
+  nodal_sp = None
+  if _uses_library_method(equation, 'explicit_nonadvective_terms'):
     if is_hybrid:
       aux_state, nodal_sp = _compute_diagnostic_state_and_sp_hybrid(
           modal_state, equation.nondim_coords
       )
     else:
       aux_state = compute_diagnostic_state_sigma(modal_state, equation.coords)
-      nodal_sp = None
     tendency = equation.explicit_nonadvective_terms(
         modal_state,
-        include_coriolis=equation.coriolis_mode == 'explicit',
+        include_coriolis=include_coriolis,
         aux_state=aux_state,
         nodal_surface_pressure=nodal_sp,
     )
   else:
     tendency = equation.explicit_nonadvective_terms(
-        modal_state, include_coriolis=equation.coriolis_mode == 'explicit'
+        modal_state, include_coriolis=include_coriolis
     )
   if equation.terrain_smoothed_log_sp:
     tendency = tendency.replace(
@@ -2022,12 +2098,28 @@ def _semi_lagrangian_nonadvective_terms(
             )
         )
     )
-  return tendency.replace(
+  tendency = tendency.replace(
       tracers={
           **tendency.tracers,
           **jax.tree_util.tree_map(jnp.zeros_like, nodal_tracers),
       }
   )
+  return tendency, aux_state, nodal_sp, modal_only
+
+
+def _semi_lagrangian_nonadvective_terms(
+    equation: SemiLagrangianPrimitiveEquations
+    | SemiLagrangianPrimitiveEquationsHybrid,
+    state: State,
+    mean_wind_weights: np.ndarray,
+    *,
+    is_hybrid: bool = False,
+) -> State:
+  """Computes non-advective explicit tendencies ("N")."""
+  tendency, _, _, _ = _nonadvective_terms_with_diagnostics(
+      equation, state, mean_wind_weights, is_hybrid=is_hybrid
+  )
+  return tendency
 
 
 def _semi_lagrangian_nonadvective_and_velocities(
@@ -2038,61 +2130,33 @@ def _semi_lagrangian_nonadvective_and_velocities(
     *,
     is_hybrid: bool,
 ) -> tuple[State, NodalVelocities]:
-  """Computes `(nonadvective_terms(state), nodal_velocities(state))` in one pass."""
-  cls = type(equation)
-  can_fuse = 'explicit_nonadvective_terms' not in getattr(
-      equation, '__dict__', ()
-  ) and cls.explicit_nonadvective_terms in (
-      PrimitiveEquationsSigma.explicit_nonadvective_terms,
-      PrimitiveEquationsHybrid.explicit_nonadvective_terms,
-  )
-  if not can_fuse:
+  """Computes `(nonadvective_terms(state), nodal_velocities(state))` in one pass.
+
+  The two share one diagnostic state. That is only equivalent to calling the
+  methods separately when `equation` uses the library's
+  `explicit_nonadvective_terms`; otherwise the methods are called
+  separately.
+
+  Args:
+    equation: the semi-Lagrangian equation.
+    state: modal state, with any `nodal_tracers` in nodal form.
+    mean_wind_weights: see `_nonadvective_terms_with_diagnostics`.
+    is_hybrid: whether `equation` is on hybrid coordinates.
+
+  Returns:
+    `(nonadvective_terms(state), nodal_velocities(state))`.
+  """
+  if not _uses_library_method(equation, 'explicit_nonadvective_terms'):
     return equation.nonadvective_terms(state), equation.nodal_velocities(state)
-
-  modal_only, nodal_tracers = _split_nodal_tracers(equation, state)
-  modal_state = _project_coupled_nodal_tracers(
-      equation, modal_only, nodal_tracers
+  tendency, aux_state, nodal_sp, modal_only = (
+      _nonadvective_terms_with_diagnostics(
+          equation, state, mean_wind_weights, is_hybrid=is_hybrid
+      )
   )
-  if is_hybrid:
-    # Strip tracers unless needed by moist dynamics; coupled tracers are already
-    # projected into `modal_state.tracers`, and nodal_velocities ignores tracers.
-    aux_state, nodal_sp = _compute_diagnostic_state_and_sp_hybrid(
-        modal_state, equation.nondim_coords
-    )
-  else:
-    aux_state = compute_diagnostic_state_sigma(modal_state, equation.coords)
-    nodal_sp = None
-
-  tendency = equation.explicit_nonadvective_terms(
-      modal_state,
-      include_coriolis=equation.coriolis_mode == 'explicit',
-      aux_state=aux_state,
-      nodal_surface_pressure=nodal_sp,
-  )
-  if equation.terrain_smoothed_log_sp:
-    tendency = tendency.replace(
-        log_surface_pressure=(
-            tendency.log_surface_pressure
-            + _terrain_advection_tendency(
-                equation,
-                modal_state,
-                mean_wind_weights,
-                nodal_cos_lat_u=aux_state.cos_lat_u,
-            )
-        )
-    )
-  tendency = tendency.replace(
-      tracers={
-          **tendency.tracers,
-          **jax.tree_util.tree_map(jnp.zeros_like, nodal_tracers),
-      }
-  )
+  # `nodal_velocities` ignores tracers, so it takes the state without them.
   if is_hybrid:
     velocities = PrimitiveEquationsHybrid.nodal_velocities(
-        equation,
-        modal_only,
-        aux_state,
-        nodal_surface_pressure=nodal_sp,
+        equation, modal_only, aux_state, nodal_surface_pressure=nodal_sp
     )
   else:
     velocities = PrimitiveEquationsSigma.nodal_velocities(
@@ -2765,51 +2829,13 @@ def _compute_diagnostic_state_and_sp_hybrid(
 ) -> tuple[DiagnosticStateHybrid, jnp.ndarray]:
   """Computes `(DiagnosticStateHybrid, nodal_surface_pressure)` in one pass."""
   grid = coords.horizontal
-
-  def to_nodal_fn(x):
-    return grid.to_nodal(x)
-
-  cos_lat_u_modal = spherical_harmonic.get_cos_lat_vector(
-      state.vorticity, state.divergence, grid, clip=False
-  )
-  vor_arr = jnp.asarray(state.vorticity)
-  if isinstance(state.tracers, Mapping):
-    matched_keys = [
-        k
-        for k, v in state.tracers.items()
-        if isinstance(v, (np.ndarray, jax.Array))
-        and v.shape == vor_arr.shape
-        and v.dtype == vor_arr.dtype
-    ]
-  else:
-    matched_keys = []
-  nodal_3d = _batch_to_nodal(
-      grid,
-      [
-          state.vorticity,
-          state.divergence,
-          state.temperature_variation,
-          cos_lat_u_modal[0],
-          cos_lat_u_modal[1],
-          *(state.tracers[k] for k in matched_keys),
-      ],
-  )
   (
       nodal_vorticity,
       nodal_divergence,
       nodal_temperature_variation,
-      cu_nodal,
-      cv_nodal,
-  ) = nodal_3d[:5]
-  nodal_cos_lat_u = (cu_nodal, cv_nodal)
-  if isinstance(state.tracers, Mapping):
-    matched_map = dict(zip(matched_keys, nodal_3d[5:]))
-    tracers = {
-        k: matched_map[k] if k in matched_map else to_nodal_fn(v)
-        for k, v in state.tracers.items()
-    }
-  else:
-    tracers = jax.tree_util.tree_map(to_nodal_fn, state.tracers)
+      nodal_cos_lat_u,
+      tracers,
+  ) = _nodal_diagnostic_fields(state, grid)
 
   cos_lat_grad_log_sp = grid.cos_lat_grad(
       state.log_surface_pressure, clip=False
