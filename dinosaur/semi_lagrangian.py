@@ -263,6 +263,107 @@ def _round_to_multiple(x: int, multiple: int) -> int:
   return multiple * math.ceil(x / multiple)
 
 
+def _effective_window_shift(max_shift: int) -> int:
+  """Window half-width actually used: a `max_shift` of 0 is treated as 1."""
+  return max(1, max_shift)
+
+
+def _window_size(
+    n_buffer: int, n_source: int, half_width: int, stencil: int
+) -> int:
+  """Number of rows (levels) in a stencil window.
+
+  The window spans `2 * half_width + stencil` consecutive source nodes: the
+  `stencil` nodes of a query whose departure point equals its arrival point,
+  plus `half_width` nodes on either side for the displacement. It is
+  truncated to the `n_source` source nodes and to the `n_buffer` nodes
+  available locally (they differ when the axis is sharded and halo-extended).
+  """
+  return min(n_buffer, min(n_source, 2 * half_width + stencil))
+
+
+def _arrival_lat_rows(
+    j_offset: int | jax.Array, ny_loc: int, n_lat: int
+) -> jax.Array:
+  """Global latitude rows of the `ny_loc` local arrival rows, [ny_loc] int32.
+
+  Rows that only exist as padding of the last shard are clipped to the last
+  physical row `n_lat - 1`.
+  """
+  return jnp.minimum(j_offset + jnp.arange(ny_loc, dtype=jnp.int32), n_lat - 1)
+
+
+def _buffer_window_start(
+    win_start: jax.Array,
+    buf_origin: int | jax.Array,
+    n_buffer: int,
+    size: int,
+) -> jax.Array:
+  """Start of a `size`-node window within the local buffer.
+
+  `win_start` indexes the full source axis; the buffer holds source nodes
+  `buf_origin ... buf_origin + n_buffer - 1`. The start is clipped so the
+  window lies inside the buffer.
+  """
+  return jnp.clip(win_start - buf_origin, 0, n_buffer - size)
+
+
+def _lat_window_starts(
+    j_global: jax.Array,
+    first_row: jax.Array,
+    n_source: int,
+    n_buffer: int,
+    size: int,
+    buf_origin: int | jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+  """Start rows of the per-arrival-row latitude windows, each [ny_loc] int32.
+
+  The window of arrival row `j` covers the `size` consecutive rows
+  `win_start[j] ... win_start[j] + size - 1` of an axis of `n_source` rows.
+  `first_row[j]` is the unclipped first row the caller wants covered (for
+  the stencil windows of `_window_size`: the first stencil row of a query
+  with zero displacement, minus the half-width). `win_start` is `first_row`
+  clipped to `[0, n_source - size]`, so near the ends of the axis the window
+  stops sliding and covers the first or last `size` rows; when the window is
+  the whole axis it is 0 and `first_row` is not used. `buf_start` is the same
+  start expressed within the local buffer (see `_buffer_window_start`).
+
+  Args:
+    j_global: global arrival rows, from `_arrival_lat_rows`.
+    first_row: unclipped first row of each window, same shape as `j_global`.
+    n_source: number of rows of the (halo-extended) source axis.
+    n_buffer: number of rows held in the local buffer.
+    size: window size from `_window_size`.
+    buf_origin: source row of the first row of the local buffer.
+
+  Returns:
+    `(win_start, buf_start)`.
+  """
+  if size == n_source:
+    win_start = jnp.zeros_like(j_global)
+  else:
+    win_start = jnp.clip(first_row, 0, n_source - size)
+  return win_start, _buffer_window_start(win_start, buf_origin, n_buffer, size)
+
+
+def _z_window_start(
+    first_level: jax.Array, n_source: int, size: int
+) -> jax.Array:
+  """Start level of the vertical window of a query level, int32 scalar.
+
+  The window covers the `size` consecutive source levels
+  `start ... start + size - 1` out of `n_source`. `first_level` is the
+  unclipped first level the caller wants covered (the first stencil level of
+  a query with zero displacement, minus the half-width). The start is
+  `first_level` clipped to `[0, n_source - size]`, so near the ends of the
+  axis the window stops sliding and covers the first or last `size` levels;
+  when the window is the whole axis it is 0 and `first_level` is not used.
+  """
+  if size == n_source:
+    return jnp.int32(0)
+  return jnp.clip(first_level, 0, n_source - size)
+
+
 def _validate_interpolation_method(method: str | None) -> None:
   if method is not None and method not in _INTERPOLATION_METHODS:
     raise ValueError(
@@ -886,9 +987,9 @@ def _matmul_2d_local(
   n_lat = grid.latitude_nodes
   n_lat_ext = n_lat + 2 * _HALO_WIDTH
   nx_loc, ny_loc = lon_q.shape
-  eff_lat_shift = max(1, max_lat_shift)
+  eff_lat_shift = _effective_window_shift(max_lat_shift)
   s_lat = 2 if order == 'linear' else 4
-  w_lat_size = min(n_lat_buf, min(n_lat_ext, 2 * eff_lat_shift + s_lat))
+  w_lat_size = _window_size(n_lat_buf, n_lat_ext, eff_lat_shift, s_lat)
   lat_start_offset = (2 if order == 'linear' else 1) - eff_lat_shift
 
   (
@@ -901,17 +1002,14 @@ def _matmul_2d_local(
       _,
   ) = _horizontal_stencil_tuple(grid, lon_q, sin_lat_q, order)
 
-  j_global = jnp.minimum(
-      j_offset + jnp.arange(ny_loc, dtype=jnp.int32), n_lat - 1
-  )
-  if w_lat_size == n_lat_ext:
-    win_lat_start = jnp.zeros_like(j_global)
-  else:
-    win_lat_start = jnp.clip(
-        j_global + lat_start_offset, 0, n_lat_ext - w_lat_size
-    )
-  buf_lat_start = jnp.clip(
-      win_lat_start - buf_lat_origin, 0, n_lat_buf - w_lat_size
+  j_global = _arrival_lat_rows(j_offset, ny_loc, n_lat)
+  win_lat_start, buf_lat_start = _lat_window_starts(
+      j_global,
+      j_global + lat_start_offset,
+      n_lat_ext,
+      n_lat_buf,
+      w_lat_size,
+      buf_lat_origin,
   )
   # Place `w_lat_size` before `ny_loc` so `(c_cur, w_lat_size)` is already
   # contiguous after `dot(f_2d, m_lat_2d_t)` — avoiding 4-D transposes and
@@ -943,19 +1041,16 @@ def _matmul_2d_local(
   )  # [ny_loc, nx_loc, w_lat_size]
 
   if limiter is not None:
-    w_lat_cell_size = min(
-        n_lat_buf - 1, min(n_lat_ext - 1, 2 * eff_lat_shift + 2)
+    w_lat_cell_size = _window_size(
+        n_lat_buf - 1, n_lat_ext - 1, eff_lat_shift, 2
     )
-    if w_lat_cell_size == n_lat_ext - 1:
-      win_lat_cell_start = jnp.zeros_like(j_global)
-    else:
-      win_lat_cell_start = jnp.clip(
-          j_global + 1 - eff_lat_shift, 0, (n_lat_ext - 1) - w_lat_cell_size
-      )
-    buf_lat_cell_start = jnp.clip(
-        win_lat_cell_start - buf_lat_origin,
-        0,
-        (n_lat_buf - 1) - w_lat_cell_size,
+    win_lat_cell_start, buf_lat_cell_start = _lat_window_starts(
+        j_global,
+        j_global + 1 - eff_lat_shift,
+        n_lat_ext - 1,
+        n_lat_buf - 1,
+        w_lat_cell_size,
+        buf_lat_origin,
     )
     m_lat_cell_win = jax.nn.one_hot(
         jnp.arange(w_lat_cell_size, dtype=jnp.int32)[:, jnp.newaxis]
@@ -1983,28 +2078,25 @@ def _matmul_3d_local(
   l_q_loc, nx_loc, ny_loc = lon_q.shape
 
   eff_limiter = limiter if limited_channel_start < num_channels else None
-  eff_lat_shift = max(1, max_lat_shift)
-  eff_z_shift = max(1, max_vertical_shift)
+  eff_lat_shift = _effective_window_shift(max_lat_shift)
+  eff_z_shift = _effective_window_shift(max_vertical_shift)
   s_lat = 2 if order == 'linear' else 4
   s_z = 2 if vertical_order == 'linear' else 4
-  w_lat_size = min(n_lat_buf, min(n_lat_ext, 2 * eff_lat_shift + s_lat))
-  w_z_size = min(l_buf, min(l_src, 2 * eff_z_shift + s_z))
+  w_lat_size = _window_size(n_lat_buf, n_lat_ext, eff_lat_shift, s_lat)
+  w_z_size = _window_size(l_buf, l_src, eff_z_shift, s_z)
   lat_start_offset = (2 if order == 'linear' else 1) - eff_lat_shift
   z_start_offset = (
       -eff_z_shift if vertical_order == 'linear' else (-eff_z_shift - 1)
   )
 
-  j_global = jnp.minimum(
-      j_offset + jnp.arange(ny_loc, dtype=jnp.int32), n_lat - 1
-  )
-  if w_lat_size == n_lat_ext:
-    win_lat_start = jnp.zeros_like(j_global)
-  else:
-    win_lat_start = jnp.clip(
-        j_global + lat_start_offset, 0, n_lat_ext - w_lat_size
-    )
-  buf_lat_start = jnp.clip(
-      win_lat_start - buf_lat_origin, 0, n_lat_buf - w_lat_size
+  j_global = _arrival_lat_rows(j_offset, ny_loc, n_lat)
+  win_lat_start, buf_lat_start = _lat_window_starts(
+      j_global,
+      j_global + lat_start_offset,
+      n_lat_ext,
+      n_lat_buf,
+      w_lat_size,
+      buf_lat_origin,
   )
   # Build `m_lat_win` in `[ny_loc, w_lat_size, n_lat_buf]` so `dot(m_lat_2d, ...)`
   # keeps `n_lon` in `axis=-1` without cross-lane minor-axis transposes.
@@ -2035,19 +2127,16 @@ def _matmul_3d_local(
   win_lat_cell_start = None
   m_lat_cell_2d = None
   if eff_limiter is not None:
-    w_lat_cell_size = min(
-        n_lat_buf - 1, min(n_lat_ext - 1, 2 * eff_lat_shift + 2)
+    w_lat_cell_size = _window_size(
+        n_lat_buf - 1, n_lat_ext - 1, eff_lat_shift, 2
     )
-    if w_lat_cell_size == n_lat_ext - 1:
-      win_lat_cell_start = jnp.zeros_like(j_global)
-    else:
-      win_lat_cell_start = jnp.clip(
-          j_global + 1 - eff_lat_shift, 0, (n_lat_ext - 1) - w_lat_cell_size
-      )
-    buf_lat_cell_start = jnp.clip(
-        win_lat_cell_start - buf_lat_origin,
-        0,
-        (n_lat_buf - 1) - w_lat_cell_size,
+    win_lat_cell_start, buf_lat_cell_start = _lat_window_starts(
+        j_global,
+        j_global + 1 - eff_lat_shift,
+        n_lat_ext - 1,
+        n_lat_buf - 1,
+        w_lat_cell_size,
+        buf_lat_origin,
     )
     m_lat_cell_win = jax.nn.one_hot(
         buf_lat_cell_start[:, jnp.newaxis]
@@ -2058,7 +2147,7 @@ def _matmul_3d_local(
     m_lat_cell_2d = m_lat_cell_win.reshape(
         ny_loc * w_lat_cell_size, n_lat_buf - 1
     )
-    w_z_cell_size = min(l_buf - 1, min(l_src - 1, 2 * eff_z_shift + 2))
+    w_z_cell_size = _window_size(l_buf - 1, l_src - 1, eff_z_shift, 2)
 
   need_separate_trilinear = trilinear_channel_start is not None and not (
       order == 'linear' and vertical_order == 'linear'
@@ -2203,7 +2292,7 @@ def _matmul_3d_local(
   sigma_q_t = jnp.swapaxes(sigma_q, 1, 2)
   k_arr = jnp.arange(l_q_loc, dtype=jnp.int32)
   m_arange = jnp.arange(n_lon, dtype=jnp.int32)[:, jnp.newaxis]
-  w_z_lin_size = min(l_buf, min(l_src, 2 * eff_z_shift + 2))
+  w_z_lin_size = _window_size(l_buf, l_src, eff_z_shift, 2)
   lat_arange = jnp.arange(w_lat_size, dtype=jnp.int32)[:, jnp.newaxis]
   c0_lon_pos = 0 if order == 'linear' else 1
   dot_prec_tri = (
@@ -2363,14 +2452,11 @@ def _matmul_3d_local(
           alpha_lon = alpha_lat = alpha_z = None
 
         k_glob = jnp.minimum(k_offset + k0_s, l_src - 1)
-        if w_z_blk_size == l_src:
-          win_z_start = jnp.int32(0)
-        else:
-          win_z_start = jnp.clip(
-              k_glob + z_start_offset, 0, l_src - w_z_blk_size
-          )
-        buf_z_start = jnp.clip(
-            win_z_start - buf_z_origin, 0, l_buf - w_z_blk_size
+        win_z_start = _z_window_start(
+            k_glob + z_start_offset, l_src, w_z_blk_size
+        )
+        buf_z_start = _buffer_window_start(
+            win_z_start, buf_z_origin, l_buf, w_z_blk_size
         )
 
         oh_lon = tuple(
@@ -2428,15 +2514,11 @@ def _matmul_3d_local(
             buf_z_lin_start = buf_z_start
             w_z_lin_mat = w_z_mat
           else:
-            win_z_lin_start = (
-                jnp.int32(0)
-                if w_z_lin_blk_size == l_src
-                else jnp.clip(
-                    k_glob - eff_z_shift, 0, l_src - w_z_lin_blk_size
-                )
+            win_z_lin_start = _z_window_start(
+                k_glob - eff_z_shift, l_src, w_z_lin_blk_size
             )
-            buf_z_lin_start = jnp.clip(
-                win_z_lin_start - buf_z_origin, 0, l_buf - w_z_lin_blk_size
+            buf_z_lin_start = _buffer_window_start(
+                win_z_lin_start, buf_z_origin, l_buf, w_z_lin_blk_size
             )
             a_z = alpha_z[:, jnp.newaxis, :]
             z_rel = (lvl_c0 - win_z_lin_start)[:, jnp.newaxis, :]
@@ -2528,16 +2610,11 @@ def _matmul_3d_local(
               and z_cell_blk_arange is not None
               and lat_cell_arange is not None
           )
-          if w_z_cell_blk_size == l_src - 1:
-            win_z_cell_start = jnp.int32(0)
-          else:
-            win_z_cell_start = jnp.clip(
-                k_glob - eff_z_shift, 0, (l_src - 1) - w_z_cell_blk_size
-            )
-          buf_z_cell_start = jnp.clip(
-              win_z_cell_start - buf_z_origin,
-              0,
-              (l_buf - 1) - w_z_cell_blk_size,
+          win_z_cell_start = _z_window_start(
+              k_glob - eff_z_shift, l_src - 1, w_z_cell_blk_size
+          )
+          buf_z_cell_start = _buffer_window_start(
+              win_z_cell_start, buf_z_origin, l_buf - 1, w_z_cell_blk_size
           )
           p_lon_mat = oh_lon[c0_lon_pos]
           p_z_mat = (
@@ -3252,23 +3329,20 @@ def _matmul_3d_wind_and_sigma_dot_local(
   _, l_buf_b, _, _ = sd_buf.shape
   l_q_loc, nx_loc, ny_loc = lon_q.shape
 
-  eff_lat_shift = max(1, max_lat_shift)
-  eff_z_shift = max(1, max_vertical_shift)
-  w_lat_size = min(n_lat_buf, min(n_lat_ext, 2 * eff_lat_shift + 2))
-  w_z_c_size = min(l_buf_c, min(l_src_c, 2 * eff_z_shift + 2))
-  w_z_b_size = min(l_buf_b, min(l_src_b, 2 * eff_z_shift + 2))
+  eff_lat_shift = _effective_window_shift(max_lat_shift)
+  eff_z_shift = _effective_window_shift(max_vertical_shift)
+  w_lat_size = _window_size(n_lat_buf, n_lat_ext, eff_lat_shift, 2)
+  w_z_c_size = _window_size(l_buf_c, l_src_c, eff_z_shift, 2)
+  w_z_b_size = _window_size(l_buf_b, l_src_b, eff_z_shift, 2)
 
-  j_global = jnp.minimum(
-      j_offset + jnp.arange(ny_loc, dtype=jnp.int32), n_lat - 1
-  )
-  if w_lat_size == n_lat_ext:
-    win_lat_start = jnp.zeros_like(j_global)
-  else:
-    win_lat_start = jnp.clip(
-        j_global + 2 - eff_lat_shift, 0, n_lat_ext - w_lat_size
-    )
-  buf_lat_start = jnp.clip(
-      win_lat_start - buf_lat_origin, 0, n_lat_buf - w_lat_size
+  j_global = _arrival_lat_rows(j_offset, ny_loc, n_lat)
+  win_lat_start, buf_lat_start = _lat_window_starts(
+      j_global,
+      j_global + 2 - eff_lat_shift,
+      n_lat_ext,
+      n_lat_buf,
+      w_lat_size,
+      buf_lat_origin,
   )
   m_lat_win = jax.nn.one_hot(
       buf_lat_start[:, jnp.newaxis]
@@ -3370,15 +3444,11 @@ def _matmul_3d_wind_and_sigma_dot_local(
     )
 
     k_glob_c = jnp.minimum(k0_s, l_src_c - 1)
-    win_z_c_start = (
-        jnp.int32(0)
-        if w_z_c_blk == l_src_c
-        else jnp.clip(k_glob_c - eff_z_shift, 0, l_src_c - w_z_c_blk)
+    win_z_c_start = _z_window_start(
+        k_glob_c - eff_z_shift, l_src_c, w_z_c_blk
     )
-    win_z_b_start = (
-        jnp.int32(0)
-        if w_z_b_blk == l_src_b
-        else jnp.clip(k_glob_c - eff_z_shift, 0, l_src_b - w_z_b_blk)
+    win_z_b_start = _z_window_start(
+        k_glob_c - eff_z_shift, l_src_b, w_z_b_blk
     )
 
     w_lon_mat = sum(
