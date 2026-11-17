@@ -279,23 +279,6 @@ def _resolve_rhs_binary_dot_precision(
   return jax_numpy_utils.resolve_dot_precision(None, lhs, rhs)
 
 
-def _lagrange_weights(x: Array, nodes: Array) -> jnp.ndarray:
-  """Computes Lagrange interpolation weights.
-
-  Args:
-    x: coordinates at which to interpolate, of shape [...].
-    nodes: stencil node coordinates, of shape [..., stencil_size]. Nodes need
-      not be uniformly spaced.
-
-  Returns:
-    Weights of shape [..., stencil_size] that are exact for polynomials of
-    degree `stencil_size - 1`.
-  """
-  stencil_size = nodes.shape[-1]
-  node_tuple = tuple(nodes[..., i] for i in range(stencil_size))
-  return jnp.stack(_lagrange_weights_tuple(x, node_tuple), axis=-1)
-
-
 def _contract_stencil(values: Array, *weights: Array) -> jnp.ndarray:
   """Contracts gathered stencil values with per-dimension weights.
 
@@ -734,21 +717,6 @@ def _interpolate_horizontal_from_flat_index(
         corners.max(axis=(-2, -1)),
     )
   return result
-
-
-def _interpolate_horizontal(
-    field: Array,
-    grid: spherical_harmonic.Grid,
-    stencil: _HorizontalStencil,
-    order: str,
-    limiter: str | None,
-) -> jnp.ndarray:
-  """Interpolates a single [lon, lat] field with a precomputed stencil."""
-  extended = _extend_with_pole_halo(field, grid)
-  flat_index = _gather_2d_flat_index(stencil)
-  return _interpolate_horizontal_from_flat_index(
-      extended, flat_index, stencil, order, limiter
-  )
 
 
 def _matmul_2d_points(
@@ -1478,50 +1446,6 @@ def _vertical_stencil_tuple(
   )
   base = (level_indices, level_weights, bracket_offset, level_cell)
   return (*base, fraction) if include_linear_fractions else base
-
-
-def _vertical_stencil(
-    sigma: Array,
-    sigma_nodes: Array,
-    vertical_order: Literal['linear', 'cubic'],
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-  """Returns (level_index, level_weights, bracket_offset) for the vertical.
-
-  σ is clipped to the node range first, so boundary weights saturate and
-  interpolation never extrapolates (constant extrapolation beyond the first
-  and last nodes). 'linear' uses the two bracketing nodes. 'cubic' uses a
-  4-point Lagrange stencil on the (possibly non-uniform) nodes, degraded to
-  linear within the first and last cells — the standard operational rule
-  (e.g. IFS), which also keeps the no-extrapolation property exact.
-  `bracket_offset` is the position of the lower bracketing node within the
-  stencil (needed by the quasi-monotone limiter, which clips against the
-  bracketing cell only).
-  """
-  level_indices, level_weights, bracket_offset, _ = _vertical_stencil_tuple(
-      sigma, sigma_nodes, vertical_order
-  )
-  return (
-      jnp.stack(level_indices, axis=-1),
-      jnp.stack(level_weights, axis=-1),
-      bracket_offset,
-  )
-
-
-def _bracketing_level_corners(
-    corners: Array, bracket_offset: Array
-) -> jnp.ndarray:
-  """Restricts corner values to the two levels bracketing the departure σ.
-
-  The quasi-monotone limiter must clip against the bracketing cell only:
-  including outer stencil levels would admit values the departure point
-  does not lie between. For the linear vertical stencil the offset is zero
-  and this selection is the identity.
-  """
-  index = (
-      bracket_offset[..., jnp.newaxis, jnp.newaxis, jnp.newaxis]
-      + np.arange(2)[:, np.newaxis, np.newaxis]
-  )
-  return jnp.take_along_axis(corners, index, axis=-3)
 
 
 def _interpolate_3d_gather(
@@ -3112,8 +3036,7 @@ def _interpolate_3d_mixed(
     )
 
   if (
-      resolved == 'matmul'
-      and c_total > 0
+      c_total > 0
       and lon.size > 0
       and lon.ndim == 3
       and lon.shape[1:] == grid.nodal_shape
