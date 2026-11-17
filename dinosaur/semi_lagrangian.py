@@ -2105,11 +2105,14 @@ def _matmul_3d_local(
         outs.append(res)
     out_full = outs[0] if len(outs) == 1 else jnp.concatenate(outs, axis=0)
     if trilinear_channel_start is not None:
-      out_lin_full = (
-          outs_lin[0]
-          if len(outs_lin) == 1
-          else jnp.concatenate(outs_lin, axis=0)
-      )
+      # No trilinear channels at all (`trilinear_channel_start == C`) leaves
+      # `outs_lin` empty; the gather method returns an empty trilinear block.
+      if not outs_lin:
+        out_lin_full = jnp.zeros((0, l_q_loc, nx_loc, ny_loc), dtype=dtype)
+      elif len(outs_lin) == 1:
+        out_lin_full = outs_lin[0]
+      else:
+        out_lin_full = jnp.concatenate(outs_lin, axis=0)
       return out_full, out_lin_full
     return out_full
 

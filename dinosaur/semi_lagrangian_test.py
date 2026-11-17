@@ -966,6 +966,42 @@ class MatmulInterpolationTest(parameterized.TestCase):
       )
     jax.clear_caches()
 
+  @parameterized.parameters('gather', 'matmul')
+  def test_interpolate_3d_mixed_no_trilinear_channels(self, method):
+    # `trilinear_channel_start == C` leaves no trilinear channels; with more
+    # channels than one MXU chunk and a limiter split the matmul method used
+    # to have no trilinear chunk to concatenate.
+    grid = spherical_harmonic.Grid.T21()
+    layers = 8
+    centers = sigma_coordinates.SigmaCoordinates.equidistant(layers).centers
+    lon_mesh, sin_lat_mesh = grid.nodal_mesh
+    shape = (layers,) + grid.nodal_shape
+    lon = jnp.broadcast_to(jnp.asarray(lon_mesh, jnp.float32), shape)
+    sin_lat = jnp.broadcast_to(jnp.asarray(sin_lat_mesh, jnp.float32), shape)
+    sigma = jnp.broadcast_to(
+        jnp.asarray(centers, jnp.float32)[:, np.newaxis, np.newaxis], shape
+    )
+    num_channels = 10
+    fields = jnp.ones((num_channels, layers) + grid.nodal_shape, jnp.float32)
+    out, out_lin = semi_lagrangian._interpolate_3d_mixed(
+        fields,
+        grid,
+        lon,
+        sin_lat,
+        sigma,
+        centers,
+        order='cubic',
+        limiter='quasi_monotone',
+        limited_channel_start=4,
+        trilinear_channel_start=num_channels,
+        vertical_order='cubic',
+        method=method,
+    )
+    self.assertEqual(out.shape, (num_channels,) + shape)
+    self.assertEqual(out_lin.shape, (0,) + shape)
+    self.assertEqual(out_lin.dtype, fields.dtype)
+    np.testing.assert_allclose(out, 1.0, atol=1e-5)
+
   def test_interpolate_3d_mixed_partial_limiting_and_trilinear(self):
     grid = spherical_harmonic.Grid.T21()
     coords = coordinate_systems.CoordinateSystem(
