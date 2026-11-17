@@ -24,6 +24,7 @@ switching modes per-test inside `semi_lagrangian_test.py`.
 """
 
 import functools
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -32,6 +33,7 @@ from dinosaur import primitive_equations
 from dinosaur import primitive_equations_states
 from dinosaur import scales
 from dinosaur import semi_lagrangian
+from dinosaur import semi_lagrangian_test
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
@@ -928,6 +930,63 @@ class SemiLagrangianGradientTest(parameterized.TestCase):
           gradient[direction], finite_difference, rtol=1e-4,
           err_msg=f'{direction=}',
       )
+
+
+class WindowClampFloat64Test(parameterized.TestCase):
+  """The window clamp, checked tightly in float64 (see `WindowClampTest`)."""
+
+  @parameterized.product(
+      order=('linear', 'cubic'),
+      limiter=(None, 'quasi_monotone'),
+  )
+  def test_out_of_window_interpolation_is_at_clamped_points(
+      self, order, limiter
+  ):
+    grid = spherical_harmonic.Grid.T21()
+    layers = 12
+    centers = sigma_coordinates.SigmaCoordinates.equidistant(layers).centers
+    lon, sin_lat, sigma = semi_lagrangian_test._far_queries(
+        grid, layers, seed=1, dtype=np.float64
+    )
+    field = jnp.asarray(
+        1.0
+        + np.abs(
+            np.random.RandomState(2).normal(size=(2, layers) + grid.nodal_shape)
+        )
+    )
+    ref = jnp.asarray(np.linspace(220.0, 295.0, layers)) if limiter else None
+    kw = dict(
+        order=order,
+        limiter=limiter,
+        vertical_order='cubic',
+        limiter_bound_reference=ref,
+    )
+    shift = semi_lagrangian_test._SHIFT
+    windows = dict(max_lat_shift=shift, max_vertical_shift=shift)
+    out_g = semi_lagrangian.interpolate_3d(
+        field, grid, lon, sin_lat, sigma, centers, method='gather',
+        **kw, **windows,
+    )
+    out_m = semi_lagrangian.interpolate_3d(
+        field, grid, lon, sin_lat, sigma, centers, method='matmul',
+        **kw, **windows,
+    )
+    with mock.patch.object(jax, 'default_backend', return_value='tpu'):
+      jax.clear_caches()
+      out_t = semi_lagrangian.interpolate_3d(
+          field, grid, lon, sin_lat, sigma, centers, method='matmul',
+          **kw, **windows,
+      )
+    jax.clear_caches()
+    sl_c, sg_c = semi_lagrangian_test._reference_clamp(
+        grid, centers, sin_lat, sigma, order, shift
+    )
+    out_ref = semi_lagrangian.interpolate_3d(
+        field, grid, lon, sl_c, sg_c, centers, method='gather', **kw,
+        max_lat_shift=None, max_vertical_shift=None,
+    )
+    for out in (out_g, out_m, out_t):
+      np.testing.assert_allclose(out, out_ref, rtol=0, atol=1e-11)
 
 
 if __name__ == '__main__':
