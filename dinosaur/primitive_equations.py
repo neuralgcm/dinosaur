@@ -2211,12 +2211,18 @@ def _passive_tracers_skip_transport(
 ) -> bool:
   """Whether the predictor stage may leave passive tracers untransported.
 
-  The predictor-stage output is only consumed by `implicit_inverse` and by
-  the non-advective terms and velocities evaluated at the predicted state.
-  For the library's own methods none of them reads a tracer that does not
-  couple to the dynamics (`humidity_key`, `cloud_keys`), so transporting the
-  others there is wasted work. That holds only while the equation uses the
-  library's own `explicit_nonadvective_terms` and `implicit_inverse`.
+  Invariant: the shortcut is valid only if nothing evaluated on the
+  predictor state reads a tracer that does not couple to the dynamics
+  (`humidity_key`, `cloud_keys`). The predictor state is consumed by
+  `implicit_inverse` and, in the corrector stage, by `nonadvective_terms` and
+  `nodal_velocities` (or their fused form
+  `nonadvective_terms_and_velocities`); its transported passive tracers
+  would otherwise be discarded, so leaving them untransported saves their
+  interpolation. The library's own implementations of those methods, and of
+  `explicit_nonadvective_terms` which they call, read only the dynamics
+  tracers. An override cannot be assumed to, so if any of them is
+  overridden on the class or the instance the full transport is used.
+
   The low-order nodal fields of `return_nodal_tracers_linear` need every
   nodal tracer transported, so requesting them also rules the shortcut out.
 
@@ -2233,8 +2239,16 @@ def _passive_tracers_skip_transport(
   return (
       predictor_stage
       and not return_nodal_tracers_linear
-      and _uses_library_method(equation, 'explicit_nonadvective_terms')
-      and _uses_library_method(equation, 'implicit_inverse')
+      and all(
+          _uses_library_method(equation, name)
+          for name in (
+              'explicit_nonadvective_terms',
+              'nonadvective_terms',
+              'nodal_velocities',
+              'nonadvective_terms_and_velocities',
+              'implicit_inverse',
+          )
+      )
   )
 
 

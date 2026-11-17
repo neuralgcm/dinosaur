@@ -1743,6 +1743,76 @@ class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
     with self.subTest('mass approximately conserved'):
       self.assertLess(results[True]['mass_drift'], 0.05)
 
+  @parameterized.parameters('class', 'instance')
+  def test_predictor_stage_transports_tracers_read_by_overridden_terms(
+      self, override_on
+  ):
+    """The passive-tracer shortcut is off when `nonadvective_terms` is replaced.
+
+    In the predictor stage the library's own equations leave tracers that do
+    not couple to the dynamics untransported, because nothing evaluated on
+    the predictor state reads them. A replaced `nonadvective_terms` may read
+    them, so it must receive the transported tracer.
+    """
+    equation, state, _, _ = self._setup(humidity=True)
+    passive = primitive_equations_states.gaussian_scalar(
+        equation.coords, equation.physics_specs
+    )
+    state.tracers = {**state.tracers, 'passive': passive}
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    departure = equation.departure_points(equation.nodal_velocities(state), dt)
+
+    def passive_tracer_after_transport(eq, predictor_stage):
+      return eq.semi_lagrangian_transport(
+          state, departure, predictor_stage=predictor_stage
+      ).tracers['passive']
+
+    def heating_from_passive_tracer(eq, state):
+      library_terms = (
+          primitive_equations.SemiLagrangianPrimitiveEquations.nonadvective_terms
+      )
+      tendency = library_terms(eq, state)
+      return tendency.replace(
+          temperature_variation=(
+              tendency.temperature_variation + state.tracers['passive']
+          )
+      )
+
+    class ReadsPassiveTracer(
+        primitive_equations.SemiLagrangianPrimitiveEquations
+    ):
+
+      def nonadvective_terms(self, state):
+        return heating_from_passive_tracer(self, state)
+
+    transported = passive_tracer_after_transport(
+        equation, predictor_stage=False
+    )
+    with self.subTest('library equation skips passive tracers'):
+      np.testing.assert_array_equal(
+          passive_tracer_after_transport(equation, predictor_stage=True),
+          passive,
+      )
+      self.assertFalse(np.allclose(transported, passive))
+    if override_on == 'class':
+      overridden = ReadsPassiveTracer(
+          equation.reference_temperature,
+          equation.orography,
+          equation.coords,
+          equation.physics_specs,
+          humidity_key='specific_humidity',
+      )
+    else:
+      overridden = dataclasses.replace(equation)
+      overridden.nonadvective_terms = functools.partial(
+          heating_from_passive_tracer, overridden
+      )
+    with self.subTest('overridden terms receive the transported tracer'):
+      np.testing.assert_array_equal(
+          passive_tracer_after_transport(overridden, predictor_stage=True),
+          transported,
+      )
+
   def test_nodal_tracer_positivity(self):
     """Nodal tracer storage delivers exact non-negativity for sharp tracers.
 
