@@ -361,8 +361,9 @@ def coordinate_system_from_attrs(
       attrs[coordinate_systems.HORIZONTAL_COORD_TYPE_KEY]
   ]
   horizontal_attrs = {
-      f.name: attrs[f.name]
+      f.name: attrs[f.name] if f.name in attrs else f.default
       for f in dataclasses.fields(horizontal_coordinate_cls)
+      if f.name in attrs or f.default is not dataclasses.MISSING
   }
   horizontal_attrs.pop(spherical_harmonic.SPHERICAL_HARMONICS_IMPL_KEY, None)
   horizontal_attrs.pop(spherical_harmonic.SPMD_MESH_KEY, None)

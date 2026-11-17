@@ -15,6 +15,7 @@
 """Tests for spherical_harmonic."""
 
 import functools
+from typing import Any
 from absl.testing import absltest
 from absl.testing import parameterized
 from dinosaur import spherical_harmonic
@@ -81,6 +82,38 @@ class SphericalHarmonicTest(parameterized.TestCase):
         (lon_waves, latitude_nodes, tot_waves),
         basis.p.shape,
     )
+    self.assertIs(basis.p_fwd, basis.p)
+
+    ls_harmonics = spherical_harmonic.RealSphericalHarmonics(
+        **params, transform_method='least_squares'
+    )
+    ls_basis = ls_harmonics.basis
+    self.assertEqual(basis.p.shape, ls_basis.p_fwd.shape)
+    self.assertTrue(np.all(np.isfinite(ls_basis.p_fwd)))
+
+  def testBasisJaxArrayDeduplicationForQuadrature(self):
+    harmonics = spherical_harmonic.FastSphericalHarmonics(
+        longitude_wavenumbers=16,
+        total_wavenumbers=17,
+        longitude_nodes=32,
+        latitude_nodes=17,
+        latitude_spacing='equiangular_with_poles',
+        basis_as_jax_arrays=True,
+    )
+    self.assertIs(harmonics.basis.p_fwd, harmonics.basis.p)
+
+  def testInvalidTransformMethodRaises(self):
+    invalid_method: Any = 'invalid'
+    with self.assertRaisesRegex(ValueError, 'Unsupported `transform_method`'):
+      spherical_harmonic.RealSphericalHarmonics(
+          longitude_wavenumbers=8,
+          total_wavenumbers=9,
+          longitude_nodes=16,
+          latitude_nodes=8,
+          transform_method=invalid_method,
+      )
+    with self.assertRaisesRegex(ValueError, 'Unsupported `transform_method`'):
+      spherical_harmonic.Grid.T21(transform_method=invalid_method)
 
 
 class GridTest(parameterized.TestCase):
@@ -582,6 +615,192 @@ class GridTest(parameterized.TestCase):
     expected_u = np.array([[1, 1, 0], [1, 1, 0], [1, 1, 0], [1, 1, 0]])
     np.testing.assert_array_equal(clipped['u'], expected_u)
     self.assertEqual(clipped['time'], 1.0)
+
+  @parameterized.product(
+      grid_ctor=[
+          spherical_harmonic.Grid.T21,
+          spherical_harmonic.Grid.TL31,
+          spherical_harmonic.Grid.TL179,
+      ],
+      impl=[
+          spherical_harmonic.RealSphericalHarmonics,
+          spherical_harmonic.FastSphericalHarmonics,
+      ],
+  )
+  def testLeastSquaresMatchesQuadratureOnGaussianGrids(self, grid_ctor, impl):
+    quad_grid = grid_ctor(
+        spherical_harmonics_impl=impl, transform_method='quadrature'
+    )
+    ls_grid = grid_ctor(
+        spherical_harmonics_impl=impl, transform_method='least_squares'
+    )
+    # All resolved wavenumbers (up to total_wavenumbers - 1) have exact
+    # Gauss-Legendre quadrature on Gaussian grids.
+    np.testing.assert_allclose(
+        ls_grid.spherical_harmonics.basis.p_fwd[:, :, :-1],
+        quad_grid.spherical_harmonics.basis.p[:, :, :-1],
+        atol=1e-12,
+    )
+    rng = np.random.default_rng(0)
+    nodal = rng.standard_normal(quad_grid.nodal_shape)
+    np.testing.assert_allclose(
+        ls_grid.clip_wavenumbers(ls_grid.to_modal(nodal)),
+        quad_grid.clip_wavenumbers(quad_grid.to_modal(nodal)),
+        atol=1e-11,
+    )
+
+  @parameterized.product(
+      (
+          dict(
+              impl=spherical_harmonic.RealSphericalHarmonics,
+              f64_atol=1e-11,
+          ),
+          dict(
+              impl=functools.partial(
+                  spherical_harmonic.FastSphericalHarmonics,
+                  fourier_method='matmul',
+              ),
+              f64_atol=1e-11,
+          ),
+          dict(
+              impl=functools.partial(
+                  spherical_harmonic.FastSphericalHarmonics,
+                  fourier_method='fft',
+              ),
+              # _fft_forward_scale / _fft_inverse_scale store float32 scales.
+              f64_atol=2e-5,
+          ),
+          dict(
+              impl=functools.partial(
+                  spherical_harmonic.FastSphericalHarmonics,
+                  base_shape_multiple=8,
+                  reverse_einsum_arg_order=True,
+              ),
+              f64_atol=1e-11,
+          ),
+      ),
+      grid_params=[
+          dict(
+              longitude_wavenumbers=64,
+              total_wavenumbers=65,
+              longitude_nodes=128,
+              latitude_nodes=64,
+              latitude_spacing='equiangular',
+          ),
+          dict(
+              longitude_wavenumbers=120,
+              total_wavenumbers=121,
+              longitude_nodes=240,
+              latitude_nodes=121,
+              latitude_spacing='equiangular_with_poles',
+          ),
+          dict(
+              longitude_wavenumbers=180,
+              total_wavenumbers=181,
+              longitude_nodes=360,
+              latitude_nodes=181,
+              latitude_spacing='equiangular_with_poles',
+          ),
+      ],
+  )
+  def testLeastSquaresRoundTripOnEquiangularLinearGrids(
+      self, impl, f64_atol, grid_params
+  ):
+    ls_grid = spherical_harmonic.Grid(
+        **grid_params,
+        spherical_harmonics_impl=impl,
+        transform_method='least_squares',
+    )
+    modal = ls_grid.clip_wavenumbers(random_modal_state(ls_grid, seed=0))
+    # Also place unit amplitude in a high-degree zonal mode where quadrature
+    # fails badly on linear equiangular grids.
+    high_l = grid_params['total_wavenumbers'] - 2
+    modal = modal.at[0, high_l].set(1.0)
+
+    nodal_f64 = ls_grid.to_nodal(modal)
+    recovered_f64 = ls_grid.clip_wavenumbers(ls_grid.to_modal(nodal_f64))
+    np.testing.assert_allclose(recovered_f64, modal, atol=f64_atol)
+
+    with jax.enable_x64(False):
+      ls_grid_f32 = spherical_harmonic.Grid(
+          **grid_params,
+          spherical_harmonics_impl=impl,
+          basis_as_jax_arrays=True,
+          transform_method='least_squares',
+      )
+      nodal_f32 = jnp.asarray(nodal_f64, dtype=jnp.float32)
+      recovered_f32 = ls_grid_f32.clip_wavenumbers(
+          ls_grid_f32.to_modal(nodal_f32)
+      )
+      np.testing.assert_allclose(
+          recovered_f32, jnp.asarray(modal, dtype=jnp.float32), atol=5e-5
+      )
+
+  def testLeastSquares360x181MatchesTL179AndIsWellConditioned(self):
+    tl179 = spherical_harmonic.Grid.TL179(
+        spherical_harmonics_impl=spherical_harmonic.RealSphericalHarmonics
+    )
+    el180_quad = spherical_harmonic.Grid(
+        longitude_wavenumbers=180,
+        total_wavenumbers=181,
+        longitude_nodes=360,
+        latitude_nodes=181,
+        latitude_spacing='equiangular_with_poles',
+        spherical_harmonics_impl=spherical_harmonic.RealSphericalHarmonics,
+        transform_method='quadrature',
+    )
+    el180_ls = spherical_harmonic.Grid(
+        longitude_wavenumbers=180,
+        total_wavenumbers=181,
+        longitude_nodes=360,
+        latitude_nodes=181,
+        latitude_spacing='equiangular_with_poles',
+        spherical_harmonics_impl=spherical_harmonic.RealSphericalHarmonics,
+        transform_method='least_squares',
+    )
+
+    modal = tl179.clip_wavenumbers(random_modal_state(tl179, seed=42))
+    modal = modal.at[0, 179].set(1.0).at[1, 179].set(1.0)
+
+    nodal_tl179 = tl179.to_nodal(modal)
+    nodal_el180 = el180_ls.to_nodal(modal)
+
+    modal_tl179 = tl179.clip_wavenumbers(tl179.to_modal(nodal_tl179))
+    modal_quad = el180_quad.clip_wavenumbers(el180_quad.to_modal(nodal_el180))
+    modal_ls = el180_ls.clip_wavenumbers(el180_ls.to_modal(nodal_el180))
+
+    # Quadrature has O(1) error on high-degree low-m modes on 360x181.
+    self.assertGreater(np.max(np.abs(modal_quad - modal_tl179)), 0.5)
+    # Least-squares matches TL179 to machine precision across all l <= 179.
+    np.testing.assert_allclose(modal_ls, modal_tl179, atol=1e-11)
+
+    # Check conditioning of the weighted analysis operator sqrt(wp) * p_fwd
+    # across all zonal wavenumbers m (on 181 Clenshaw-Curtis nodes, polar cap
+    # weights scale as ~1/n_lat^2 so max ||sqrt(wp) * p_fwd||_2 is ~28.7).
+    _, wp = spherical_harmonic.get_latitude_nodes(181, 'equiangular_with_poles')
+    p_fwd = el180_ls.spherical_harmonics.basis.p_fwd
+    weighted_ops = np.sqrt(wp)[np.newaxis, :, np.newaxis] * p_fwd
+    op_norms = np.linalg.norm(weighted_ops, ord=2, axis=(1, 2))
+    self.assertLess(float(np.max(op_norms)), 35.0)
+
+    # Passing transform_method via functools.partial on spherical_harmonics_impl
+    # is also respected when Grid.transform_method is left at default.
+    el180_partial = spherical_harmonic.Grid(
+        longitude_wavenumbers=180,
+        total_wavenumbers=181,
+        longitude_nodes=360,
+        latitude_nodes=181,
+        latitude_spacing='equiangular_with_poles',
+        spherical_harmonics_impl=functools.partial(
+            spherical_harmonic.RealSphericalHarmonics,
+            transform_method='least_squares',
+        ),
+    )
+    np.testing.assert_allclose(
+        el180_partial.clip_wavenumbers(el180_partial.to_modal(nodal_el180)),
+        modal_tl179,
+        atol=1e-11,
+    )
 
 
 if __name__ == '__main__':
