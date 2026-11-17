@@ -2133,9 +2133,10 @@ def _semi_lagrangian_nonadvective_and_velocities(
   """Computes `(nonadvective_terms(state), nodal_velocities(state))` in one pass.
 
   The two share one diagnostic state. That is only equivalent to calling the
-  methods separately when `equation` uses the library's
-  `explicit_nonadvective_terms`; otherwise the methods are called
-  separately.
+  methods separately while `equation` uses the library's
+  `explicit_nonadvective_terms`, `nonadvective_terms` and `nodal_velocities`;
+  if any of them is overridden, the methods are called separately so the
+  override takes effect.
 
   Args:
     equation: the semi-Lagrangian equation.
@@ -2146,7 +2147,14 @@ def _semi_lagrangian_nonadvective_and_velocities(
   Returns:
     `(nonadvective_terms(state), nodal_velocities(state))`.
   """
-  if not _uses_library_method(equation, 'explicit_nonadvective_terms'):
+  if not all(
+      _uses_library_method(equation, name)
+      for name in (
+          'explicit_nonadvective_terms',
+          'nonadvective_terms',
+          'nodal_velocities',
+      )
+  ):
     return equation.nonadvective_terms(state), equation.nodal_velocities(state)
   tendency, aux_state, nodal_sp, modal_only = (
       _nonadvective_terms_with_diagnostics(

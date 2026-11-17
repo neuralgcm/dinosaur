@@ -335,5 +335,116 @@ class DigitalFilterInitiailizationTest(absltest.TestCase):
     np.testing.assert_allclose(expected, result, atol=1e-3)
 
 
+class ScalarSemiLagrangianODE(
+    time_integration.SemiLagrangianImplicitExplicitODE
+):
+  """`dx/dt = -x` with trajectories that do not move; records transports."""
+
+  def __init__(self):
+    self.transport_calls = []
+
+  def nonadvective_terms(self, state):
+    return -state
+
+  def implicit_terms(self, state):
+    return jnp.zeros_like(state)
+
+  def implicit_inverse(self, state, step_size):
+    return state
+
+  def nodal_velocities(self, state):
+    return jnp.zeros_like(state)
+
+  def departure_points(self, velocities, dt, initial_guess=None):
+    return velocities
+
+  def semi_lagrangian_transport(
+      self, state, departure, *, predictor_stage=False
+  ):
+    self.transport_calls.append(predictor_stage)
+    return state
+
+
+class LegacyTransportODE(ScalarSemiLagrangianODE):
+  """Overrides transport with the original `(state, departure)` signature."""
+
+  def semi_lagrangian_transport(self, state, departure):
+    self.transport_calls.append('legacy')
+    return state
+
+
+class PairedODE(ScalarSemiLagrangianODE):
+  """Evaluates `(nonadvective_terms, nodal_velocities)` in one call."""
+
+  def __init__(self):
+    super().__init__()
+    self.pair_calls = 0
+
+  def nonadvective_terms_and_velocities(self, state):
+    self.pair_calls += 1
+    return -state, jnp.zeros_like(state)
+
+
+class SemiLagrangianProtocolTest(absltest.TestCase):
+
+  def test_default_pair_is_the_two_separate_methods(self):
+    eq = ScalarSemiLagrangianODE()
+    x = jnp.arange(3.0)
+    n, v = eq.nonadvective_terms_and_velocities(x)
+    np.testing.assert_array_equal(n, eq.nonadvective_terms(x))
+    np.testing.assert_array_equal(v, eq.nodal_velocities(x))
+
+  def test_steppers_use_an_equations_own_pair(self):
+    x = jnp.arange(3.0)
+    eq = PairedODE()
+    time_integration.semi_lagrangian_crank_nicolson_rk2(eq, 0.1)(x)
+    self.assertEqual(eq.pair_calls, 2)  # once per stage
+    eq = PairedODE()
+    carry = time_integration.semi_lagrangian_settls_init(eq, 0.1)(x)
+    eq.pair_calls = 0
+    time_integration.semi_lagrangian_settls(eq, 0.1)(carry)
+    self.assertEqual(eq.pair_calls, 1)
+
+  def test_predictor_stage_is_flagged_only_for_the_predictor(self):
+    eq = ScalarSemiLagrangianODE()
+    time_integration.semi_lagrangian_crank_nicolson_rk2(eq, 0.1)(jnp.ones(3))
+    self.assertEqual(eq.transport_calls, [True, False])
+
+  def test_transport_without_predictor_stage_keyword_still_works(self):
+    x = jnp.arange(3.0)
+    legacy = LegacyTransportODE()
+    modern = ScalarSemiLagrangianODE()
+    np.testing.assert_array_equal(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(legacy, 0.1)(x),
+        time_integration.semi_lagrangian_crank_nicolson_rk2(modern, 0.1)(x),
+    )
+    self.assertEqual(legacy.transport_calls, ['legacy', 'legacy'])
+
+  def test_from_functions_transport_without_keyword_still_works(self):
+    eq = time_integration.SemiLagrangianImplicitExplicitODE.from_functions(
+        nonadvective_terms=lambda x: -x,
+        implicit_terms=jnp.zeros_like,
+        implicit_inverse=lambda x, eta: x,
+        nodal_velocities=jnp.zeros_like,
+        departure_points=lambda v, dt, initial_guess=None: v,
+        semi_lagrangian_transport=lambda x, departure: x,
+    )
+    x = jnp.arange(3.0)
+    expected = time_integration.semi_lagrangian_crank_nicolson_rk2(
+        ScalarSemiLagrangianODE(), 0.1
+    )(x)
+    np.testing.assert_array_equal(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(eq, 0.1)(x),
+        expected,
+    )
+
+  def test_time_reversed_equation_accepts_predictor_stage(self):
+    forward = LegacyTransportODE()
+    eq = time_integration.TimeReversedSemiLagrangianODE(forward)
+    x = jnp.arange(3.0)
+    time_integration.semi_lagrangian_crank_nicolson_rk2(eq, 0.1)(x)
+    self.assertEqual(forward.transport_calls, ['legacy', 'legacy'])
+
+
 if __name__ == '__main__':
   absltest.main()

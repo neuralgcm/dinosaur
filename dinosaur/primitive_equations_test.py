@@ -1813,6 +1813,43 @@ class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
           transported,
       )
 
+  def test_fused_terms_and_velocities_respect_overrides(self):
+    """The shared-diagnostics path is used only for the library's methods."""
+    equation, state, _, _ = self._setup(humidity=True)
+
+    class DoubledVelocities(
+        primitive_equations.SemiLagrangianPrimitiveEquations
+    ):
+
+      def nodal_velocities(self, state, aux_state=None):
+        velocities = super().nodal_velocities(state, aux_state)
+        return jax.tree_util.tree_map(lambda x: 2 * x, velocities)
+
+    overridden = DoubledVelocities(
+        equation.reference_temperature,
+        equation.orography,
+        equation.coords,
+        equation.physics_specs,
+        humidity_key='specific_humidity',
+    )
+    with self.subTest('library velocities'):
+      _, velocities = equation.nonadvective_terms_and_velocities(state)
+      jax.tree_util.tree_map(
+          np.testing.assert_array_equal,
+          velocities,
+          equation.nodal_velocities(state),
+      )
+    with self.subTest('overridden velocities'):
+      _, velocities = overridden.nonadvective_terms_and_velocities(state)
+      jax.tree_util.tree_map(
+          np.testing.assert_array_equal,
+          velocities,
+          overridden.nodal_velocities(state),
+      )
+      self.assertFalse(
+          np.allclose(velocities.u, equation.nodal_velocities(state).u)
+      )
+
   def test_nodal_tracer_positivity(self):
     """Nodal tracer storage delivers exact non-negativity for sharp tracers.
 
