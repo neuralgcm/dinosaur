@@ -282,19 +282,19 @@ def _resolve_rhs_binary_dot_precision(
 def _contract_stencil(values: Array, *weights: Array) -> jnp.ndarray:
   """Contracts gathered stencil values with per-dimension weights.
 
-  `values` has one trailing axis per weight vector (the tensor-product
-  stencil); each `weights[k]` has shape [..., stencil_size_k]. Production
-  SL codes evaluate this contraction as a cascade of 1-D interpolations so
-  the full stencil tensor never exists in memory; the XLA equivalent is
-  fusion. An einsum lowers to dot_general, whose operands must be
-  materialized — the gathered stencil tensor is written to memory — which
-  is the fastest form on CPU (0.55✕ the fused form) but measurably slower
-  on GPU, where a broadcast-multiply + reduce fuses with the producing
-  gather and skips the materialization (1.15–1.20✕ isolated on A100 at
-  T170/L32, and considerably more in a full model step, where the skipped
+  Used by the 2-D gather interpolation, where `values` has one trailing axis
+  per weight vector (the tensor-product stencil) and each `weights[k]` has
+  shape [..., stencil_size_k]. The contraction is an einsum on CPU, whose
+  dot_general operands are materialized: that is the fastest form on CPU
+  (0.55✕ the fused form) but measurably slower on GPU, where a
+  broadcast-multiply + reduce fuses with the producing gather and skips the
+  materialization (1.15–1.20✕ isolated on A100 at T170/L32, and
+  considerably more in a full model step, where the skipped
   materializations compound: 32.0 → 26.3 ms/step with linear vertical and
-  58.4 → 33.3 ms/step with cubic on the 2-day ERA5 benchmark). The
-  backend is known at trace time, so pick per platform.
+  58.4 → 33.3 ms/step with cubic on the 2-day ERA5 benchmark). The backend
+  is known at trace time, so the form is picked per platform. The 3-D
+  gather interpolation accumulates the vertical, longitude and latitude
+  stencils level by level itself and does not use this function.
   """
   if jax.default_backend() == 'cpu':
     n = len(weights)
@@ -1243,13 +1243,22 @@ class GridInterpolator:
       interpolated values are clipped to the range of the 2✕2 bracketing
       cell corners, which prevents new extrema (and preserves positivity)
       at the cost of formal accuracy at extrema.
-    method: 'gather' (1-D gather + fused contraction, fastest on single GPU),
-      'matmul' (MXU matrix multiplication without unstructured gather/scatter,
-      designed for TPU and SPMD sharding), or None (auto-selects 'matmul' on
-      TPU or when `grid.spmd_mesh` is set, and 'gather' otherwise).
-    max_lat_shift: maximum meridional displacement in latitude grid cells
-      around arrival nodes for windowed 'matmul' interpolation on grid-aligned
-      queries (None disables latitude windowing).
+    method: 'gather' (1-D gather + fused contraction, fastest on single GPU;
+      no window), 'matmul' (MXU matrix multiplication without unstructured
+      gather/scatter, designed for TPU and SPMD sharding; windowed, see
+      `max_lat_shift`), or None (auto-selects 'matmul' on TPU or when
+      `grid.spmd_mesh` is set, and 'gather' otherwise).
+    max_lat_shift: half-width, in latitude rows, of the window inside which
+      the 'matmul' method builds each query's stencil. For queries laid out
+      on the grid (`lon.shape == grid.nodal_shape`, or with a leading levels
+      axis) the window has `2 * max_lat_shift + stencil` latitude rows
+      (stencil is 2 for 'linear' and 4 for 'cubic'), starting `max_lat_shift`
+      rows before the first stencil row of a point that equals its arrival
+      node, clipped to the ends of the halo-extended latitude axis. A stencil
+      point outside the window contributes nothing, so the value is wrong
+      there (it is not clamped). A value of 0 is treated as 1. None disables
+      windowing, as does any other query layout (the queries are then
+      interpolated without a window). Ignored by 'gather'.
   """
 
   grid: spherical_harmonic.Grid
@@ -2117,7 +2126,7 @@ def _matmul_3d_local(
     return out_full
 
   # Pre-transpose query coordinates once outside `lax.scan` so `nx_loc` stays
-  # in `axis=-1` throughout `_scan_level` with zero per-level transposes.
+  # in `axis=-1` throughout `_scan_block` with zero per-level transposes.
   lon_q_t = jnp.swapaxes(lon_q, 1, 2)
   sin_lat_q_t = jnp.swapaxes(sin_lat_q, 1, 2)
   sigma_q_t = jnp.swapaxes(sigma_q, 1, 2)
@@ -2878,11 +2887,31 @@ def interpolate_3d(
       used to bound `T′ = T − T_ref(σ)` transport in full temperature,
       where a bound on T′ across levels with different `T_ref` would be
       gauge-dependent. Ignored without a limiter.
-    method: 'gather', 'matmul', or None (auto-selected per backend/mesh).
-    max_lat_shift: maximum meridional shift in latitude cells for windowed
-      grid-aligned 'matmul' interpolation (None disables windowing).
-    max_vertical_shift: maximum vertical shift in levels for windowed
-      grid-aligned 'matmul' interpolation (None disables windowing).
+    method: 'gather', 'matmul', or None (auto-selected: 'matmul' on TPU or
+      when `grid.spmd_mesh` is set, 'gather' otherwise). 'gather' reads the
+      stencil points directly and has no window. 'matmul' selects them with
+      one-hot matrix products built inside a fixed window around each
+      query's arrival point (see `max_lat_shift` and `max_vertical_shift`).
+    max_lat_shift: half-width, in latitude rows, of the 'matmul' window. For
+      queries laid out on the grid (`lon.shape == (layers, *grid.nodal_shape)`)
+      each query's stencil is built inside a window of
+      `2 * max_lat_shift + stencil` latitude rows (stencil is 2 for 'linear'
+      and 4 for 'cubic'). The window starts `max_lat_shift` rows before the
+      first stencil row of a departure point that equals its arrival point,
+      and is clipped to the ends of the halo-extended latitude axis. A
+      stencil point outside the window contributes nothing, so the value
+      is wrong there (it is not clamped). A value of 0 is treated as 1.
+      None disables windowing, as does any other query layout (the queries
+      are then interpolated without a window). Ignored by 'gather'.
+    max_vertical_shift: half-width, in levels, of the same window in the
+      vertical: `2 * max_vertical_shift + stencil` levels (stencil is 2 for
+      `vertical_order='linear'` and 4 for 'cubic'), starting
+      `max_vertical_shift` levels before the first stencil level of a
+      departure point that equals its arrival point, clipped to the ends of
+      `sigma_nodes`. A stencil point outside it contributes nothing. A value
+      of 0 is treated as 1. Windowing needs both shifts to be set; None for
+      either disables it. The limiter's bracketing-cell corners are read from
+      a window of the same half-width. Ignored by 'gather'.
 
   Returns:
     Interpolated values of shape `(*channels, *lon.shape)`.
@@ -3548,9 +3577,12 @@ def horizontal_departure_points(
     initial_guess: optional departure points to warm-start the iteration
       (e.g. a predictor stage's or the previous step's solution, following
       the IFS practice noted above); defaults to the arrival points.
-    method: 'gather', 'matmul', or None (auto-selected per backend/mesh).
-    max_lat_shift: maximum meridional shift in latitude cells for windowed
-      grid-aligned 'matmul' interpolation (None disables windowing).
+    method: 'gather', 'matmul', or None (auto-selected per backend/mesh); see
+      `interpolate_3d`.
+    max_lat_shift: latitude half-width of the 'matmul' window, in rows; the
+      wind interpolated at a trajectory midpoint that lies further than this
+      from its arrival row is wrong (not clamped). 0 is treated as 1, None
+      disables windowing, and 'gather' has no window. See `interpolate_3d`.
 
   Returns:
     DeparturePoints with fields of shape [*batch, longitude_nodes,
@@ -3694,11 +3726,14 @@ def departure_points_3d(
       `sigma_dot` the rate of change of that node coordinate).
     initial_guess: optional departure points to warm-start the iteration;
       defaults to the arrival points. See `horizontal_departure_points`.
-    method: 'gather', 'matmul', or None (auto-selected per backend/mesh).
-    max_lat_shift: maximum meridional shift in latitude cells for windowed
-      grid-aligned 'matmul' interpolation (None disables windowing).
-    max_vertical_shift: maximum vertical shift in levels for windowed
-      grid-aligned 'matmul' interpolation (None disables windowing).
+    method: 'gather', 'matmul', or None (auto-selected per backend/mesh); see
+      `interpolate_3d`.
+    max_lat_shift: latitude half-width of the 'matmul' window, in rows.
+    max_vertical_shift: vertical half-width of the 'matmul' window, in levels.
+      The winds and σ̇ interpolated at a trajectory midpoint that lies outside
+      either window are wrong (not clamped). A shift of 0 is treated as 1,
+      None for either disables windowing, and 'gather' has no window. See
+      `interpolate_3d`.
 
   Returns:
     DeparturePoints with fields of shape [layers, longitude_nodes,
@@ -3907,12 +3942,15 @@ def transport_scalar(
       increasing `.centers` node values (`SigmaCoordinates` or
       `VerticalNodes`).
     interpolator: interpolation rule (its grid, order, limiter, method, and
-      `max_lat_shift` settings are used).
+      `max_lat_shift` window settings are used).
     vertical_order: vertical interpolation order (see `interpolate_3d`).
     limiter_bound_reference: optional per-level bound shift for the
       limiter (see `interpolate_3d`).
-    max_vertical_shift: maximum vertical shift in levels for windowed
-      grid-aligned 'matmul' interpolation (None disables windowing).
+    max_vertical_shift: vertical half-width of the 'matmul' window, in levels;
+      the latitude half-width is the interpolator's `max_lat_shift`. A
+      departure point outside either window is interpolated wrongly (not
+      clamped). 0 is treated as 1, None disables windowing, and the 'gather'
+      method has no window. See `interpolate_3d`.
 
   Returns:
     The transported field(s) at arrival points, of shape
@@ -4041,8 +4079,11 @@ def transport_wind(
       caller's (u, v) must carry the state winds with coefficient exactly
       one (see `SemiLagrangianImplicitExplicitODE.semi_lagrangian_transport`).
     vertical_order: vertical interpolation order (see `interpolate_3d`).
-    max_vertical_shift: maximum vertical shift in levels for windowed
-      grid-aligned 'matmul' interpolation (None disables windowing).
+    max_vertical_shift: vertical half-width of the 'matmul' window, in levels;
+      the latitude half-width is the interpolator's `max_lat_shift`. A
+      departure point outside either window is interpolated wrongly (not
+      clamped). 0 is treated as 1, None disables windowing, and the 'gather'
+      method has no window. See `interpolate_3d`.
 
   Returns:
     Tuple (u, v) of transported winds at arrival points.
