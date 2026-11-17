@@ -1111,6 +1111,141 @@ def _gather_lat_with_halo(
   return jnp.concatenate([south, phys, north], axis=-1), iy * ny_loc, 0
 
 
+def _mesh_z_shards(mesh: jax.sharding.Mesh | None) -> int:
+  """Number of shards along the mesh's vertical axis 'z' (1 if it has none)."""
+  return mesh.shape['z'] if mesh is not None and 'z' in mesh.axis_names else 1
+
+
+def _edge_pad_levels(x: jax.Array, axis: int, n_padded: int) -> jax.Array:
+  """Pads the level axis `axis` of `x` to `n_padded` levels by edge values.
+
+  The level axis is sharded along 'z', so its length must be a multiple of the
+  number of z-shards (`_round_to_multiple`). The padded levels repeat the last
+  real level, so they stay valid inputs to the interpolation and are sliced
+  off the result by the caller. Returns `x` unchanged when no padding is
+  needed.
+  """
+  n = x.shape[axis]
+  if n_padded == n:
+    return x
+  pad_width = [(0, 0)] * x.ndim
+  pad_width[axis] = (0, n_padded - n)
+  return jnp.pad(x, pad_width, mode='edge')
+
+
+def _gather_longitude(
+    f_loc: jax.Array, grid: spherical_harmonic.Grid, x_shards: int
+) -> jax.Array:
+  """All-gathers longitude (axis -2) of a field sharded over 'x'.
+
+  Must be called inside a `shard_map` whose mesh has axis 'x'. `f_loc` has
+  shape [..., nx_loc, ny_loc]. Every stencil may reach any longitude (the
+  displacement limit `max_lat_shift` applies to latitude only), so each shard
+  needs all of them. The result is trimmed to the physical
+  `grid.longitude_nodes`, dropping the nodal padding that makes the axis
+  divisible by `x_shards`. With one x-shard there is nothing to gather.
+  """
+  if x_shards > 1:
+    f_x = lax.all_gather(f_loc, 'x', axis=f_loc.ndim - 2, tiled=True)
+  else:
+    f_x = f_loc
+  return f_x[..., : grid.longitude_nodes, :]
+
+
+def _gather_longitude_and_lat_halo(
+    f_loc: jax.Array,
+    grid: spherical_harmonic.Grid,
+    max_lat_shift: int,
+    x_shards: int,
+) -> tuple[jax.Array, int | jax.Array, int | jax.Array]:
+  """Shard-local buffer of a field sharded over (x, y), for `_matmul_*_local`.
+
+  Must be called inside a `shard_map` whose mesh has axes 'x' and 'y'. The
+  field `f_loc` has shape [..., nx_loc, ny_loc] (any leading axes, e.g.
+  [channels, levels]) and is sharded along x (longitude) and y (latitude).
+
+  Longitude is all-gathered over 'x' (`_gather_longitude`). Latitude is then
+  extended by `_gather_lat_with_halo`: pole halos
+  plus, between y-shards, a `max_lat_shift + _HALO_WIDTH` row halo exchanged by
+  `ppermute`. That width covers the latitude window of `_window_size` /
+  `_lat_window_starts` (half-width `max_lat_shift`, plus the stencil's own
+  rows). When the shard has fewer rows than the halo, or the latitude axis is
+  padded, the y axis is all-gathered instead; see `_gather_lat_with_halo`.
+
+  Args:
+    f_loc: local block [..., nx_loc, ny_loc].
+    grid: horizontal grid of the (global) field.
+    max_lat_shift: latitude window half-width of the interpolation.
+    x_shards: number of shards along mesh axis 'x'.
+
+  Returns:
+    `(buf, j_offset, buf_lat_origin)`: the buffer [..., longitude_nodes,
+    n_lat_buf], the global latitude row of this shard's first arrival row, and
+    the global (pole-extended) latitude row of the buffer's first row.
+  """
+  f_x = _gather_longitude(f_loc, grid, x_shards)
+  return _gather_lat_with_halo(f_x, grid, max_lat_shift)
+
+
+def _gather_z_with_halo(
+    f_xy_buf: jax.Array,
+    *,
+    z_shards: int,
+    n_src: int,
+    n_src_padded: int,
+    n_query: int,
+    n_query_loc: int,
+    max_vertical_shift: int,
+) -> tuple[jax.Array, int | jax.Array, int | jax.Array]:
+  """Shard-local vertical buffer of a z-sharded field for `_matmul_3d_local`.
+
+  Must be called inside a `shard_map`. `f_xy_buf` has shape [C, l_src_loc,
+  nx, ny_buf] (the output of `_gather_longitude_and_lat_halo`) with the level
+  axis 1 sharded along 'z' over `n_src_padded` levels, `n_src` of them real.
+
+  With one z-shard the buffer is the real levels. Otherwise, when the source
+  and query level counts agree (each shard's query levels are the arrival
+  levels of its own source levels), a halo of `max_vertical_shift + 2` levels
+  is exchanged between neighbouring z-shards by `ppermute`: it covers the
+  vertical window of `_window_size` / `_z_window_start` (half-width
+  `max_vertical_shift`, plus the stencil's own levels). The z axis is
+  all-gathered instead (and
+  trimmed to the real levels) when the halo does not fit in a shard
+  (`l_src_loc < max_vertical_shift + 2`), or the source and query level counts
+  differ, or the source levels were padded.
+
+  Args:
+    f_xy_buf: local block [C, l_src_loc, nx, ny_buf].
+    z_shards: number of shards along mesh axis 'z'.
+    n_src: number of real source levels.
+    n_src_padded: source levels after `_round_to_multiple` to `z_shards`.
+    n_query: number of real query levels.
+    n_query_loc: query levels held by this shard.
+    max_vertical_shift: vertical window half-width of the interpolation.
+
+  Returns:
+    `(buf, k_offset, buf_z_origin)`: the buffer, the global level of this
+    shard's first query level, and the global level of the buffer's first
+    level.
+  """
+  if z_shards == 1:
+    return f_xy_buf[:, :n_src, :, :], 0, 0
+  iz = lax.axis_index('z')
+  l_src_loc = f_xy_buf.shape[1]
+  h_z = max_vertical_shift + 2
+  if n_src == n_query and n_src == n_src_padded and l_src_loc >= h_z:
+    perm_down = [(s, (s + 1) % z_shards) for s in range(z_shards)]
+    perm_up = [(s, (s - 1) % z_shards) for s in range(z_shards)]
+    top_halo = lax.ppermute(f_xy_buf[:, -h_z:, :, :], 'z', perm=perm_down)
+    bot_halo = lax.ppermute(f_xy_buf[:, :h_z, :, :], 'z', perm=perm_up)
+    f_xyz_buf = jnp.concatenate([top_halo, f_xy_buf, bot_halo], axis=1)
+    return f_xyz_buf, iz * n_query_loc, iz * l_src_loc - h_z
+  f_xyz_buf = lax.all_gather(f_xy_buf, 'z', axis=1, tiled=True)[
+      :, :n_src, :, :
+  ]
+  return f_xyz_buf, iz * n_query_loc, 0
+
+
 def _gather_2d_flat_index(stencil: _HorizontalStencil) -> jax.Array:
   return (
       stencil.lon_index[..., :, jnp.newaxis] * stencil.extended_latitude_size
@@ -1433,13 +1568,8 @@ def _interpolate_2d_grid_matmul(
   q_spec = P('x', 'y')
 
   def _sharded(f_loc, lon_loc, sin_lat_loc, lat_lo_loc, lat_hi_loc):
-    if x_shards > 1:
-      f_x = lax.all_gather(f_loc, 'x', axis=1, tiled=True)
-    else:
-      f_x = f_loc
-    f_x = f_x[:, : grid.longitude_nodes, :]
-    f_xy_buf, j_offset, buf_lat_origin = _gather_lat_with_halo(
-        f_x, grid, max_lat_shift
+    f_xy_buf, j_offset, buf_lat_origin = _gather_longitude_and_lat_halo(
+        f_loc, grid, max_lat_shift, x_shards
     )
     return _matmul_2d_local(
         f_xy_buf,
@@ -1574,33 +1704,19 @@ def _interpolate_2d_multi(
         )
         return jnp.swapaxes(out_by_l, 0, 1)
 
-      z_shards = mesh.shape['z'] if 'z' in mesh.axis_names else 1
+      z_shards = _mesh_z_shards(mesh)
       x_shards = mesh.shape['x']
       l_pad = _round_to_multiple(levels, z_shards)
-      if l_pad > levels:
-        fields_pad = jnp.pad(
-            fields, [(0, 0), (0, l_pad - levels), (0, 0), (0, 0)], mode='edge'
-        )
-        lon_pad = jnp.pad(
-            lon, [(0, l_pad - levels), (0, 0), (0, 0)], mode='edge'
-        )
-        sin_lat_pad = jnp.pad(
-            sin_lat, [(0, l_pad - levels), (0, 0), (0, 0)], mode='edge'
-        )
-      else:
-        fields_pad, lon_pad, sin_lat_pad = fields, lon, sin_lat
+      fields_pad = _edge_pad_levels(fields, 1, l_pad)
+      lon_pad = _edge_pad_levels(lon, 0, l_pad)
+      sin_lat_pad = _edge_pad_levels(sin_lat, 0, l_pad)
       z_spec = 'z' if z_shards > 1 else None
       f_spec = P(None, z_spec, 'x', 'y')
       q_spec = P(z_spec, 'x', 'y')
 
       def _sharded_levels(f_loc, lon_loc, sin_lat_loc, lat_lo_loc, lat_hi_loc):
-        if x_shards > 1:
-          f_x = lax.all_gather(f_loc, 'x', axis=2, tiled=True)
-        else:
-          f_x = f_loc
-        f_x = f_x[:, :, : grid.longitude_nodes, :]
-        f_xy_buf, j_offset, buf_lat_origin = _gather_lat_with_halo(
-            f_x, grid, max_lat_shift
+        f_xy_buf, j_offset, buf_lat_origin = _gather_longitude_and_lat_halo(
+            f_loc, grid, max_lat_shift, x_shards
         )
         # Transpose level to axis 0 and scan across local levels
         f_by_l = jnp.swapaxes(f_xy_buf, 0, 1)
@@ -4077,9 +4193,7 @@ def _interpolate_3d_grid_matmul(
   sigma_nodes = jnp.asarray(sigma_nodes)
   mesh = grid.spmd_mesh
   lat_lo, lat_hi = _lat_clamp_bounds(grid, max_lat_shift, order, sin_lat.dtype)
-  z_shards = (
-      mesh.shape['z'] if mesh is not None and 'z' in mesh.axis_names else 1
-  )
+  z_shards = _mesh_z_shards(mesh)
   # Bounds for every (padded) query level; sharded along 'z' with them.
   sig_lo, sig_hi = _level_clamp_bounds(
       sigma_nodes,
@@ -4118,22 +4232,10 @@ def _interpolate_3d_grid_matmul(
   l_src_pad = _round_to_multiple(l_src, z_shards)
   l_q_pad = _round_to_multiple(l_q, z_shards)
 
-  f_pad = (
-      jnp.pad(
-          fields_4d,
-          [(0, 0), (0, l_src_pad - l_src), (0, 0), (0, 0)],
-          mode='edge',
-      )
-      if l_src_pad > l_src
-      else fields_4d
-  )
-  if l_q_pad > l_q:
-    q_pad_width = [(0, l_q_pad - l_q), (0, 0), (0, 0)]
-    lon_pad = jnp.pad(lon, q_pad_width, mode='edge')
-    sin_lat_pad = jnp.pad(sin_lat, q_pad_width, mode='edge')
-    sigma_pad = jnp.pad(sigma, q_pad_width, mode='edge')
-  else:
-    lon_pad, sin_lat_pad, sigma_pad = lon, sin_lat, sigma
+  f_pad = _edge_pad_levels(fields_4d, 1, l_src_pad)
+  lon_pad = _edge_pad_levels(lon, 0, l_q_pad)
+  sin_lat_pad = _edge_pad_levels(sin_lat, 0, l_q_pad)
+  sigma_pad = _edge_pad_levels(sigma, 0, l_q_pad)
 
   z_spec = 'z' if z_shards > 1 else None
   f_spec = P(None, z_spec, 'x', 'y')
@@ -4154,38 +4256,18 @@ def _interpolate_3d_grid_matmul(
       sig_lo_loc,
       sig_hi_loc,
   ):
-    if x_shards > 1:
-      f_x = lax.all_gather(f_loc, 'x', axis=2, tiled=True)
-    else:
-      f_x = f_loc
-    f_x = f_x[:, :, : grid.longitude_nodes, :]
-    f_xy_buf, j_offset, buf_lat_origin = _gather_lat_with_halo(
-        f_x, grid, max_lat_shift
+    f_xy_buf, j_offset, buf_lat_origin = _gather_longitude_and_lat_halo(
+        f_loc, grid, max_lat_shift, x_shards
     )
-
-    if z_shards == 1:
-      f_xyz_buf = f_xy_buf[:, :l_src, :, :]
-      k_offset = 0
-      buf_z_origin = 0
-    else:
-      iz = lax.axis_index('z')
-      l_src_loc = f_xy_buf.shape[1]
-      l_q_loc = lon_loc.shape[0]
-      h_z = max_vertical_shift + 2
-      if l_src == l_q and l_src == l_src_pad and l_src_loc >= h_z:
-        perm_down = [(s, (s + 1) % z_shards) for s in range(z_shards)]
-        perm_up = [(s, (s - 1) % z_shards) for s in range(z_shards)]
-        top_halo = lax.ppermute(f_xy_buf[:, -h_z:, :, :], 'z', perm=perm_down)
-        bot_halo = lax.ppermute(f_xy_buf[:, :h_z, :, :], 'z', perm=perm_up)
-        f_xyz_buf = jnp.concatenate([top_halo, f_xy_buf, bot_halo], axis=1)
-        k_offset = iz * l_q_loc
-        buf_z_origin = iz * l_src_loc - h_z
-      else:
-        f_xyz_buf = lax.all_gather(f_xy_buf, 'z', axis=1, tiled=True)[
-            :, :l_src, :, :
-        ]
-        k_offset = iz * l_q_loc
-        buf_z_origin = 0
+    f_xyz_buf, k_offset, buf_z_origin = _gather_z_with_halo(
+        f_xy_buf,
+        z_shards=z_shards,
+        n_src=l_src,
+        n_src_padded=l_src_pad,
+        n_query=l_q,
+        n_query_loc=lon_loc.shape[0],
+        max_vertical_shift=max_vertical_shift,
+    )
 
     return _matmul_3d_local(
         f_xyz_buf,
@@ -4909,13 +4991,8 @@ def _interpolate_3d_wind_and_sigma_dot_matmul(
   def _sharded(
       w_loc, sd_loc, lon_loc, sin_lat_loc, sigma_loc, c_loc, b_loc, *bounds
   ):
-    if x_shards > 1:
-      w_x = lax.all_gather(w_loc, 'x', axis=2, tiled=True)
-      sd_x = lax.all_gather(sd_loc, 'x', axis=2, tiled=True)
-    else:
-      w_x, sd_x = w_loc, sd_loc
-    w_x = w_x[:, :, : grid.longitude_nodes, :]
-    sd_x = sd_x[:, :, : grid.longitude_nodes, :]
+    w_x = _gather_longitude(w_loc, grid, x_shards)
+    sd_x = _gather_longitude(sd_loc, grid, x_shards)
     w_buf, j_offset, buf_lat_origin = _gather_lat_with_halo(
         w_x, grid, max_lat_shift
     )
