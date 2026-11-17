@@ -75,6 +75,65 @@ P = jax.sharding.PartitionSpec
 # All `einsum`s should be done at highest available precision.
 einsum = functools.partial(jnp.einsum, precision=jax.lax.Precision.HIGHEST)
 
+# Tuning constants of the 'matmul' interpolation. All are empirical settings
+# chosen on TPU v5e (128 MiB on-chip VMEM per core) unless stated otherwise;
+# none is derived from a model of the hardware, and changing one changes the
+# compiled program (not the interpolated values).
+_MIB = 1024 * 1024
+
+# Largest 1-D node/table axis whose lookup is done with a one-hot MXU dot (or a
+# broadcast compare) instead of a scalar gather or `searchsorted`. The one-hot
+# has one column per node, so this bounds its size.
+_ONE_HOT_LOOKUP_MAX_NODES = 512
+
+# Queries evaluated per `lax.scan` step by the arbitrary-point (unwindowed)
+# matmul paths; bounds the [queries, nodes] one-hot matrices.
+_POINTS_QUERY_CHUNK = 1024
+
+# Channels per `lax.scan` step of the windowed 2-D matmul (the limited variant
+# also carries a lower and an upper bound row per channel).
+_MATMUL_2D_CHANNEL_CHUNK = 8
+_MATMUL_2D_CHANNEL_CHUNK_LIMITED = 4
+
+# Budgets that size the channel chunk of the windowed 3-D matmul. In bytes of
+# (8, 128)-tile-padded buffers, per channel chunk: `single_buf` bounds the
+# largest single buffer, `ws_buf` the sum of the hoisted buffers alive at
+# once, and `vmem` the per-block working set of the gather/contraction, which
+# on TPU must fit in on-chip VMEM without spilling (hence below 128 MiB). The
+# non-TPU `vmem` is not a hardware limit. `max_channels` caps the chunk.
+# TPU values:
+_MATMUL_3D_MAX_CHANNELS_TPU = 12
+_MATMUL_3D_SINGLE_BUF_LIMIT_TPU = 450 * _MIB
+_MATMUL_3D_WS_BUF_LIMIT_TPU = 900 * _MIB
+_MATMUL_3D_VMEM_LIMIT_TPU = 112 * _MIB
+# CPU/GPU values:
+_MATMUL_3D_MAX_CHANNELS_CPU_GPU = 8
+_MATMUL_3D_SINGLE_BUF_LIMIT_CPU_GPU = 185 * _MIB
+_MATMUL_3D_WS_BUF_LIMIT_CPU_GPU = 440 * _MIB
+_MATMUL_3D_VMEM_LIMIT_CPU_GPU = 256 * _MIB
+
+# Numbers of consecutive query levels fused into one scan block, tried in this
+# order (1 is the fallback), on TPU only.
+_BLOCK_LEVEL_CANDIDATES = (4, 2)
+
+# Largest per-block working set (bytes) accepted when probing the block
+# length: the 3-D scalar/limiter path and the fused wind + sigma_dot path.
+# Both sit just below TPU v5e's 128 MiB VMEM.
+_MATMUL_3D_BLOCK_VMEM_PROBE = 116 * _MIB
+_WIND_SIGMA_DOT_BLOCK_VMEM_PROBE = 118 * _MIB
+
+# TPU (8, 128) tiling of 32-bit arrays: the minor axis is padded to a multiple
+# of 128 lanes and the second-minor axis to a multiple of 8 sublanes. Buffer
+# footprint estimates and the K axis of the one-hot products use these.
+_TPU_LANES = 128
+_TPU_SUBLANES = 8
+
+# Relative widening of the limiter's cell bounds on TPU in float32: the 3-pass
+# `bf16_3x` MXU selection of a bound is exact only to the 16-bit split ulp
+# (2^-16 ~ 1.5e-5), so the bounds are widened by slightly more than that to
+# keep constant fields and non-negative fields exactly inside them.
+_BF16X3_BOUND_WIDENING = 1.6e-5
+
 
 #  =============================================================================
 #  Spherical geometry helpers.
@@ -258,7 +317,10 @@ def _uniform_lagrange_weights_tuple(
 
 def _take_1d(values_1d: jax.Array, idx: jax.Array) -> jax.Array:
   """1-D table lookup using MXU `one_hot` dot on TPU to avoid scalar VPU gathers."""
-  if jax.default_backend() == 'tpu' and values_1d.shape[0] <= 512:
+  if (
+      jax.default_backend() == 'tpu'
+      and values_1d.shape[0] <= _ONE_HOT_LOOKUP_MAX_NODES
+  ):
     oh = jax.nn.one_hot(idx, values_1d.shape[0], dtype=values_1d.dtype)
     dot_prec = jax_numpy_utils.resolve_dot_precision(
         None, oh, values_1d, lhs_exact_in_bf16=True
@@ -405,7 +467,7 @@ def _searchsorted_right_minus_one(
     nodes_1d: jax.Array, x: jax.Array
 ) -> jax.Array:
   """Computes `searchsorted(nodes_1d, x, side='right') - 1` without `[..., 1]` tiles."""
-  if nodes_1d.shape[0] <= 512 and (
+  if nodes_1d.shape[0] <= _ONE_HOT_LOOKUP_MAX_NODES and (
       x.ndim <= 2 or jax.default_backend() == 'tpu'
   ):
     return (x[..., jnp.newaxis] >= nodes_1d).sum(axis=-1, dtype=jnp.int32) - 1
@@ -467,7 +529,10 @@ def _horizontal_stencil_tuple(
   c_min = -int(offsets[0])
   c_max = phi_extended.size - 1 - int(offsets[-1])
   alpha_lat = None
-  if jax.default_backend() == 'tpu' and phi_extended.size <= 512:
+  if (
+      jax.default_backend() == 'tpu'
+      and phi_extended.size <= _ONE_HOT_LOOKUP_MAX_NODES
+  ):
     n_starts = c_max - c_min + 1
     thresholds = jnp.asarray(
         phi_extended[c_min + 1 : c_max + 1], dtype=phi.dtype
@@ -739,7 +804,7 @@ def _matmul_2d_points(
 
   lon_flat = jnp.asarray(lon).reshape(-1)
   sin_lat_flat = jnp.asarray(sin_lat).reshape(-1)
-  q_chunk = min(q_total, 1024)
+  q_chunk = min(q_total, _POINTS_QUERY_CHUNK)
   q_padded = _round_to_multiple(q_total, q_chunk)
   if q_padded > q_total:
     lon_flat = jnp.pad(lon_flat, [(0, q_padded - q_total)], mode='edge')
@@ -956,7 +1021,11 @@ def _matmul_2d_local(
       val = jnp.clip(val, b_val[:c_cur], b_val[c_cur:])
     return val
 
-  chunk_size = 4 if limiter is not None else 8
+  chunk_size = (
+      _MATMUL_2D_CHANNEL_CHUNK_LIMITED
+      if limiter is not None
+      else _MATMUL_2D_CHANNEL_CHUNK
+  )
   if num_channels <= chunk_size:
     return _eval_chunk(f_buf)
 
@@ -1353,7 +1422,7 @@ def _vertical_stencil_tuple(
   if (
       jax.default_backend() == 'tpu'
       and (vertical_order == 'linear' or num_levels >= 4)
-      and num_levels <= 512
+      and num_levels <= _ONE_HOT_LOOKUP_MAX_NODES
   ):
     n_cells = num_levels - 1
     oh_cell = _tpu_step_diff_one_hot(sigma, sigma_nodes[1:-1], sigma.dtype)
@@ -1757,7 +1826,7 @@ def _matmul_3d_points(
   lon_flat = jnp.asarray(lon).reshape(-1)
   sin_lat_flat = jnp.asarray(sin_lat).reshape(-1)
   sigma_flat = jnp.asarray(sigma).reshape(-1)
-  q_chunk = min(q_total, 1024)
+  q_chunk = min(q_total, _POINTS_QUERY_CHUNK)
   q_padded = _round_to_multiple(q_total, q_chunk)
   if q_padded > q_total:
     pad_w = [(0, q_padded - q_total)]
@@ -1999,24 +2068,24 @@ def _matmul_3d_local(
   # compact in HBM AND per-level `b_len = 1` working sets fit inside TPU v5e's
   # 128 MiB on-chip VMEM without spilling.
   item_bytes = 8 if dtype == jnp.float64 else 4
-  n_lon_pad128 = _round_to_multiple(n_lon, 128)
-  nx_pad128 = _round_to_multiple(nx_loc, 128)
+  n_lon_pad128 = _round_to_multiple(n_lon, _TPU_LANES)
+  nx_pad128 = _round_to_multiple(nx_loc, _TPU_LANES)
   w_lon_vmem_b = (
-      ny_loc * _round_to_multiple(n_lon, 8) * nx_pad128 * item_bytes
+      ny_loc * _round_to_multiple(n_lon, _TPU_SUBLANES) * nx_pad128 * item_bytes
   )
   if is_tpu:
-    max_c_cap = 12
-    single_buf_limit = 450 * 1024 * 1024
-    ws_buf_limit = 900 * 1024 * 1024
-    vmem_limit = 112 * 1024 * 1024
+    max_c_cap = _MATMUL_3D_MAX_CHANNELS_TPU
+    single_buf_limit = _MATMUL_3D_SINGLE_BUF_LIMIT_TPU
+    ws_buf_limit = _MATMUL_3D_WS_BUF_LIMIT_TPU
+    vmem_limit = _MATMUL_3D_VMEM_LIMIT_TPU
   else:
-    max_c_cap = 8
-    single_buf_limit = 185 * 1024 * 1024
-    ws_buf_limit = 440 * 1024 * 1024
-    vmem_limit = 256 * 1024 * 1024
+    max_c_cap = _MATMUL_3D_MAX_CHANNELS_CPU_GPU
+    single_buf_limit = _MATMUL_3D_SINGLE_BUF_LIMIT_CPU_GPU
+    ws_buf_limit = _MATMUL_3D_WS_BUF_LIMIT_CPU_GPU
+    vmem_limit = _MATMUL_3D_VMEM_LIMIT_CPU_GPU
 
   def _fits_budget(c_test: int, lim_s: int = 0) -> bool:
-    k_c_pad = _round_to_multiple(c_test * w_lat_size, 8)
+    k_c_pad = _round_to_multiple(c_test * w_lat_size, _TPU_SUBLANES)
     f_lat_b = ny_loc * l_buf * k_c_pad * n_lon_pad128 * item_bytes
     f_patch_b = ny_loc * w_z_size * k_c_pad * n_lon_pad128 * item_bytes
     gath_b = ny_loc * w_z_size * k_c_pad * nx_pad128 * item_bytes
@@ -2025,7 +2094,9 @@ def _matmul_3d_local(
     ws_b = f_lat_b
     c_lim_test = max(0, c_test - lim_s) if eff_limiter is not None else 0
     if c_lim_test > 0:
-      k_l_pad = _round_to_multiple(2 * c_lim_test * w_lat_cell_size, 8)
+      k_l_pad = _round_to_multiple(
+          2 * c_lim_test * w_lat_cell_size, _TPU_SUBLANES
+      )
       b_lat_b = (
           ny_loc * max(1, l_buf - 1) * k_l_pad * n_lon_pad128 * item_bytes
       )
@@ -2151,7 +2222,7 @@ def _matmul_3d_local(
     c_tri = max(0, c_cur - tri_start) if tri_start is not None else 0
 
     k_raw = c_cur * w_lat_size
-    k_pad = _round_to_multiple(k_raw, 8)
+    k_pad = _round_to_multiple(k_raw, _TPU_SUBLANES)
     f_2d_t = (
         f_chunk.swapaxes(0, 1)
         .reshape(l_buf * c_cur, n_lon, n_lat_buf)
@@ -2173,7 +2244,7 @@ def _matmul_3d_local(
     if c_lim > 0:
       assert m_lat_cell_2d is not None
       k_lim_raw = 2 * c_lim * w_lat_cell_size
-      k_lim_pad = _round_to_multiple(k_lim_raw, 8)
+      k_lim_pad = _round_to_multiple(k_lim_raw, _TPU_SUBLANES)
       f_lim = f_chunk[lim_start:]
       f_for_bounds = (
           f_lim + ref_buf[jnp.newaxis, :, jnp.newaxis, jnp.newaxis]
@@ -2184,8 +2255,8 @@ def _matmul_3d_local(
       if is_tpu and dtype == jnp.float32:
         # Widen cell bounds by 16-bit split ulp (`2^-16`) so 3-pass `bf16_3x`
         # MXU selection preserves constants and non-negativity (`0.0`) exactly.
-        lo_buf = lo_buf - 1.6e-5 * jnp.abs(lo_buf)
-        hi_buf = hi_buf + 1.6e-5 * jnp.abs(hi_buf)
+        lo_buf = lo_buf - _BF16X3_BOUND_WIDENING * jnp.abs(lo_buf)
+        hi_buf = hi_buf + _BF16X3_BOUND_WIDENING * jnp.abs(hi_buf)
       b_2d_t = (
           jnp.concatenate([lo_buf, hi_buf], axis=0)
           .swapaxes(0, 1)
@@ -2216,10 +2287,13 @@ def _matmul_3d_local(
           else 0
       )
       nx_blk = b_len * nx_loc
-      nx_blk_pad128 = _round_to_multiple(nx_blk, 128)
+      nx_blk_pad128 = _round_to_multiple(nx_blk, _TPU_LANES)
       f_patch_blk_b = ny_loc * w_z_blk_size * k_pad * n_lon_pad128 * item_bytes
       w_lon_blk_b = (
-          ny_loc * _round_to_multiple(n_lon, 8) * nx_blk_pad128 * item_bytes
+          ny_loc
+          * _round_to_multiple(n_lon, _TPU_SUBLANES)
+          * nx_blk_pad128
+          * item_bytes
       )
       gath_blk_b = ny_loc * w_z_blk_size * k_pad * nx_blk_pad128 * item_bytes
       fuse_gath_blk = (
@@ -2373,7 +2447,7 @@ def _matmul_3d_local(
             )
 
           k_tri_raw = c_tri * w_lat_size
-          k_tri_pad = _round_to_multiple(k_tri_raw, 8)
+          k_tri_pad = _round_to_multiple(k_tri_raw, _TPU_SUBLANES)
           f_tri_win = lax.dynamic_slice(
               f_lat,
               (
@@ -2544,15 +2618,18 @@ def _matmul_3d_local(
 
     b_len = 1
     if is_tpu:
-      for b_cand in (4, 2):
+      for b_cand in _BLOCK_LEVEL_CANDIDATES:
         if l_q_loc < b_cand:
           continue
         w_z_c = min(l_buf, min(l_src, w_z_size + b_cand - 1))
         f_blk_vmem = ny_loc * w_z_c * k_pad * n_lon_pad128 * item_bytes
         g_1_vmem = ny_loc * w_z_c * k_pad * nx_pad128 * item_bytes
-        nx_c_pad128 = _round_to_multiple(b_cand * nx_loc, 128)
+        nx_c_pad128 = _round_to_multiple(b_cand * nx_loc, _TPU_LANES)
         w_lon_c_vmem = (
-            ny_loc * _round_to_multiple(n_lon, 8) * nx_c_pad128 * item_bytes
+            ny_loc
+            * _round_to_multiple(n_lon, _TPU_SUBLANES)
+            * nx_c_pad128
+            * item_bytes
         )
         b_vmem = 0
         if c_lim > 0:
@@ -2565,7 +2642,7 @@ def _matmul_3d_local(
           b_vmem = b_blk_vmem + w_lon_c_vmem + b_lon_vmem
         if (
             max(f_blk_vmem + w_lon_vmem_b + g_1_vmem, b_vmem)
-            <= 116 * 1024 * 1024
+            <= _MATMUL_3D_BLOCK_VMEM_PROBE
         ):
           b_len = b_cand
           break
@@ -3207,7 +3284,7 @@ def _matmul_3d_wind_and_sigma_dot_local(
   dot_prec_f32 = jax_numpy_utils.resolve_dot_precision(None, wind_buf, wind_buf)
 
   k_w_raw = 3 * w_lat_size
-  k_w_pad = _round_to_multiple(k_w_raw, 8)
+  k_w_pad = _round_to_multiple(k_w_raw, _TPU_SUBLANES)
   wind_2d_t = (
       wind_buf.swapaxes(0, 1)
       .reshape(l_buf_c * 3, n_lon, n_lat_buf)
@@ -3224,7 +3301,7 @@ def _matmul_3d_wind_and_sigma_dot_local(
     wind_lat = jnp.pad(wind_lat, [(0, 0), (0, 0), (0, k_w_pad - k_w_raw), (0, 0)])
 
   k_sd_raw = w_lat_size
-  k_sd_pad = _round_to_multiple(k_sd_raw, 8)
+  k_sd_pad = _round_to_multiple(k_sd_raw, _TPU_SUBLANES)
   sd_2d_t = sd_buf[0].transpose(2, 0, 1).reshape(n_lat_buf, l_buf_b * n_lon)
   sd_lat = (
       jnp.dot(m_lat_2d, sd_2d_t, precision=dot_prec_lhs_bf16)
@@ -3242,20 +3319,25 @@ def _matmul_3d_wind_and_sigma_dot_local(
   lat_arange = jnp.arange(w_lat_size, dtype=jnp.int32)[:, jnp.newaxis]
 
   item_bytes = 8 if dtype == jnp.float64 else 4
-  n_lon_pad128 = _round_to_multiple(n_lon, 128)
+  n_lon_pad128 = _round_to_multiple(n_lon, _TPU_LANES)
   b_len = 1
   if is_tpu and l_q_loc > 1:
-    for b_cand in (4, 2):
+    for b_cand in _BLOCK_LEVEL_CANDIDATES:
       if l_q_loc < b_cand:
         continue
       wz_c = min(l_buf_c, min(l_src_c, w_z_c_size + b_cand - 1))
       wz_b = min(l_buf_b, min(l_src_b, w_z_b_size + b_cand - 1))
       k_tot = wz_c * k_w_pad + wz_b * k_sd_pad
-      nx_c_pad128 = _round_to_multiple(b_cand * nx_loc, 128)
+      nx_c_pad128 = _round_to_multiple(b_cand * nx_loc, _TPU_LANES)
       lhs_b = ny_loc * k_tot * n_lon_pad128 * item_bytes
-      rhs_b = ny_loc * _round_to_multiple(n_lon, 8) * nx_c_pad128 * item_bytes
+      rhs_b = (
+          ny_loc
+          * _round_to_multiple(n_lon, _TPU_SUBLANES)
+          * nx_c_pad128
+          * item_bytes
+      )
       out_b = ny_loc * k_tot * nx_c_pad128 * item_bytes
-      if lhs_b + rhs_b + out_b <= 118 * 1024 * 1024:
+      if lhs_b + rhs_b + out_b <= _WIND_SIGMA_DOT_BLOCK_VMEM_PROBE:
         b_len = b_cand
         break
 
