@@ -4671,21 +4671,15 @@ def _matmul_3d_wind_and_sigma_dot_local(
   w_z_b_size = _window_size(l_buf_b, l_src_b, eff_z_shift, 2)
 
   j_global = _arrival_lat_rows(j_offset, ny_loc, n_lat)
-  win_lat_start, buf_lat_start = _lat_window_starts(
+  win_lat_start, m_lat_2d = _lat_window_selector(
       j_global,
       j_global + 2 - eff_lat_shift,
       n_lat_ext,
       n_lat_buf,
       w_lat_size,
       buf_lat_origin,
+      dtype,
   )
-  m_lat_win = jax.nn.one_hot(
-      buf_lat_start[:, jnp.newaxis]
-      + jnp.arange(w_lat_size, dtype=jnp.int32)[jnp.newaxis, :],
-      n_lat_buf,
-      dtype=dtype,
-  )
-  m_lat_2d = m_lat_win.reshape(ny_loc * w_lat_size, n_lat_buf)
 
   dot_prec_lhs_bf16 = jax_numpy_utils.resolve_dot_precision(
       None, m_lat_2d, wind_buf, lhs_exact_in_bf16=True
@@ -4731,26 +4725,25 @@ def _matmul_3d_wind_and_sigma_dot_local(
 
   item_bytes = 8 if dtype == jnp.float64 else 4
   n_lon_pad128 = _round_to_multiple(n_lon, _TPU_LANES)
-  b_len = 1
-  if is_tpu and l_q_loc > 1:
-    for b_cand in _BLOCK_LEVEL_CANDIDATES:
-      if l_q_loc < b_cand:
-        continue
-      wz_c = min(l_buf_c, min(l_src_c, w_z_c_size + b_cand - 1))
-      wz_b = min(l_buf_b, min(l_src_b, w_z_b_size + b_cand - 1))
-      k_tot = wz_c * k_w_pad + wz_b * k_sd_pad
-      nx_c_pad128 = _round_to_multiple(b_cand * nx_loc, _TPU_LANES)
-      lhs_b = ny_loc * k_tot * n_lon_pad128 * item_bytes
-      rhs_b = (
-          ny_loc
-          * _round_to_multiple(n_lon, _TPU_SUBLANES)
-          * nx_c_pad128
-          * item_bytes
-      )
-      out_b = ny_loc * k_tot * nx_c_pad128 * item_bytes
-      if lhs_b + rhs_b + out_b <= _WIND_SIGMA_DOT_BLOCK_VMEM_PROBE:
-        b_len = b_cand
-        break
+
+  def _block_bytes(b_cand: int) -> int:
+    wz_c = min(l_buf_c, min(l_src_c, w_z_c_size + b_cand - 1))
+    wz_b = min(l_buf_b, min(l_src_b, w_z_b_size + b_cand - 1))
+    k_tot = wz_c * k_w_pad + wz_b * k_sd_pad
+    nx_c_pad128 = _round_to_multiple(b_cand * nx_loc, _TPU_LANES)
+    lhs_b = ny_loc * k_tot * n_lon_pad128 * item_bytes
+    rhs_b = (
+        ny_loc
+        * _round_to_multiple(n_lon, _TPU_SUBLANES)
+        * nx_c_pad128
+        * item_bytes
+    )
+    out_b = ny_loc * k_tot * nx_c_pad128 * item_bytes
+    return lhs_b + rhs_b + out_b
+
+  b_len = _level_block_length(
+      l_q_loc, is_tpu, _block_bytes, _WIND_SIGMA_DOT_BLOCK_VMEM_PROBE
+  )
 
   w_z_c_blk = min(l_buf_c, min(l_src_c, w_z_c_size + b_len - 1))
   w_z_b_blk = min(l_buf_b, min(l_src_b, w_z_b_size + b_len - 1))
@@ -4853,46 +4846,10 @@ def _matmul_3d_wind_and_sigma_dot_local(
         *(b[0] for b in z_bounds),
     ))
     out_4d = jnp.swapaxes(out_0, 1, 2)[:, jnp.newaxis, :, :]
-  elif b_len == 1:
-    _, out_l = lax.scan(
-        lambda _, inp: (None, _scan_block(inp)),
-        None,
-        (k_arr, lon_q_t, sin_lat_q_t, sigma_q_t, *z_bounds),
-    )
-    out_4d = out_l.transpose(1, 0, 3, 2)
   else:
-    n_blocks = (l_q_loc + b_len - 1) // b_len
-    pad_l = n_blocks * b_len - l_q_loc
-    if pad_l > 0:
-      k_in = jnp.pad(k_arr, (0, pad_l), mode='edge').reshape(n_blocks, b_len)
-      lon_in = jnp.pad(
-          lon_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
-      ).reshape(n_blocks, b_len, ny_loc, nx_loc)
-      sin_lat_in = jnp.pad(
-          sin_lat_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
-      ).reshape(n_blocks, b_len, ny_loc, nx_loc)
-      sigma_in = jnp.pad(
-          sigma_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
-      ).reshape(n_blocks, b_len, ny_loc, nx_loc)
-      z_bounds_in = [
-          jnp.pad(b, (0, pad_l), mode='edge').reshape(n_blocks, b_len)
-          for b in z_bounds
-      ]
-    else:
-      k_in = k_arr.reshape(n_blocks, b_len)
-      lon_in = lon_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
-      sin_lat_in = sin_lat_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
-      sigma_in = sigma_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
-      z_bounds_in = [b.reshape(n_blocks, b_len) for b in z_bounds]
-    _, out_blk = lax.scan(
-        lambda _, inp: (None, _scan_block(inp)),
-        None,
-        (k_in, lon_in, sin_lat_in, sigma_in, *z_bounds_in),
-    )
-    out_4d = (
-        out_blk.reshape(n_blocks * b_len, 4, ny_loc, nx_loc)[:l_q_loc]
-        .transpose(1, 0, 3, 2)
-    )
+    out_4d = _scan_level_blocks(
+        _scan_block, k_arr, lon_q_t, sin_lat_q_t, sigma_q_t, z_bounds, b_len
+    ).transpose(1, 0, 3, 2)
   return out_4d[:3], out_4d[3]
 
 
