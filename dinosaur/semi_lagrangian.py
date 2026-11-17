@@ -50,6 +50,7 @@ References:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import dataclasses
 import functools
 import math
@@ -2353,6 +2354,1518 @@ def _matmul_3d_points(
   return out_flat[:, :q_total].reshape((c_total, *point_shape))
 
 
+@dataclasses.dataclass(frozen=True)
+class _Matmul3DPlan:
+  """Static geometry and memory budget of one windowed 3-D matmul call.
+
+  Every field is a Python value fixed at trace time. The buffer
+  `f_buf` has shape `[num_channels, l_buf, n_lon, n_lat_buf]` and the local
+  queries `[l_q_loc, nx_loc, ny_loc]`; `l_src` / `n_lat_ext` are the numbers of
+  source levels and halo-extended latitude rows the windows slide over.
+
+  Attributes:
+    dtype: dtype of the interpolated field.
+    is_tpu: whether the TPU-specific layouts and budgets apply.
+    order: horizontal interpolation order.
+    vertical_order: vertical interpolation order.
+    n_lon: number of longitude nodes.
+    n_lat_ext: number of halo-extended latitude rows of the source axis.
+    l_src: number of source levels.
+    num_channels: number of channels of `f_buf`.
+    l_buf: number of levels held in the local buffer.
+    n_lat_buf: number of latitude rows held in the local buffer.
+    l_q_loc: number of local query levels.
+    nx_loc: number of local query longitudes.
+    ny_loc: number of local arrival latitude rows.
+    limiter: the limiter if any channel is limited, else None.
+    eff_lat_shift: latitude window half-width, in rows.
+    eff_z_shift: vertical window half-width, in levels.
+    w_lat_size: rows of the latitude stencil window.
+    w_z_size: levels of the vertical stencil window of a single query level.
+    w_z_lin_size: levels of the linear-stencil window of a single query level
+      (used by the trilinear output).
+    w_lat_cell_size: rows of the limiter's cell-bound latitude window (0 if
+      there is no limiter).
+    w_z_cell_size: levels of the limiter's cell-bound vertical window (0 if
+      there is no limiter).
+    lat_start_offset: first stencil row of a query at its arrival row, relative
+      to that row.
+    z_start_offset: the same in the vertical, relative to the arrival level.
+    need_separate_trilinear: whether the trilinear channels need stencils of
+      their own (they do not if the main stencil already is trilinear).
+    item_bytes: bytes per element.
+    n_lon_pad128: `n_lon` padded to a multiple of the TPU lane count.
+    nx_pad128: `nx_loc` padded to a multiple of the TPU lane count.
+    w_lon_vmem_b: padded bytes of the longitude weights of a single-level
+      block.
+    max_channels: cap on the channel chunk.
+    single_buf_limit: budget of the largest single hoisted buffer, in bytes.
+    ws_buf_limit: budget of the sum of the hoisted buffers alive at once.
+    vmem_limit: budget of the per-block working set, in bytes.
+  """
+
+  dtype: jnp.dtype
+  is_tpu: bool
+  order: str
+  vertical_order: str
+  n_lon: int
+  n_lat_ext: int
+  l_src: int
+  num_channels: int
+  l_buf: int
+  n_lat_buf: int
+  l_q_loc: int
+  nx_loc: int
+  ny_loc: int
+  limiter: str | None
+  eff_lat_shift: int
+  eff_z_shift: int
+  w_lat_size: int
+  w_z_size: int
+  w_z_lin_size: int
+  w_lat_cell_size: int
+  w_z_cell_size: int
+  lat_start_offset: int
+  z_start_offset: int
+  need_separate_trilinear: bool
+  item_bytes: int
+  n_lon_pad128: int
+  nx_pad128: int
+  w_lon_vmem_b: int
+  max_channels: int
+  single_buf_limit: int
+  ws_buf_limit: int
+  vmem_limit: int
+
+  def fits_budget(self, num_channels: int, limited_start: int = 0) -> bool:
+    """Whether a chunk of `num_channels` channels fits the memory budgets.
+
+    The sizes are those of (8, 128)-tile-padded buffers: the hoisted
+    latitude-projected field (and cell bounds), the per-block vertical patch,
+    and the per-block longitude-contracted result.
+
+    Args:
+      num_channels: channels in the chunk.
+      limited_start: index within the chunk of the first limited channel.
+
+    Returns:
+      True if the largest single buffer, the sum of the hoisted buffers and
+      the per-block working set are all within their limits.
+    """
+    k_c_pad = _round_to_multiple(num_channels * self.w_lat_size, _TPU_SUBLANES)
+    f_lat_b = (
+        self.ny_loc * self.l_buf * k_c_pad * self.n_lon_pad128 * self.item_bytes
+    )
+    f_patch_b = (
+        self.ny_loc * self.w_z_size * k_c_pad * self.n_lon_pad128
+        * self.item_bytes
+    )
+    gath_b = (
+        self.ny_loc * self.w_z_size * k_c_pad * self.nx_pad128
+        * self.item_bytes
+    )
+    vmem_b = self.w_lon_vmem_b + f_patch_b + gath_b
+    max_single_b = f_lat_b
+    ws_b = f_lat_b
+    c_lim_test = (
+        max(0, num_channels - limited_start) if self.limiter is not None else 0
+    )
+    if c_lim_test > 0:
+      k_l_pad = _round_to_multiple(
+          2 * c_lim_test * self.w_lat_cell_size, _TPU_SUBLANES
+      )
+      b_lat_b = (
+          self.ny_loc
+          * max(1, self.l_buf - 1)
+          * k_l_pad
+          * self.n_lon_pad128
+          * self.item_bytes
+      )
+      b_patch_b = (
+          self.ny_loc * self.w_z_cell_size * k_l_pad * self.n_lon_pad128
+          * self.item_bytes
+      )
+      b_lon_b = (
+          self.ny_loc * self.w_z_cell_size * k_l_pad * self.nx_pad128
+          * self.item_bytes
+      )
+      max_single_b = max(max_single_b, b_lat_b)
+      ws_b = f_lat_b + b_lat_b
+      vmem_b = max(vmem_b, self.w_lon_vmem_b + b_patch_b + b_lon_b)
+    return (
+        max_single_b <= self.single_buf_limit
+        and ws_b <= self.ws_buf_limit
+        and vmem_b <= self.vmem_limit
+    )
+
+
+def _plan_matmul_3d(
+    f_buf: jax.Array,
+    lon_q: jax.Array,
+    grid: spherical_harmonic.Grid,
+    sigma_nodes: np.ndarray,
+    *,
+    order: str,
+    limiter: str | None,
+    vertical_order: Literal['linear', 'cubic'],
+    max_lat_shift: int,
+    max_vertical_shift: int,
+    limited_channel_start: int,
+    trilinear_channel_start: int | None,
+) -> _Matmul3DPlan:
+  """Builds the static plan of a windowed 3-D matmul call.
+
+  Args:
+    f_buf: local buffer, [C, L_buf, n_lon, n_lat_buf].
+    lon_q: local query longitudes, [l_q_loc, nx_loc, ny_loc].
+    grid: the horizontal grid holding the source data.
+    sigma_nodes: source σ nodes.
+    order: horizontal interpolation order.
+    limiter: the limiter, applied to channels from `limited_channel_start` on.
+    vertical_order: vertical interpolation order.
+    max_lat_shift: latitude displacement limit, in cells.
+    max_vertical_shift: vertical displacement limit, in cells.
+    limited_channel_start: first limited channel.
+    trilinear_channel_start: first channel that also gets a trilinear output,
+      or None.
+
+  Returns:
+    The plan, including the TPU or CPU/GPU memory budgets selected by the
+    backend.
+  """
+  dtype = f_buf.dtype
+  is_tpu = jax.default_backend() == 'tpu'
+  n_lon = grid.longitude_nodes
+  n_lat = grid.latitude_nodes
+  n_lat_ext = n_lat + 2 * _HALO_WIDTH
+  l_src = sigma_nodes.shape[0]
+  num_channels, l_buf, _, n_lat_buf = f_buf.shape
+  l_q_loc, nx_loc, ny_loc = lon_q.shape
+
+  eff_limiter = limiter if limited_channel_start < num_channels else None
+  eff_lat_shift = _effective_window_shift(max_lat_shift)
+  eff_z_shift = _effective_window_shift(max_vertical_shift)
+  s_lat = 2 if order == 'linear' else 4
+  s_z = 2 if vertical_order == 'linear' else 4
+  w_lat_cell_size = 0
+  w_z_cell_size = 0
+  if eff_limiter is not None:
+    w_lat_cell_size = _window_size(
+        n_lat_buf - 1, n_lat_ext - 1, eff_lat_shift, 2
+    )
+    w_z_cell_size = _window_size(l_buf - 1, l_src - 1, eff_z_shift, 2)
+
+  # Channel chunks are sized so the hoisted `[ny_loc, l_buf, k_pad, n_lon]`
+  # buffers stay compact in HBM AND the per-level `b_len = 1` working sets fit
+  # inside TPU v5e's 128 MiB on-chip VMEM without spilling.
+  item_bytes = 8 if dtype == jnp.float64 else 4
+  n_lon_pad128 = _round_to_multiple(n_lon, _TPU_LANES)
+  nx_pad128 = _round_to_multiple(nx_loc, _TPU_LANES)
+  if is_tpu:
+    budgets = (
+        _MATMUL_3D_MAX_CHANNELS_TPU,
+        _MATMUL_3D_SINGLE_BUF_LIMIT_TPU,
+        _MATMUL_3D_WS_BUF_LIMIT_TPU,
+        _MATMUL_3D_VMEM_LIMIT_TPU,
+    )
+  else:
+    budgets = (
+        _MATMUL_3D_MAX_CHANNELS_CPU_GPU,
+        _MATMUL_3D_SINGLE_BUF_LIMIT_CPU_GPU,
+        _MATMUL_3D_WS_BUF_LIMIT_CPU_GPU,
+        _MATMUL_3D_VMEM_LIMIT_CPU_GPU,
+    )
+  max_channels, single_buf_limit, ws_buf_limit, vmem_limit = budgets
+  return _Matmul3DPlan(
+      dtype=dtype,
+      is_tpu=is_tpu,
+      order=order,
+      vertical_order=vertical_order,
+      n_lon=n_lon,
+      n_lat_ext=n_lat_ext,
+      l_src=l_src,
+      num_channels=num_channels,
+      l_buf=l_buf,
+      n_lat_buf=n_lat_buf,
+      l_q_loc=l_q_loc,
+      nx_loc=nx_loc,
+      ny_loc=ny_loc,
+      limiter=eff_limiter,
+      eff_lat_shift=eff_lat_shift,
+      eff_z_shift=eff_z_shift,
+      w_lat_size=_window_size(n_lat_buf, n_lat_ext, eff_lat_shift, s_lat),
+      w_z_size=_window_size(l_buf, l_src, eff_z_shift, s_z),
+      w_z_lin_size=_window_size(l_buf, l_src, eff_z_shift, 2),
+      w_lat_cell_size=w_lat_cell_size,
+      w_z_cell_size=w_z_cell_size,
+      lat_start_offset=(2 if order == 'linear' else 1) - eff_lat_shift,
+      z_start_offset=(
+          -eff_z_shift if vertical_order == 'linear' else (-eff_z_shift - 1)
+      ),
+      need_separate_trilinear=trilinear_channel_start is not None
+      and not (order == 'linear' and vertical_order == 'linear'),
+      item_bytes=item_bytes,
+      n_lon_pad128=n_lon_pad128,
+      nx_pad128=nx_pad128,
+      w_lon_vmem_b=(
+          ny_loc
+          * _round_to_multiple(n_lon, _TPU_SUBLANES)
+          * nx_pad128
+          * item_bytes
+      ),
+      max_channels=max_channels,
+      single_buf_limit=single_buf_limit,
+      ws_buf_limit=ws_buf_limit,
+      vmem_limit=vmem_limit,
+  )
+
+
+class _ChannelSegment(NamedTuple):
+  """A run of channels sharing one limiter / trilinear setting."""
+
+  start: int
+  stop: int
+  limited: bool
+  trilinear: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class _ChannelPlan:
+  """How the channels of one windowed 3-D matmul call are processed.
+
+  Attributes:
+    chunk_size: channels evaluated together (one `lax.scan` step if the
+      channels do not fit in a single chunk).
+    segments: None if the channels are evaluated as one stack. Otherwise the
+      homogeneous runs the stack is split into, because chunking a stack
+      that mixes limited / unlimited / trilinear channels would make the
+      chunks non-uniform; each run is then evaluated by its own call.
+  """
+
+  chunk_size: int
+  segments: tuple[_ChannelSegment, ...] | None
+
+
+def _plan_channels(
+    plan: _Matmul3DPlan,
+    limited_channel_start: int,
+    trilinear_channel_start: int | None,
+) -> _ChannelPlan:
+  """Chooses the channel chunk size and splits mixed channels into runs.
+
+  The chunk is the whole stack if it fits the budgets of `plan` with its
+  limited channels; otherwise the largest chunk that fits when every one of
+  its channels is limited (the worst case), at least 1.
+
+  Args:
+    plan: the static plan of the call.
+    limited_channel_start: first limited channel.
+    trilinear_channel_start: first channel that also gets a trilinear output,
+      or None.
+
+  Returns:
+    The channel plan.
+  """
+  num_channels = plan.num_channels
+  if num_channels <= plan.max_channels and plan.fits_budget(
+      num_channels, limited_channel_start
+  ):
+    chunk_size = num_channels
+  else:
+    chunk_size = 1
+    for c_cand in range(min(num_channels, plan.max_channels), 0, -1):
+      if plan.fits_budget(c_cand, 0):
+        chunk_size = c_cand
+        break
+
+  if not (
+      num_channels > chunk_size
+      and (
+          0 < limited_channel_start < num_channels
+          or (
+              trilinear_channel_start is not None
+              and 0 < trilinear_channel_start < num_channels
+          )
+      )
+  ):
+    return _ChannelPlan(chunk_size, None)
+
+  split_pts = sorted(
+      {0, num_channels}
+      | (
+          {min(num_channels, max(0, limited_channel_start))}
+          if plan.limiter is not None
+          else set()
+      )
+      | (
+          {min(num_channels, max(0, trilinear_channel_start))}
+          if trilinear_channel_start is not None
+          else set()
+      )
+  )
+  segments = tuple(
+      _ChannelSegment(
+          start=s0,
+          stop=s1,
+          limited=plan.limiter is not None and s0 >= limited_channel_start,
+          trilinear=(
+              trilinear_channel_start is not None
+              and s0 >= trilinear_channel_start
+          ),
+      )
+      for s0, s1 in zip(split_pts[:-1], split_pts[1:])
+      if s0 != s1
+  )
+  return _ChannelPlan(chunk_size, segments)
+
+
+def _matmul_3d_by_segments(
+    local_fn,
+    f_buf: jax.Array,
+    segments: tuple[_ChannelSegment, ...],
+    plan: _Matmul3DPlan,
+    *,
+    limiter: str | None,
+    with_trilinear: bool,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+  """Evaluates homogeneous channel runs separately and concatenates them.
+
+  Args:
+    local_fn: `_matmul_3d_local` with every argument but `f_buf`, `limiter`,
+      `limited_channel_start` and `trilinear_channel_start` bound.
+    f_buf: local buffer, [C, L_buf, n_lon, n_lat_buf].
+    segments: the runs, from `_plan_channels`.
+    plan: the static plan of the call.
+    limiter: the limiter applied to the limited runs.
+    with_trilinear: whether the call has a trilinear output.
+
+  Returns:
+    The interpolated channels, [C, l_q_loc, nx_loc, ny_loc], and with
+    `with_trilinear` also the trilinear output of the trilinear runs.
+  """
+  outs = []
+  outs_lin = []
+  for seg in segments:
+    res = local_fn(
+        f_buf[seg.start : seg.stop],
+        limiter=limiter if seg.limited else None,
+        limited_channel_start=0,
+        trilinear_channel_start=0 if seg.trilinear else None,
+    )
+    if seg.trilinear:
+      outs.append(res[0])
+      outs_lin.append(res[1])
+    else:
+      outs.append(res)
+  out_full = outs[0] if len(outs) == 1 else jnp.concatenate(outs, axis=0)
+  if with_trilinear:
+    # No trilinear channels at all (`trilinear_channel_start == C`) leaves
+    # `outs_lin` empty; the gather method returns an empty trilinear block.
+    if not outs_lin:
+      out_lin_full = jnp.zeros(
+          (0, plan.l_q_loc, plan.nx_loc, plan.ny_loc), dtype=plan.dtype
+      )
+    elif len(outs_lin) == 1:
+      out_lin_full = outs_lin[0]
+    else:
+      out_lin_full = jnp.concatenate(outs_lin, axis=0)
+    return out_full, out_lin_full
+  return out_full
+
+
+def _lat_window_selector(
+    j_global: jax.Array,
+    first_row: jax.Array,
+    n_source: int,
+    n_buffer: int,
+    size: int,
+    buf_origin: int | jax.Array,
+    dtype: jnp.dtype,
+) -> tuple[jax.Array, jax.Array]:
+  """One-hot selectors of the per-arrival-row latitude windows.
+
+  Args:
+    j_global: global arrival rows, [ny_loc], from `_arrival_lat_rows`.
+    first_row: unclipped first row of each window, [ny_loc].
+    n_source: number of rows of the (halo-extended) source axis.
+    n_buffer: number of rows held in the local buffer.
+    size: window size from `_window_size`.
+    buf_origin: source row of the first row of the local buffer.
+    dtype: dtype of the selector.
+
+  Returns:
+    `(win_start, m_lat_2d)`: the window starts within the source axis
+    ([ny_loc], see `_lat_window_starts`) and the selector
+    [ny_loc * size, n_buffer] whose row `j * size + w` picks buffer row
+    `buf_start[j] + w`. It is built through `[ny_loc, size, n_buffer]` so that
+    `dot(m_lat_2d, ...)` keeps `n_lon` in the last axis of its right-hand side
+    with no cross-lane minor-axis transposes.
+  """
+  win_start, buf_start = _lat_window_starts(
+      j_global, first_row, n_source, n_buffer, size, buf_origin
+  )
+  m_lat_win = jax.nn.one_hot(
+      buf_start[:, jnp.newaxis]
+      + jnp.arange(size, dtype=jnp.int32)[jnp.newaxis, :],
+      n_buffer,
+      dtype=dtype,
+  )  # [ny_loc, size, n_buffer]
+  return win_start, m_lat_win.reshape(j_global.shape[0] * size, n_buffer)
+
+
+def _project_lat_window(
+    stack: jax.Array,
+    m_lat_2d: jax.Array,
+    window_size: int,
+    precision: jax.lax.PrecisionLike,
+) -> jax.Array:
+  """Restricts a stack of fields to the latitude window of each arrival row.
+
+  One matmul with the one-hot selector `m_lat_2d` selects, for every
+  arrival row, its `window_size` latitude rows from every (channel, level)
+  pair at once. The result is laid out `[ny_loc, level, K, n_lon]` with the
+  window rows minor within each channel in `K`, and `K` padded with zeros to a
+  multiple of the TPU sublane count, so that the later per-block longitude
+  contraction `[ny_loc, level * K, n_lon] x [ny_loc, n_lon, nx]` runs on full
+  (8, 128) tiles with `n_lon` (contracted) and `nx` (output) in the lanes.
+
+  Args:
+    stack: [C, L, n_lon, n_lat] fields (or cell bounds, `n_lat` rows of
+      cells).
+    m_lat_2d: selector [ny_loc * window_size, n_lat] from
+      `_lat_window_selector`.
+    window_size: rows per window.
+    precision: dot precision; the selector is exactly representable in
+      bfloat16.
+
+  Returns:
+    [ny_loc, L, K_pad, n_lon], `K_pad = round_up(C * window_size, 8)`.
+  """
+  num_channels, num_levels, n_lon, n_lat = stack.shape
+  ny_loc = m_lat_2d.shape[0] // window_size
+  k_raw = num_channels * window_size
+  k_pad = _round_to_multiple(k_raw, _TPU_SUBLANES)
+  stack_2d_t = (
+      stack.swapaxes(0, 1)
+      .reshape(num_levels * num_channels, n_lon, n_lat)
+      .transpose(2, 0, 1)
+      .reshape(n_lat, num_levels * num_channels * n_lon)
+  )
+  projected = (
+      jnp.dot(m_lat_2d, stack_2d_t, precision=precision)
+      .reshape(ny_loc, window_size, num_levels * num_channels, n_lon)
+      .transpose(0, 2, 1, 3)
+      .reshape(ny_loc, num_levels, k_raw, n_lon)
+  )
+  if k_pad > k_raw:
+    projected = jnp.pad(projected, [(0, 0), (0, 0), (0, k_pad - k_raw), (0, 0)])
+  return projected
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _Matmul3DOperands:
+  """Everything the channel chunks of one `_matmul_3d_local` call share.
+
+  The arrays are built once, outside every `lax.scan`, so that the scans close
+  over them instead of rebuilding them per step.
+
+  Attributes:
+    plan: static plan of the call.
+    grid: the horizontal grid holding the source data.
+    sigma_nodes: source σ nodes.
+    k_offset: global index of the first local query level.
+    buf_z_origin: source level of the first level of the local buffer.
+    win_lat_start: [ny_loc] first source row of each arrival row's window.
+    m_lat_2d: [ny_loc * w_lat_size, n_lat_buf] latitude window selector.
+    win_lat_cell_start: the same for the limiter's cell windows (None without
+      a limiter).
+    m_lat_cell_2d: the corresponding selector, [ny_loc * w_lat_cell_size,
+      n_lat_buf - 1] (None without a limiter).
+    ref_buf: [l_buf] limiter bound reference on the buffer levels (None if
+      there is none or no limiter).
+    lon_q_t: [l_q_loc, ny_loc, nx_loc] query longitudes. The queries are
+      transposed once here so that `nx_loc` stays the last axis throughout the
+      level scan, with no per-level transposes.
+    sin_lat_q_t: query sin(latitude), laid out like `lon_q_t`.
+    sigma_q_t: query σ, laid out like `lon_q_t`.
+    k_arr: [l_q_loc] local query level indices.
+    lat_bounds_t: latitude clamp bounds, each [ny_loc, 1].
+    sig_lo_arr: [l_q_loc] lower σ clamp per query level.
+    sig_hi_arr: [l_q_loc] upper σ clamp per query level.
+    m_arange: [n_lon, 1] longitude positions.
+    lat_arange: [w_lat_size, 1] latitude window positions.
+    dot_prec_lhs_bf16: dot precision for selectors that are exact in bfloat16.
+    dot_prec_f32: dot precision for the field contractions.
+    dot_prec_tri: dot precision for the trilinear and limiter-bound
+      contractions.
+  """
+
+  plan: _Matmul3DPlan
+  grid: spherical_harmonic.Grid
+  sigma_nodes: np.ndarray
+  k_offset: int | jax.Array
+  buf_z_origin: int | jax.Array
+  win_lat_start: jax.Array
+  m_lat_2d: jax.Array
+  win_lat_cell_start: jax.Array | None
+  m_lat_cell_2d: jax.Array | None
+  ref_buf: jax.Array | None
+  lon_q_t: jax.Array
+  sin_lat_q_t: jax.Array
+  sigma_q_t: jax.Array
+  k_arr: jax.Array
+  lat_bounds_t: tuple[jax.Array, jax.Array]
+  sig_lo_arr: jax.Array
+  sig_hi_arr: jax.Array
+  m_arange: jax.Array
+  lat_arange: jax.Array
+  dot_prec_lhs_bf16: jax.lax.PrecisionLike
+  dot_prec_f32: jax.lax.PrecisionLike
+  dot_prec_tri: jax.lax.PrecisionLike
+
+
+@dataclasses.dataclass(frozen=True)
+class _ChannelChunk:
+  """Static layout of one chunk of channels.
+
+  Attributes:
+    c_cur: channels in the chunk.
+    lim_start: first limited channel of the chunk.
+    tri_start: first trilinear channel of the chunk, or None.
+    c_lim: number of limited channels.
+    c_tri: number of trilinear channels.
+    k_raw: `c_cur * w_lat_size`, the K extent of the projected field.
+    k_pad: `k_raw` padded to the TPU sublane count.
+    k_lim_raw: `2 * c_lim * w_lat_cell_size`, the K extent of the projected
+      cell bounds (a lower and an upper bound per limited channel).
+    k_lim_pad: `k_lim_raw` padded to the TPU sublane count.
+  """
+
+  c_cur: int
+  lim_start: int
+  tri_start: int | None
+  c_lim: int
+  c_tri: int
+  k_raw: int
+  k_pad: int
+  k_lim_raw: int
+  k_lim_pad: int
+
+
+def _channel_chunk(
+    plan: _Matmul3DPlan,
+    c_cur: int,
+    lim_start: int,
+    tri_start: int | None,
+) -> _ChannelChunk:
+  """Layout of a chunk of `c_cur` channels; see `_ChannelChunk`."""
+  c_lim = max(0, c_cur - lim_start) if plan.limiter is not None else 0
+  c_tri = max(0, c_cur - tri_start) if tri_start is not None else 0
+  k_raw = c_cur * plan.w_lat_size
+  k_lim_raw = 0
+  k_lim_pad = 0
+  if c_lim > 0:
+    k_lim_raw = 2 * c_lim * plan.w_lat_cell_size
+    k_lim_pad = _round_to_multiple(k_lim_raw, _TPU_SUBLANES)
+  return _ChannelChunk(
+      c_cur=c_cur,
+      lim_start=lim_start,
+      tri_start=tri_start,
+      c_lim=c_lim,
+      c_tri=c_tri,
+      k_raw=k_raw,
+      k_pad=_round_to_multiple(k_raw, _TPU_SUBLANES),
+      k_lim_raw=k_lim_raw,
+      k_lim_pad=k_lim_pad,
+  )
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _LevelBlock:
+  """Static layout and window positions of a block of `b_len` query levels.
+
+  The block's levels share one vertical window, one longitude contraction and
+  one latitude weight matrix, with the levels folded into the query axis
+  (`nx_blk = b_len * nx_loc`, level-major).
+
+  Attributes:
+    b_len: query levels in the block.
+    nx_blk: `b_len * nx_loc`.
+    w_z_blk_size: levels of the block's vertical stencil window.
+    w_z_lin_blk_size: levels of the block's linear-stencil window.
+    w_z_cell_blk_size: levels of the block's limiter cell-bound window (0
+      without limited channels).
+    fuse_gath_blk: whether the longitude contraction of the whole block fits
+      in on-chip memory at once (always for `b_len == 1`); otherwise the
+      levels are contracted one at a time, ordered by optimization barriers.
+    z_blk_arange: [w_z_blk_size, 1] vertical window positions.
+    z_lin_blk_arange: [w_z_lin_blk_size, 1] linear-stencil window positions.
+    z_cell_blk_arange: [w_z_cell_blk_size, 1] cell-bound window positions
+      (None without limited channels).
+    lat_cell_arange: [w_lat_cell_size, 1] cell-bound latitude window
+      positions (None without limited channels).
+  """
+
+  b_len: int
+  nx_blk: int
+  w_z_blk_size: int
+  w_z_lin_blk_size: int
+  w_z_cell_blk_size: int
+  fuse_gath_blk: bool
+  z_blk_arange: jax.Array
+  z_lin_blk_arange: jax.Array
+  z_cell_blk_arange: jax.Array | None
+  lat_cell_arange: jax.Array | None
+
+
+def _level_block(
+    plan: _Matmul3DPlan, chunk: _ChannelChunk, b_len: int
+) -> _LevelBlock:
+  """Layout of blocks of `b_len` query levels of a channel chunk."""
+  w_z_blk_size = min(plan.l_buf, min(plan.l_src, plan.w_z_size + b_len - 1))
+  w_z_lin_blk_size = min(
+      plan.l_buf, min(plan.l_src, plan.w_z_lin_size + b_len - 1)
+  )
+  w_z_cell_blk_size = (
+      min(
+          max(1, plan.l_buf - 1),
+          min(max(1, plan.l_src - 1), plan.w_z_cell_size + b_len - 1),
+      )
+      if chunk.c_lim > 0
+      else 0
+  )
+  nx_blk = b_len * plan.nx_loc
+  nx_blk_pad128 = _round_to_multiple(nx_blk, _TPU_LANES)
+  f_patch_blk_b = (
+      plan.ny_loc * w_z_blk_size * chunk.k_pad * plan.n_lon_pad128
+      * plan.item_bytes
+  )
+  w_lon_blk_b = (
+      plan.ny_loc
+      * _round_to_multiple(plan.n_lon, _TPU_SUBLANES)
+      * nx_blk_pad128
+      * plan.item_bytes
+  )
+  gath_blk_b = (
+      plan.ny_loc * w_z_blk_size * chunk.k_pad * nx_blk_pad128
+      * plan.item_bytes
+  )
+  fuse_gath_blk = (
+      b_len == 1
+      or (f_patch_blk_b + w_lon_blk_b + gath_blk_b) <= plan.vmem_limit
+  )
+
+  z_blk_arange = jnp.arange(w_z_blk_size, dtype=jnp.int32)[:, jnp.newaxis]
+  z_lin_blk_arange = jnp.arange(w_z_lin_blk_size, dtype=jnp.int32)[
+      :, jnp.newaxis
+  ]
+  z_cell_blk_arange = (
+      jnp.arange(w_z_cell_blk_size, dtype=jnp.int32)[:, jnp.newaxis]
+      if chunk.c_lim > 0
+      else None
+  )
+  lat_cell_arange = (
+      jnp.arange(plan.w_lat_cell_size, dtype=jnp.int32)[:, jnp.newaxis]
+      if chunk.c_lim > 0
+      else None
+  )
+  return _LevelBlock(
+      b_len=b_len,
+      nx_blk=nx_blk,
+      w_z_blk_size=w_z_blk_size,
+      w_z_lin_blk_size=w_z_lin_blk_size,
+      w_z_cell_blk_size=w_z_cell_blk_size,
+      fuse_gath_blk=fuse_gath_blk,
+      z_blk_arange=z_blk_arange,
+      z_lin_blk_arange=z_lin_blk_arange,
+      z_cell_blk_arange=z_cell_blk_arange,
+      lat_cell_arange=lat_cell_arange,
+  )
+
+
+def _matmul_3d_block_bytes(
+    plan: _Matmul3DPlan, chunk: _ChannelChunk, b_cand: int
+) -> int:
+  """Padded working-set bytes of a block of `b_cand` query levels.
+
+  The larger of the field contraction (vertical patch, longitude weights and
+  contracted result) and, with limited channels, the cell-bound contraction.
+  """
+  w_z_c = min(plan.l_buf, min(plan.l_src, plan.w_z_size + b_cand - 1))
+  f_blk_vmem = (
+      plan.ny_loc * w_z_c * chunk.k_pad * plan.n_lon_pad128 * plan.item_bytes
+  )
+  g_1_vmem = (
+      plan.ny_loc * w_z_c * chunk.k_pad * plan.nx_pad128 * plan.item_bytes
+  )
+  nx_c_pad128 = _round_to_multiple(b_cand * plan.nx_loc, _TPU_LANES)
+  w_lon_c_vmem = (
+      plan.ny_loc
+      * _round_to_multiple(plan.n_lon, _TPU_SUBLANES)
+      * nx_c_pad128
+      * plan.item_bytes
+  )
+  b_vmem = 0
+  if chunk.c_lim > 0:
+    w_zc_c = min(
+        max(1, plan.l_buf - 1),
+        min(max(1, plan.l_src - 1), plan.w_z_cell_size + b_cand - 1),
+    )
+    b_blk_vmem = (
+        plan.ny_loc * w_zc_c * chunk.k_lim_pad * plan.n_lon_pad128
+        * plan.item_bytes
+    )
+    b_lon_vmem = (
+        plan.ny_loc * w_zc_c * chunk.k_lim_pad * nx_c_pad128 * plan.item_bytes
+    )
+    b_vmem = b_blk_vmem + w_lon_c_vmem + b_lon_vmem
+  return max(f_blk_vmem + plan.w_lon_vmem_b + g_1_vmem, b_vmem)
+
+
+def _level_block_length(
+    num_levels: int, is_tpu: bool, block_bytes, limit: int
+) -> int:
+  """Number of consecutive query levels to fuse into one scan block.
+
+  Blocking reuses the overlapping vertical windows of neighbouring levels
+  and widens the longitude contraction; it is only used on TPU, and only
+  while the block's working set fits in on-chip memory.
+
+  Args:
+    num_levels: number of local query levels.
+    is_tpu: whether the TPU layouts apply; otherwise blocks have one level.
+    block_bytes: function from a candidate block length to the padded
+      working-set bytes of such a block.
+    limit: largest accepted working set, in bytes.
+
+  Returns:
+    The first of `_BLOCK_LEVEL_CANDIDATES` that is not longer than
+    `num_levels` and fits, else 1.
+  """
+  if is_tpu:
+    for b_cand in _BLOCK_LEVEL_CANDIDATES:
+      if num_levels < b_cand:
+        continue
+      if block_bytes(b_cand) <= limit:
+        return b_cand
+  return 1
+
+
+def _scan_level_blocks(
+    block_fn,
+    k_arr: jax.Array,
+    lon_q_t: jax.Array,
+    sin_lat_q_t: jax.Array,
+    sigma_q_t: jax.Array,
+    z_bounds: Sequence[jax.Array],
+    b_len: int,
+):
+  """Scans `block_fn` over the query levels in blocks of `b_len` levels.
+
+  The levels are padded to a multiple of `b_len` by repeating the last one
+  (the padded results are dropped) and folded into `[n_blocks, b_len, ...]`.
+
+  Args:
+    block_fn: maps `(k_b, lon_b, sin_lat_b, sigma_b, *z_bounds_b)` for one
+      block to the block's result (`[b_len, ...]` leaves for `b_len > 1`,
+      per-level leaves for `b_len == 1`).
+    k_arr: [l] query level indices.
+    lon_q_t: [l, ny_loc, nx_loc] query longitudes.
+    sin_lat_q_t: query sin(latitude), same layout.
+    sigma_q_t: query σ, same layout.
+    z_bounds: [l] σ clamp bounds, one array per stencil.
+    b_len: levels per block.
+
+  Returns:
+    The block results stacked over the query levels: a pytree whose leaves
+    have a leading axis of size `l`.
+  """
+  num_levels, ny_loc, nx_loc = lon_q_t.shape
+  if b_len == 1:
+    _, scan_res = lax.scan(
+        lambda _, inp: (None, block_fn(inp)),
+        None,
+        (k_arr, lon_q_t, sin_lat_q_t, sigma_q_t, *z_bounds),
+    )
+    return scan_res
+  n_blocks = (num_levels + b_len - 1) // b_len
+  pad_l = n_blocks * b_len - num_levels
+  if pad_l > 0:
+    k_in = jnp.pad(k_arr, (0, pad_l), mode='edge').reshape(n_blocks, b_len)
+    lon_in = jnp.pad(
+        lon_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
+    ).reshape(n_blocks, b_len, ny_loc, nx_loc)
+    sin_lat_in = jnp.pad(
+        sin_lat_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
+    ).reshape(n_blocks, b_len, ny_loc, nx_loc)
+    sigma_in = jnp.pad(
+        sigma_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
+    ).reshape(n_blocks, b_len, ny_loc, nx_loc)
+    z_bounds_in = [
+        jnp.pad(b, (0, pad_l), mode='edge').reshape(n_blocks, b_len)
+        for b in z_bounds
+    ]
+  else:
+    k_in = k_arr.reshape(n_blocks, b_len)
+    lon_in = lon_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
+    sin_lat_in = sin_lat_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
+    sigma_in = sigma_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
+    z_bounds_in = [b.reshape(n_blocks, b_len) for b in z_bounds]
+  _, scan_res = lax.scan(
+      lambda _, inp: (None, block_fn(inp)),
+      None,
+      (k_in, lon_in, sin_lat_in, sigma_in, *z_bounds_in),
+  )
+  return jax.tree_util.tree_map(
+      lambda x: x.reshape((n_blocks * b_len,) + x.shape[2:])[:num_levels],
+      scan_res,
+  )
+
+
+def _trilinear_block_output(
+    f_lat: jax.Array,
+    ops: _Matmul3DOperands,
+    chunk: _ChannelChunk,
+    block: _LevelBlock,
+    *,
+    w_lon_mat: jax.Array,
+    w_lat_mat: jax.Array,
+    w_z_mat: jax.Array,
+    oh_lon: tuple[jax.Array, ...],
+    lat_c0: jax.Array,
+    lvl_c0: jax.Array,
+    alphas: tuple[jax.Array, jax.Array, jax.Array],
+    k_glob: jax.Array,
+    buf_z_start: jax.Array,
+) -> jax.Array:
+  """Trilinear (low-order) interpolation of a block's trilinear channels.
+
+  Used when the main stencil is not already trilinear: the weights are the
+  linear weights of the cell that brackets the query (`alphas` are the
+  fractional positions in it), applied to the trilinear channels of `f_lat`
+  (those from `chunk.tri_start` on) in a linear-stencil vertical window.
+
+  Args:
+    f_lat: [ny_loc, l_buf, k_pad, n_lon] latitude-projected channel chunk.
+    ops: the shared operands of the call.
+    chunk: layout of the channel chunk.
+    block: layout of the level block.
+    w_lon_mat: [ny_loc, n_lon, nx_blk] longitude weights of the main stencil.
+    w_lat_mat: [ny_loc, w_lat_size, nx_blk] latitude window weights of the
+      main stencil.
+    w_z_mat: [ny_loc, w_z_blk_size, nx_blk] vertical window weights of the
+      main stencil.
+    oh_lon: per longitude stencil point, [ny_loc, n_lon, nx_blk] one-hots.
+    lat_c0: [ny_loc, nx_blk] first latitude row of the bracketing cell.
+    lvl_c0: [ny_loc, nx_blk] first level of the bracketing cell.
+    alphas: fractional position in the bracketing cell, `(lon, lat, z)`.
+    k_glob: global level of the block's first query level.
+    buf_z_start: start of the main vertical window within the buffer.
+
+  Returns:
+    [ny_loc, c_tri, nx_blk] trilinear values.
+  """
+  plan = ops.plan
+  ny_loc = plan.ny_loc
+  n_lon = plan.n_lon
+  w_lat_size = plan.w_lat_size
+  c_tri = chunk.c_tri
+  alpha_lon, alpha_lat, alpha_z = alphas
+  c0_lon_pos = 0 if plan.order == 'linear' else 1
+  if plan.order == 'linear':
+    w_lon_lin_mat = w_lon_mat
+    w_lat_lin_mat = w_lat_mat
+  else:
+    a_lon = alpha_lon[:, jnp.newaxis, :]
+    w_lon_lin_mat = (1.0 - a_lon) * oh_lon[c0_lon_pos] + a_lon * oh_lon[
+        c0_lon_pos + 1
+    ]
+    a_lat = alpha_lat[:, jnp.newaxis, :]
+    lat_rel = (lat_c0 - ops.win_lat_start[:, jnp.newaxis])[:, jnp.newaxis, :]
+    w_lat_lin_mat = (1.0 - a_lat) * (lat_rel == ops.lat_arange).astype(
+        plan.dtype
+    ) + a_lat * (lat_rel + 1 == ops.lat_arange).astype(plan.dtype)
+  if plan.vertical_order == 'linear':
+    buf_z_lin_start = buf_z_start
+    w_z_lin_mat = w_z_mat
+  else:
+    win_z_lin_start = _z_window_start(
+        k_glob - plan.eff_z_shift, plan.l_src, block.w_z_lin_blk_size
+    )
+    buf_z_lin_start = _buffer_window_start(
+        win_z_lin_start, ops.buf_z_origin, plan.l_buf, block.w_z_lin_blk_size
+    )
+    a_z = alpha_z[:, jnp.newaxis, :]
+    z_rel = (lvl_c0 - win_z_lin_start)[:, jnp.newaxis, :]
+    w_z_lin_mat = (1.0 - a_z) * (z_rel == block.z_lin_blk_arange).astype(
+        plan.dtype
+    ) + a_z * (z_rel + 1 == block.z_lin_blk_arange).astype(plan.dtype)
+
+  k_tri_raw = c_tri * w_lat_size
+  k_tri_pad = _round_to_multiple(k_tri_raw, _TPU_SUBLANES)
+  f_tri_win = lax.dynamic_slice(
+      f_lat,
+      (
+          jnp.int32(0),
+          buf_z_lin_start,
+          jnp.int32(chunk.tri_start * w_lat_size),
+          jnp.int32(0),
+      ),
+      (ny_loc, block.w_z_lin_blk_size, k_tri_raw, n_lon),
+  )
+  if k_tri_pad > k_tri_raw:
+    f_tri_win = jnp.pad(
+        f_tri_win,
+        [(0, 0), (0, 0), (0, k_tri_pad - k_tri_raw), (0, 0)],
+    )
+  f_tri_patch = f_tri_win.reshape(
+      ny_loc, block.w_z_lin_blk_size * k_tri_pad, n_lon
+  )
+  tri_lon = jnp.einsum(
+      'jkm,jmi->jki', f_tri_patch, w_lon_lin_mat, precision=ops.dot_prec_tri
+  )
+  tri_after_z = (
+      tri_lon.reshape(ny_loc, block.w_z_lin_blk_size, k_tri_pad, block.nx_blk)
+      * w_z_lin_mat[:, :, jnp.newaxis, :]
+  ).sum(axis=1)
+  return (
+      tri_after_z[:, :k_tri_raw, :].reshape(
+          ny_loc, c_tri, w_lat_size, block.nx_blk
+      )
+      * w_lat_lin_mat[:, jnp.newaxis, :, :]
+  ).sum(axis=2)
+
+
+def _limit_block_values(
+    val_jci: jax.Array,
+    b_lat: jax.Array,
+    ops: _Matmul3DOperands,
+    chunk: _ChannelChunk,
+    block: _LevelBlock,
+    *,
+    oh_lon: tuple[jax.Array, ...],
+    lat_c0: jax.Array,
+    lvl_c0: jax.Array,
+    w_z_mat: jax.Array,
+    k_glob: jax.Array,
+    buf_z_start: jax.Array,
+) -> jax.Array:
+  """Clips the limited channels of a block to their bracketing-cell bounds.
+
+  The cell bounds of every query are selected from the latitude-projected
+  bounds `b_lat` with one-hot weights of the bracketing cell (in a cell
+  window of the block's levels), then each limited channel is clipped to
+  its `[lo, hi]`, in the shifted variable if there is a bound reference.
+
+  Args:
+    val_jci: [ny_loc, c_cur, nx_blk] interpolated values of the chunk.
+    b_lat: [ny_loc, l_buf - 1, k_lim_pad, n_lon] latitude-projected cell
+      bounds.
+    ops: the shared operands of the call.
+    chunk: layout of the channel chunk.
+    block: layout of the level block.
+    oh_lon: per longitude stencil point, [ny_loc, n_lon, nx_blk] one-hots.
+    lat_c0: [ny_loc, nx_blk] first latitude row of the bracketing cell.
+    lvl_c0: [ny_loc, nx_blk] first level of the bracketing cell.
+    w_z_mat: [ny_loc, w_z_blk_size, nx_blk] vertical window weights.
+    k_glob: global level of the block's first query level.
+    buf_z_start: start of the vertical window within the buffer.
+
+  Returns:
+    `val_jci` with the limited channels clipped.
+  """
+  plan = ops.plan
+  ny_loc = plan.ny_loc
+  n_lon = plan.n_lon
+  assert (
+      ops.win_lat_cell_start is not None
+      and block.z_cell_blk_arange is not None
+      and block.lat_cell_arange is not None
+  )
+  c_lim = chunk.c_lim
+  win_z_cell_start = _z_window_start(
+      k_glob - plan.eff_z_shift, plan.l_src - 1, block.w_z_cell_blk_size
+  )
+  buf_z_cell_start = _buffer_window_start(
+      win_z_cell_start,
+      ops.buf_z_origin,
+      plan.l_buf - 1,
+      block.w_z_cell_blk_size,
+  )
+  p_lon_mat = oh_lon[0 if plan.order == 'linear' else 1]
+  p_z_mat = (
+      (lvl_c0 - win_z_cell_start)[:, jnp.newaxis, :] == block.z_cell_blk_arange
+  ).astype(plan.dtype)
+  p_lat_mat = (
+      (lat_c0 - ops.win_lat_cell_start[:, jnp.newaxis])[:, jnp.newaxis, :]
+      == block.lat_cell_arange
+  ).astype(plan.dtype)
+  b_win = lax.dynamic_slice_in_dim(
+      b_lat, buf_z_cell_start, block.w_z_cell_blk_size, axis=1
+  )
+  b_patch = b_win.reshape(
+      ny_loc, block.w_z_cell_blk_size * chunk.k_lim_pad, n_lon
+  )
+  b_lon = jnp.einsum(
+      'jkm,jmi->jki', b_patch, p_lon_mat, precision=ops.dot_prec_tri
+  )
+  b_after_z = (
+      b_lon.reshape(
+          ny_loc, block.w_z_cell_blk_size, chunk.k_lim_pad, block.nx_blk
+      )
+      * p_z_mat[:, :, jnp.newaxis, :]
+  ).sum(axis=1)
+  b_jci = (
+      b_after_z[:, : chunk.k_lim_raw, :].reshape(
+          ny_loc, 2 * c_lim, plan.w_lat_cell_size, block.nx_blk
+      )
+      * p_lat_mat[:, jnp.newaxis, :, :]
+  ).sum(axis=2)
+  lo_jci, hi_jci = b_jci[:, :c_lim, :], b_jci[:, c_lim:, :]
+  val_lim = val_jci[:, chunk.lim_start :, :]
+  if ops.ref_buf is not None:
+    ref_win = lax.dynamic_slice_in_dim(
+        ops.ref_buf, buf_z_start, block.w_z_blk_size, axis=0
+    )
+    ref_ji = (w_z_mat * ref_win[jnp.newaxis, :, jnp.newaxis]).sum(axis=1)[
+        :, jnp.newaxis, :
+    ]
+    val_lim = jnp.clip(val_lim + ref_ji, lo_jci, hi_jci) - ref_ji
+  else:
+    val_lim = jnp.clip(val_lim, lo_jci, hi_jci)
+  return (
+      val_lim
+      if chunk.lim_start == 0
+      else jnp.concatenate([val_jci[:, : chunk.lim_start, :], val_lim], axis=1)
+  )
+
+
+def _eval_level_block(
+    inputs,
+    ops: _Matmul3DOperands,
+    chunk: _ChannelChunk,
+    block: _LevelBlock,
+    f_lat: jax.Array,
+    b_lat: jax.Array | None,
+):
+  """Interpolates one block of query levels of a channel chunk.
+
+  Builds the block's stencils and one-hot weight matrices, contracts the
+  latitude-projected field `f_lat` with them (longitude first, then the
+  vertical and latitude windows), applies the limiter, and with trilinear
+  channels also evaluates their low-order output.
+
+  Args:
+    inputs: `(k_b, lon_b, sin_lat_b, sigma_b, sig_lo_b, sig_hi_b)` of one
+      block: for `b_len == 1` a scalar level index, [ny_loc, nx_loc] query
+      coordinates and scalar σ clamp bounds; otherwise [b_len] indices,
+      [b_len, ny_loc, nx_loc] coordinates and [b_len] bounds.
+    ops: the shared operands of the call.
+    chunk: layout of the channel chunk.
+    block: layout of the level block.
+    f_lat: [ny_loc, l_buf, k_pad, n_lon] latitude-projected channel chunk.
+    b_lat: [ny_loc, l_buf - 1, k_lim_pad, n_lon] latitude-projected cell
+      bounds of the limited channels (None without them).
+
+  Returns:
+    [c_cur, ny_loc, nx_loc] for `b_len == 1`, else
+    [b_len, c_cur, ny_loc, nx_loc]; with trilinear channels, a tuple with
+    the trilinear output ([c_tri, ...], same layout) second.
+  """
+  plan = ops.plan
+  ny_loc = plan.ny_loc
+  nx_loc = plan.nx_loc
+  n_lon = plan.n_lon
+  b_len = block.b_len
+  nx_blk = block.nx_blk
+  c_cur = chunk.c_cur
+  c_tri = chunk.c_tri
+  dtype = plan.dtype
+  k_b, lon_b, sin_lat_b, sigma_b, sig_lo_b, sig_hi_b = inputs
+  if b_len == 1:
+    k0_s = k_b
+    lon_s = lon_b
+    sin_lat_s = sin_lat_b
+    sigma_s = sigma_b
+    sigma_bounds_s = (sig_lo_b, sig_hi_b)
+  else:
+    k0_s = k_b[0]
+    lon_s = jnp.swapaxes(lon_b, 0, 1).reshape(ny_loc, nx_blk)
+    sin_lat_s = jnp.swapaxes(sin_lat_b, 0, 1).reshape(ny_loc, nx_blk)
+    sigma_s = jnp.swapaxes(sigma_b, 0, 1).reshape(ny_loc, nx_blk)
+    # One clamp per query level of the block (not per block), laid out
+    # like the level-major `nx_blk` axis.
+    sigma_bounds_s = tuple(
+        jnp.broadcast_to(b[:, jnp.newaxis], (b_len, nx_loc)).reshape(
+            1, nx_blk
+        )
+        for b in (sig_lo_b, sig_hi_b)
+    )
+
+  if c_tri > 0 and plan.need_separate_trilinear:
+    (
+        lon_idx,
+        lon_w,
+        lat_idx,
+        lat_w,
+        _,
+        lat_c0,
+        _,
+        (alpha_lon, alpha_lat),
+    ) = _horizontal_stencil_tuple(
+        ops.grid,
+        lon_s,
+        sin_lat_s,
+        plan.order,
+        include_linear_fractions=True,
+        lat_bounds=ops.lat_bounds_t,
+    )
+    lvl_idx, lvl_w, _, lvl_c0, alpha_z = _vertical_stencil_tuple(
+        sigma_s,
+        ops.sigma_nodes,
+        plan.vertical_order,
+        include_linear_fractions=True,
+        sigma_bounds=sigma_bounds_s,
+    )
+  else:
+    (
+        lon_idx,
+        lon_w,
+        lat_idx,
+        lat_w,
+        _,
+        lat_c0,
+        _,
+    ) = _horizontal_stencil_tuple(
+        ops.grid, lon_s, sin_lat_s, plan.order, lat_bounds=ops.lat_bounds_t
+    )
+    lvl_idx, lvl_w, _, lvl_c0 = _vertical_stencil_tuple(
+        sigma_s,
+        ops.sigma_nodes,
+        plan.vertical_order,
+        sigma_bounds=sigma_bounds_s,
+    )
+    alpha_lon = alpha_lat = alpha_z = None
+
+  k_glob = jnp.minimum(ops.k_offset + k0_s, plan.l_src - 1)
+  win_z_start = _z_window_start(
+      k_glob + plan.z_start_offset, plan.l_src, block.w_z_blk_size
+  )
+  buf_z_start = _buffer_window_start(
+      win_z_start, ops.buf_z_origin, plan.l_buf, block.w_z_blk_size
+  )
+
+  oh_lon = tuple(
+      (idx[:, jnp.newaxis, :] == ops.m_arange).astype(dtype) for idx in lon_idx
+  )
+  w_lon_mat = sum(w[:, jnp.newaxis, :] * oh for w, oh in zip(lon_w, oh_lon))
+  w_z_mat = _weighted_window_one_hot(
+      lvl_idx, lvl_w, block.z_blk_arange, dtype, win_z_start
+  )
+  w_lat_mat = _weighted_window_one_hot(
+      lat_idx, lat_w, ops.lat_arange, dtype, ops.win_lat_start
+  )
+
+  # Slice the block vertical window once from `f_lat` across all `b_len`
+  # query levels so overlapping vertical levels are reused in VMEM.
+  f_win = lax.dynamic_slice_in_dim(
+      f_lat, buf_z_start, block.w_z_blk_size, axis=1
+  )
+
+  val_lin_jci = None
+  if c_tri > 0 and plan.need_separate_trilinear:
+    assert (
+        alpha_lon is not None and alpha_lat is not None and alpha_z is not None
+    )
+    val_lin_jci = _trilinear_block_output(
+        f_lat,
+        ops,
+        chunk,
+        block,
+        w_lon_mat=w_lon_mat,
+        w_lat_mat=w_lat_mat,
+        w_z_mat=w_z_mat,
+        oh_lon=oh_lon,
+        lat_c0=lat_c0,
+        lvl_c0=lvl_c0,
+        alphas=(alpha_lon, alpha_lat, alpha_z),
+        k_glob=k_glob,
+        buf_z_start=buf_z_start,
+    )
+
+  f_patch = f_win.reshape(ny_loc, block.w_z_blk_size * chunk.k_pad, n_lon)
+  if block.fuse_gath_blk:
+    gathered_lon = jnp.einsum(
+        'jkm,jmi->jki', f_patch, w_lon_mat, precision=ops.dot_prec_f32
+    )
+    after_z = (
+        gathered_lon.reshape(ny_loc, block.w_z_blk_size, chunk.k_pad, nx_blk)
+        * w_z_mat[:, :, jnp.newaxis, :]
+    ).sum(axis=1)
+    val_jci = (
+        after_z[:, : chunk.k_raw, :].reshape(
+            ny_loc, c_cur, plan.w_lat_size, nx_blk
+        )
+        * w_lat_mat[:, jnp.newaxis, :, :]
+    ).sum(axis=2)
+  else:
+    val_parts = []
+    f_patch_cur = f_patch
+    for b_idx in range(b_len):
+      s0 = b_idx * nx_loc
+      s1 = s0 + nx_loc
+      g_b = jnp.einsum(
+          'jkm,jmi->jki',
+          f_patch_cur,
+          w_lon_mat[:, :, s0:s1],
+          precision=ops.dot_prec_f32,
+      )
+      az_b = (
+          g_b.reshape(ny_loc, block.w_z_blk_size, chunk.k_pad, nx_loc)
+          * w_z_mat[:, :, jnp.newaxis, s0:s1]
+      ).sum(axis=1)
+      v_b = (
+          az_b[:, : chunk.k_raw, :].reshape(
+              ny_loc, c_cur, plan.w_lat_size, nx_loc
+          )
+          * w_lat_mat[:, jnp.newaxis, :, s0:s1]
+      ).sum(axis=2)
+      if b_idx + 1 < b_len:
+        v_b, f_patch_cur = lax.optimization_barrier((v_b, f_patch_cur))
+      val_parts.append(v_b)
+    val_jci = jnp.concatenate(val_parts, axis=2)
+
+  if c_tri > 0 and not plan.need_separate_trilinear:
+    val_lin_jci = val_jci[:, chunk.tri_start :, :]
+
+  if chunk.c_lim > 0:
+    assert b_lat is not None
+    val_jci = _limit_block_values(
+        val_jci,
+        b_lat,
+        ops,
+        chunk,
+        block,
+        oh_lon=oh_lon,
+        lat_c0=lat_c0,
+        lvl_c0=lvl_c0,
+        w_z_mat=w_z_mat,
+        k_glob=k_glob,
+        buf_z_start=buf_z_start,
+    )
+
+  if b_len == 1:
+    if c_tri > 0:
+      return jnp.swapaxes(val_jci, 0, 1), jnp.swapaxes(val_lin_jci, 0, 1)
+    return jnp.swapaxes(val_jci, 0, 1)
+
+  out_blk = val_jci.reshape(ny_loc, c_cur, b_len, nx_loc).transpose(2, 1, 0, 3)
+  if c_tri > 0:
+    out_lin_blk = val_lin_jci.reshape(ny_loc, c_tri, b_len, nx_loc).transpose(
+        2, 1, 0, 3
+    )
+    return out_blk, out_lin_blk
+  return out_blk
+
+
+def _matmul_3d_channel_chunk(
+    f_chunk: jax.Array,
+    lim_start: int,
+    tri_start: int | None,
+    ops: _Matmul3DOperands,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+  """Interpolates a chunk of channels at every local query.
+
+  Projects the chunk (and the limited channels' cell bounds) onto the
+  latitude windows, then evaluates the query levels in blocks.
+
+  Args:
+    f_chunk: [c_cur, l_buf, n_lon, n_lat_buf] channels of the chunk.
+    lim_start: first limited channel of the chunk.
+    tri_start: first trilinear channel of the chunk, or None.
+    ops: the shared operands of the call.
+
+  Returns:
+    [c_cur, l_q_loc, nx_loc, ny_loc]; with `tri_start` not None, a tuple
+    whose second element is the trilinear output of the chunk's trilinear
+    channels, [c_tri, l_q_loc, nx_loc, ny_loc] (empty if there are none).
+  """
+  plan = ops.plan
+  dtype = plan.dtype
+  l_q_loc = plan.l_q_loc
+  nx_loc = plan.nx_loc
+  ny_loc = plan.ny_loc
+  chunk = _channel_chunk(plan, f_chunk.shape[0], lim_start, tri_start)
+  f_lat = _project_lat_window(
+      f_chunk, ops.m_lat_2d, plan.w_lat_size, ops.dot_prec_lhs_bf16
+  )
+
+  b_lat = None
+  if chunk.c_lim > 0:
+    assert ops.m_lat_cell_2d is not None
+    f_lim = f_chunk[lim_start:]
+    f_for_bounds = (
+        f_lim + ops.ref_buf[jnp.newaxis, :, jnp.newaxis, jnp.newaxis]
+        if ops.ref_buf is not None
+        else f_lim
+    )
+    lo_buf, hi_buf = _cell_bounds_3d(f_for_bounds)
+    if plan.is_tpu and dtype == jnp.float32:
+      # Widen cell bounds by 16-bit split ulp (`2^-16`) so 3-pass `bf16_3x`
+      # MXU selection preserves constants and non-negativity (`0.0`) exactly.
+      lo_buf = lo_buf - _BF16X3_BOUND_WIDENING * jnp.abs(lo_buf)
+      hi_buf = hi_buf + _BF16X3_BOUND_WIDENING * jnp.abs(hi_buf)
+    b_lat = _project_lat_window(
+        jnp.concatenate([lo_buf, hi_buf], axis=0),
+        ops.m_lat_cell_2d,
+        plan.w_lat_cell_size,
+        ops.dot_prec_tri,
+    )
+
+  if l_q_loc == 1:
+    block = _level_block(plan, chunk, 1)
+    res_0 = _eval_level_block(
+        (
+            jnp.int32(0),
+            ops.lon_q_t[0],
+            ops.sin_lat_q_t[0],
+            ops.sigma_q_t[0],
+            ops.sig_lo_arr[0],
+            ops.sig_hi_arr[0],
+        ),
+        ops,
+        chunk,
+        block,
+        f_lat,
+        b_lat,
+    )
+    if chunk.c_tri > 0:
+      out_0, out_lin_0 = res_0
+      return (
+          jnp.swapaxes(out_0, 1, 2)[:, jnp.newaxis, :, :],
+          jnp.swapaxes(out_lin_0, 1, 2)[:, jnp.newaxis, :, :],
+      )
+    out_single = jnp.swapaxes(res_0, 1, 2)[:, jnp.newaxis, :, :]
+    if tri_start is not None:
+      return out_single, jnp.zeros((0, 1, nx_loc, ny_loc), dtype=dtype)
+    return out_single
+
+  b_len = _level_block_length(
+      l_q_loc,
+      plan.is_tpu,
+      lambda b_cand: _matmul_3d_block_bytes(plan, chunk, b_cand),
+      _MATMUL_3D_BLOCK_VMEM_PROBE,
+  )
+  block = _level_block(plan, chunk, b_len)
+  scan_res = _scan_level_blocks(
+      functools.partial(
+          _eval_level_block,
+          ops=ops,
+          chunk=chunk,
+          block=block,
+          f_lat=f_lat,
+          b_lat=b_lat,
+      ),
+      ops.k_arr,
+      ops.lon_q_t,
+      ops.sin_lat_q_t,
+      ops.sigma_q_t,
+      (ops.sig_lo_arr, ops.sig_hi_arr),
+      b_len,
+  )
+  # [l_q_loc, c, ny_loc, nx_loc] -> [c, l_q_loc, nx_loc, ny_loc].
+  out_all = jax.tree_util.tree_map(lambda x: x.transpose(1, 0, 3, 2), scan_res)
+  if chunk.c_tri > 0:
+    return out_all
+  if tri_start is not None:
+    return out_all, jnp.zeros((0, l_q_loc, nx_loc, ny_loc), dtype=dtype)
+  return out_all
+
+
+def _map_channel_chunks(
+    eval_chunk,
+    f_buf: jax.Array,
+    plan: _Matmul3DPlan,
+    chunk_size: int,
+    limited_channel_start: int,
+    trilinear_channel_start: int | None,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+  """Evaluates the channels in chunks of `chunk_size` channels.
+
+  A single chunk is evaluated directly. When every channel is limited and
+  trilinear alike (or the setting is uniform), the channels are zero-padded
+  to a multiple of the chunk and scanned. Otherwise the chunks differ in
+  their limited / trilinear channels and are evaluated one after another.
+
+  Args:
+    eval_chunk: `_matmul_3d_channel_chunk` with the operands bound.
+    f_buf: local buffer, [C, L_buf, n_lon, n_lat_buf].
+    plan: the static plan of the call.
+    chunk_size: channels per chunk, from `_plan_channels`.
+    limited_channel_start: first limited channel.
+    trilinear_channel_start: first trilinear channel, or None.
+
+  Returns:
+    The interpolated channels, [C, l_q_loc, nx_loc, ny_loc], and with
+    `trilinear_channel_start` also the trilinear output.
+  """
+  num_channels = plan.num_channels
+  l_q_loc = plan.l_q_loc
+  nx_loc = plan.nx_loc
+  ny_loc = plan.ny_loc
+  if num_channels <= chunk_size:
+    return eval_chunk(f_buf, limited_channel_start, trilinear_channel_start)
+
+  if limited_channel_start == 0 and trilinear_channel_start in (None, 0):
+    c_pad = _round_to_multiple(num_channels, chunk_size)
+    f_pad = (
+        jnp.pad(f_buf, [(0, c_pad - num_channels), (0, 0), (0, 0), (0, 0)])
+        if c_pad > num_channels
+        else f_buf
+    )
+    f_grouped = f_pad.reshape(
+        c_pad // chunk_size, chunk_size, plan.l_buf, plan.n_lon, plan.n_lat_buf
+    )
+    _, out_grouped = lax.scan(
+        lambda _, grp: (None, eval_chunk(grp, 0, trilinear_channel_start)),
+        None,
+        f_grouped,
+    )
+    if trilinear_channel_start is not None:
+      out_g, out_lin_g = out_grouped
+      return (
+          out_g.reshape(c_pad, l_q_loc, nx_loc, ny_loc)[:num_channels],
+          out_lin_g.reshape(c_pad, l_q_loc, nx_loc, ny_loc)[:num_channels],
+      )
+    return out_grouped.reshape(c_pad, l_q_loc, nx_loc, ny_loc)[:num_channels]
+
+  outs = []
+  outs_lin = []
+  for c0 in range(0, num_channels, chunk_size):
+    c1 = min(c0 + chunk_size, num_channels)
+    sub_len = c1 - c0
+    sub_lim = max(0, min(sub_len, limited_channel_start - c0))
+    if trilinear_channel_start is None or c1 <= trilinear_channel_start:
+      sub_tri = None
+    else:
+      sub_tri = max(0, trilinear_channel_start - c0)
+    res = eval_chunk(f_buf[c0:c1], sub_lim, sub_tri)
+    if sub_tri is not None:
+      outs.append(res[0])
+      outs_lin.append(res[1])
+    else:
+      outs.append(res)
+  out_cat = jnp.concatenate(outs, axis=0)
+  if trilinear_channel_start is not None:
+    out_lin_cat = (
+        jnp.concatenate(outs_lin, axis=0)
+        if outs_lin
+        else jnp.zeros((0, l_q_loc, nx_loc, ny_loc), dtype=plan.dtype)
+    )
+    return out_cat, out_lin_cat
+  return out_cat
+
+
 def _matmul_3d_local(
     f_buf: jax.Array,
     lon_q: jax.Array,
@@ -2381,798 +3894,166 @@ def _matmul_3d_local(
   `lat_bounds` ([ny_loc] each) and `sigma_bounds` ([l_q_loc] each) are the
   `_lat_clamp_bounds` / `_level_clamp_bounds` of the local arrival rows and
   query levels; they keep every stencil inside its window.
+
+  The channels are interpolated in chunks sized to the memory budget
+  (`_plan_channels`); within a chunk, the field is first restricted to each
+  arrival row's latitude window (`_project_lat_window`), then the query
+  levels are evaluated in blocks (`_eval_level_block`, scanned by
+  `_scan_level_blocks`).
+
+  Args:
+    f_buf: local buffer [C, L_buf, n_lon, n_lat_buf]: source levels
+      `buf_z_origin ...` and halo-extended latitude rows `buf_lat_origin ...`.
+    lon_q: query longitudes [l_q_loc, nx_loc, ny_loc]; query `[k, i, j]`
+      arrives at local row `j` and level `k_offset + k`.
+    sin_lat_q: sine of the query latitudes, same shape.
+    sigma_q: query σ, same shape.
+    grid: the horizontal grid holding the source data.
+    sigma_nodes: source σ nodes.
+    order: horizontal interpolation order.
+    limiter: the limiter, applied to channels from `limited_channel_start`.
+    vertical_order: vertical interpolation order.
+    limiter_bound_reference: per-level limiter bound reference, or None.
+    k_offset: global level of the first local query level.
+    buf_z_origin: source level of the first buffer level.
+    j_offset: global latitude row of the first local arrival row.
+    buf_lat_origin: source row of the first buffer row.
+    max_lat_shift: latitude displacement limit, in cells.
+    max_vertical_shift: vertical displacement limit, in cells.
+    lat_bounds: latitude clamp bounds, see above.
+    sigma_bounds: σ clamp bounds, see above.
+    limited_channel_start: first limited channel.
+    trilinear_channel_start: first channel that also gets a trilinear output,
+      or None.
+
+  Returns:
+    [C, l_q_loc, nx_loc, ny_loc]; with `trilinear_channel_start` not None, a
+    tuple whose second element is the trilinear output of the channels from
+    that index on, [C - trilinear_channel_start, l_q_loc, nx_loc, ny_loc].
   """
-  dtype = f_buf.dtype
-  is_tpu = jax.default_backend() == 'tpu'
-  n_lon = grid.longitude_nodes
-  n_lat = grid.latitude_nodes
-  n_lat_ext = n_lat + 2 * _HALO_WIDTH
-  l_src = sigma_nodes.shape[0]
-  num_channels, l_buf, _, n_lat_buf = f_buf.shape
-  l_q_loc, nx_loc, ny_loc = lon_q.shape
-
-  eff_limiter = limiter if limited_channel_start < num_channels else None
-  eff_lat_shift = _effective_window_shift(max_lat_shift)
-  eff_z_shift = _effective_window_shift(max_vertical_shift)
-  s_lat = 2 if order == 'linear' else 4
-  s_z = 2 if vertical_order == 'linear' else 4
-  w_lat_size = _window_size(n_lat_buf, n_lat_ext, eff_lat_shift, s_lat)
-  w_z_size = _window_size(l_buf, l_src, eff_z_shift, s_z)
-  lat_start_offset = (2 if order == 'linear' else 1) - eff_lat_shift
-  z_start_offset = (
-      -eff_z_shift if vertical_order == 'linear' else (-eff_z_shift - 1)
+  plan = _plan_matmul_3d(
+      f_buf,
+      lon_q,
+      grid,
+      sigma_nodes,
+      order=order,
+      limiter=limiter,
+      vertical_order=vertical_order,
+      max_lat_shift=max_lat_shift,
+      max_vertical_shift=max_vertical_shift,
+      limited_channel_start=limited_channel_start,
+      trilinear_channel_start=trilinear_channel_start,
   )
+  channel_plan = _plan_channels(
+      plan, limited_channel_start, trilinear_channel_start
+  )
+  if channel_plan.segments is not None:
+    return _matmul_3d_by_segments(
+        functools.partial(
+            _matmul_3d_local,
+            lon_q=lon_q,
+            sin_lat_q=sin_lat_q,
+            sigma_q=sigma_q,
+            grid=grid,
+            sigma_nodes=sigma_nodes,
+            order=order,
+            vertical_order=vertical_order,
+            limiter_bound_reference=limiter_bound_reference,
+            k_offset=k_offset,
+            buf_z_origin=buf_z_origin,
+            j_offset=j_offset,
+            buf_lat_origin=buf_lat_origin,
+            max_lat_shift=max_lat_shift,
+            max_vertical_shift=max_vertical_shift,
+            lat_bounds=lat_bounds,
+            sigma_bounds=sigma_bounds,
+        ),
+        f_buf,
+        channel_plan.segments,
+        plan,
+        limiter=plan.limiter,
+        with_trilinear=trilinear_channel_start is not None,
+    )
 
-  j_global = _arrival_lat_rows(j_offset, ny_loc, n_lat)
-  win_lat_start, buf_lat_start = _lat_window_starts(
+  dtype = plan.dtype
+  j_global = _arrival_lat_rows(j_offset, plan.ny_loc, grid.latitude_nodes)
+  win_lat_start, m_lat_2d = _lat_window_selector(
       j_global,
-      j_global + lat_start_offset,
-      n_lat_ext,
-      n_lat_buf,
-      w_lat_size,
+      j_global + plan.lat_start_offset,
+      plan.n_lat_ext,
+      plan.n_lat_buf,
+      plan.w_lat_size,
       buf_lat_origin,
+      dtype,
   )
-  # Build `m_lat_win` in `[ny_loc, w_lat_size, n_lat_buf]` so `dot(m_lat_2d, ...)`
-  # keeps `n_lon` in `axis=-1` without cross-lane minor-axis transposes.
-  m_lat_win = jax.nn.one_hot(
-      buf_lat_start[:, jnp.newaxis]
-      + jnp.arange(w_lat_size, dtype=jnp.int32)[jnp.newaxis, :],
-      n_lat_buf,
-      dtype=dtype,
-  )  # [ny_loc, w_lat_size, n_lat_buf]
-  m_lat_2d = m_lat_win.reshape(ny_loc * w_lat_size, n_lat_buf)
-
   dot_prec_lhs_bf16 = jax_numpy_utils.resolve_dot_precision(
       None, m_lat_2d, f_buf, lhs_exact_in_bf16=True
   )
   dot_prec_f32 = jax_numpy_utils.resolve_dot_precision(None, f_buf, f_buf)
 
   ref_buf = None
-  if eff_limiter is not None and limiter_bound_reference is not None:
+  if plan.limiter is not None and limiter_bound_reference is not None:
     ref_arr = jnp.asarray(limiter_bound_reference, dtype=dtype)
     ref_centered = ref_arr - jnp.mean(ref_arr)
     k_buf_levels = jnp.clip(
-        buf_z_origin + jnp.arange(l_buf, dtype=jnp.int32), 0, l_src - 1
+        buf_z_origin + jnp.arange(plan.l_buf, dtype=jnp.int32),
+        0,
+        plan.l_src - 1,
     )
     ref_buf = _take_1d(ref_centered, k_buf_levels)
 
-  w_lat_cell_size = 0
-  w_z_cell_size = 0
   win_lat_cell_start = None
   m_lat_cell_2d = None
-  if eff_limiter is not None:
-    w_lat_cell_size = _window_size(
-        n_lat_buf - 1, n_lat_ext - 1, eff_lat_shift, 2
-    )
-    win_lat_cell_start, buf_lat_cell_start = _lat_window_starts(
+  if plan.limiter is not None:
+    win_lat_cell_start, m_lat_cell_2d = _lat_window_selector(
         j_global,
-        j_global + 1 - eff_lat_shift,
-        n_lat_ext - 1,
-        n_lat_buf - 1,
-        w_lat_cell_size,
+        j_global + 1 - plan.eff_lat_shift,
+        plan.n_lat_ext - 1,
+        plan.n_lat_buf - 1,
+        plan.w_lat_cell_size,
         buf_lat_origin,
-    )
-    m_lat_cell_win = jax.nn.one_hot(
-        buf_lat_cell_start[:, jnp.newaxis]
-        + jnp.arange(w_lat_cell_size, dtype=jnp.int32)[jnp.newaxis, :],
-        n_lat_buf - 1,
-        dtype=dtype,
-    )  # [ny_loc, w_lat_cell_size, n_lat_buf - 1]
-    m_lat_cell_2d = m_lat_cell_win.reshape(
-        ny_loc * w_lat_cell_size, n_lat_buf - 1
-    )
-    w_z_cell_size = _window_size(l_buf - 1, l_src - 1, eff_z_shift, 2)
-
-  need_separate_trilinear = trilinear_channel_start is not None and not (
-      order == 'linear' and vertical_order == 'linear'
-  )
-
-  # Size channel chunks so hoisted `[ny_loc, l_buf, k_pad, n_lon]` buffers stay
-  # compact in HBM AND per-level `b_len = 1` working sets fit inside TPU v5e's
-  # 128 MiB on-chip VMEM without spilling.
-  item_bytes = 8 if dtype == jnp.float64 else 4
-  n_lon_pad128 = _round_to_multiple(n_lon, _TPU_LANES)
-  nx_pad128 = _round_to_multiple(nx_loc, _TPU_LANES)
-  w_lon_vmem_b = (
-      ny_loc * _round_to_multiple(n_lon, _TPU_SUBLANES) * nx_pad128 * item_bytes
-  )
-  if is_tpu:
-    max_c_cap = _MATMUL_3D_MAX_CHANNELS_TPU
-    single_buf_limit = _MATMUL_3D_SINGLE_BUF_LIMIT_TPU
-    ws_buf_limit = _MATMUL_3D_WS_BUF_LIMIT_TPU
-    vmem_limit = _MATMUL_3D_VMEM_LIMIT_TPU
-  else:
-    max_c_cap = _MATMUL_3D_MAX_CHANNELS_CPU_GPU
-    single_buf_limit = _MATMUL_3D_SINGLE_BUF_LIMIT_CPU_GPU
-    ws_buf_limit = _MATMUL_3D_WS_BUF_LIMIT_CPU_GPU
-    vmem_limit = _MATMUL_3D_VMEM_LIMIT_CPU_GPU
-
-  def _fits_budget(c_test: int, lim_s: int = 0) -> bool:
-    k_c_pad = _round_to_multiple(c_test * w_lat_size, _TPU_SUBLANES)
-    f_lat_b = ny_loc * l_buf * k_c_pad * n_lon_pad128 * item_bytes
-    f_patch_b = ny_loc * w_z_size * k_c_pad * n_lon_pad128 * item_bytes
-    gath_b = ny_loc * w_z_size * k_c_pad * nx_pad128 * item_bytes
-    vmem_b = w_lon_vmem_b + f_patch_b + gath_b
-    max_single_b = f_lat_b
-    ws_b = f_lat_b
-    c_lim_test = max(0, c_test - lim_s) if eff_limiter is not None else 0
-    if c_lim_test > 0:
-      k_l_pad = _round_to_multiple(
-          2 * c_lim_test * w_lat_cell_size, _TPU_SUBLANES
-      )
-      b_lat_b = (
-          ny_loc * max(1, l_buf - 1) * k_l_pad * n_lon_pad128 * item_bytes
-      )
-      b_patch_b = ny_loc * w_z_cell_size * k_l_pad * n_lon_pad128 * item_bytes
-      b_lon_b = ny_loc * w_z_cell_size * k_l_pad * nx_pad128 * item_bytes
-      max_single_b = max(max_single_b, b_lat_b)
-      ws_b = f_lat_b + b_lat_b
-      vmem_b = max(vmem_b, w_lon_vmem_b + b_patch_b + b_lon_b)
-    return (
-        max_single_b <= single_buf_limit
-        and ws_b <= ws_buf_limit
-        and vmem_b <= vmem_limit
+        dtype,
     )
 
-  if num_channels <= max_c_cap and _fits_budget(
-      num_channels, limited_channel_start
-  ):
-    chunk_size = num_channels
-  else:
-    chunk_size = 1
-    for c_cand in range(min(num_channels, max_c_cap), 0, -1):
-      if _fits_budget(c_cand, 0):
-        chunk_size = c_cand
-        break
-
-  # If channel chunking is needed with mixed channel options, split into
-  # homogeneous channel groups so each `lax.scan` chunk is uniform.
-  if num_channels > chunk_size and (
-      0 < limited_channel_start < num_channels
-      or (
-          trilinear_channel_start is not None
-          and 0 < trilinear_channel_start < num_channels
-      )
-  ):
-    common_kw = dict(
-        lon_q=lon_q,
-        sin_lat_q=sin_lat_q,
-        sigma_q=sigma_q,
-        grid=grid,
-        sigma_nodes=sigma_nodes,
-        order=order,
-        vertical_order=vertical_order,
-        limiter_bound_reference=limiter_bound_reference,
-        k_offset=k_offset,
-        buf_z_origin=buf_z_origin,
-        j_offset=j_offset,
-        buf_lat_origin=buf_lat_origin,
-        max_lat_shift=max_lat_shift,
-        max_vertical_shift=max_vertical_shift,
-        lat_bounds=lat_bounds,
-        sigma_bounds=sigma_bounds,
-    )
-    split_pts = sorted(
-        {0, num_channels}
-        | (
-            {min(num_channels, max(0, limited_channel_start))}
-            if eff_limiter is not None
-            else set()
-        )
-        | (
-            {min(num_channels, max(0, trilinear_channel_start))}
-            if trilinear_channel_start is not None
-            else set()
-        )
-    )
-    outs = []
-    outs_lin = []
-    for s0, s1 in zip(split_pts[:-1], split_pts[1:]):
-      if s0 == s1:
-        continue
-      sub_lim = eff_limiter if s0 >= limited_channel_start else None
-      sub_tri = (
-          0
-          if (trilinear_channel_start is not None and s0 >= trilinear_channel_start)
-          else None
-      )
-      res = _matmul_3d_local(
-          f_buf[s0:s1],
-          limiter=sub_lim,
-          limited_channel_start=0,
-          trilinear_channel_start=sub_tri,
-          **common_kw,
-      )
-      if sub_tri is not None:
-        outs.append(res[0])
-        outs_lin.append(res[1])
-      else:
-        outs.append(res)
-    out_full = outs[0] if len(outs) == 1 else jnp.concatenate(outs, axis=0)
-    if trilinear_channel_start is not None:
-      # No trilinear channels at all (`trilinear_channel_start == C`) leaves
-      # `outs_lin` empty; the gather method returns an empty trilinear block.
-      if not outs_lin:
-        out_lin_full = jnp.zeros((0, l_q_loc, nx_loc, ny_loc), dtype=dtype)
-      elif len(outs_lin) == 1:
-        out_lin_full = outs_lin[0]
-      else:
-        out_lin_full = jnp.concatenate(outs_lin, axis=0)
-      return out_full, out_lin_full
-    return out_full
-
-  # Pre-transpose query coordinates once outside `lax.scan` so `nx_loc` stays
-  # in `axis=-1` throughout `_scan_block` with zero per-level transposes.
-  lon_q_t = jnp.swapaxes(lon_q, 1, 2)
-  sin_lat_q_t = jnp.swapaxes(sin_lat_q, 1, 2)
-  sigma_q_t = jnp.swapaxes(sigma_q, 1, 2)
-  k_arr = jnp.arange(l_q_loc, dtype=jnp.int32)
-  # Queries are laid out [ny_loc, nx] inside the scan.
-  lat_bounds_t = tuple(
-      jnp.asarray(b)[:, jnp.newaxis] for b in lat_bounds
-  )
+  # Queries are pre-transposed once, outside every `lax.scan`, and laid out
+  # [ny_loc, nx] inside the scans.
   sig_lo_arr, sig_hi_arr = sigma_bounds
-  m_arange = jnp.arange(n_lon, dtype=jnp.int32)[:, jnp.newaxis]
-  w_z_lin_size = _window_size(l_buf, l_src, eff_z_shift, 2)
-  lat_arange = jnp.arange(w_lat_size, dtype=jnp.int32)[:, jnp.newaxis]
-  c0_lon_pos = 0 if order == 'linear' else 1
-  dot_prec_tri = (
-      lax.DotAlgorithmPreset.BF16_BF16_F32_X3
-      if (is_tpu and dtype == jnp.float32)
-      else dot_prec_f32
+  ops = _Matmul3DOperands(
+      plan=plan,
+      grid=grid,
+      sigma_nodes=sigma_nodes,
+      k_offset=k_offset,
+      buf_z_origin=buf_z_origin,
+      win_lat_start=win_lat_start,
+      m_lat_2d=m_lat_2d,
+      win_lat_cell_start=win_lat_cell_start,
+      m_lat_cell_2d=m_lat_cell_2d,
+      ref_buf=ref_buf,
+      lon_q_t=jnp.swapaxes(lon_q, 1, 2),
+      sin_lat_q_t=jnp.swapaxes(sin_lat_q, 1, 2),
+      sigma_q_t=jnp.swapaxes(sigma_q, 1, 2),
+      k_arr=jnp.arange(plan.l_q_loc, dtype=jnp.int32),
+      lat_bounds_t=tuple(jnp.asarray(b)[:, jnp.newaxis] for b in lat_bounds),
+      sig_lo_arr=sig_lo_arr,
+      sig_hi_arr=sig_hi_arr,
+      m_arange=jnp.arange(plan.n_lon, dtype=jnp.int32)[:, jnp.newaxis],
+      lat_arange=jnp.arange(plan.w_lat_size, dtype=jnp.int32)[:, jnp.newaxis],
+      dot_prec_lhs_bf16=dot_prec_lhs_bf16,
+      dot_prec_f32=dot_prec_f32,
+      dot_prec_tri=(
+          lax.DotAlgorithmPreset.BF16_BF16_F32_X3
+          if (plan.is_tpu and dtype == jnp.float32)
+          else dot_prec_f32
+      ),
   )
-
-  def _eval_channel_chunk(
-      f_chunk: jax.Array,
-      lim_start: int,
-      tri_start: int | None,
-  ) -> jax.Array | tuple[jax.Array, jax.Array]:
-    c_cur = f_chunk.shape[0]
-    c_lim = max(0, c_cur - lim_start) if eff_limiter is not None else 0
-    c_tri = max(0, c_cur - tri_start) if tri_start is not None else 0
-
-    k_raw = c_cur * w_lat_size
-    k_pad = _round_to_multiple(k_raw, _TPU_SUBLANES)
-    f_2d_t = (
-        f_chunk.swapaxes(0, 1)
-        .reshape(l_buf * c_cur, n_lon, n_lat_buf)
-        .transpose(2, 0, 1)
-        .reshape(n_lat_buf, l_buf * c_cur * n_lon)
-    )
-    f_lat = (
-        jnp.dot(m_lat_2d, f_2d_t, precision=dot_prec_lhs_bf16)
-        .reshape(ny_loc, w_lat_size, l_buf * c_cur, n_lon)
-        .transpose(0, 2, 1, 3)
-        .reshape(ny_loc, l_buf, k_raw, n_lon)
-    )
-    if k_pad > k_raw:
-      f_lat = jnp.pad(f_lat, [(0, 0), (0, 0), (0, k_pad - k_raw), (0, 0)])
-
-    b_lat = None
-    k_lim_raw = 0
-    k_lim_pad = 0
-    if c_lim > 0:
-      assert m_lat_cell_2d is not None
-      k_lim_raw = 2 * c_lim * w_lat_cell_size
-      k_lim_pad = _round_to_multiple(k_lim_raw, _TPU_SUBLANES)
-      f_lim = f_chunk[lim_start:]
-      f_for_bounds = (
-          f_lim + ref_buf[jnp.newaxis, :, jnp.newaxis, jnp.newaxis]
-          if ref_buf is not None
-          else f_lim
-      )
-      lo_buf, hi_buf = _cell_bounds_3d(f_for_bounds)
-      if is_tpu and dtype == jnp.float32:
-        # Widen cell bounds by 16-bit split ulp (`2^-16`) so 3-pass `bf16_3x`
-        # MXU selection preserves constants and non-negativity (`0.0`) exactly.
-        lo_buf = lo_buf - _BF16X3_BOUND_WIDENING * jnp.abs(lo_buf)
-        hi_buf = hi_buf + _BF16X3_BOUND_WIDENING * jnp.abs(hi_buf)
-      b_2d_t = (
-          jnp.concatenate([lo_buf, hi_buf], axis=0)
-          .swapaxes(0, 1)
-          .reshape((l_buf - 1) * 2 * c_lim, n_lon, n_lat_buf - 1)
-          .transpose(2, 0, 1)
-          .reshape(n_lat_buf - 1, (l_buf - 1) * 2 * c_lim * n_lon)
-      )
-      b_lat = (
-          jnp.dot(m_lat_cell_2d, b_2d_t, precision=dot_prec_tri)
-          .reshape(ny_loc, w_lat_cell_size, (l_buf - 1) * 2 * c_lim, n_lon)
-          .transpose(0, 2, 1, 3)
-          .reshape(ny_loc, l_buf - 1, k_lim_raw, n_lon)
-      )
-      if k_lim_pad > k_lim_raw:
-        b_lat = jnp.pad(
-            b_lat, [(0, 0), (0, 0), (0, k_lim_pad - k_lim_raw), (0, 0)]
-        )
-
-    def _eval_levels_grouped(b_len: int):
-      w_z_blk_size = min(l_buf, min(l_src, w_z_size + b_len - 1))
-      w_z_lin_blk_size = min(l_buf, min(l_src, w_z_lin_size + b_len - 1))
-      w_z_cell_blk_size = (
-          min(
-              max(1, l_buf - 1),
-              min(max(1, l_src - 1), w_z_cell_size + b_len - 1),
-          )
-          if c_lim > 0
-          else 0
-      )
-      nx_blk = b_len * nx_loc
-      nx_blk_pad128 = _round_to_multiple(nx_blk, _TPU_LANES)
-      f_patch_blk_b = ny_loc * w_z_blk_size * k_pad * n_lon_pad128 * item_bytes
-      w_lon_blk_b = (
-          ny_loc
-          * _round_to_multiple(n_lon, _TPU_SUBLANES)
-          * nx_blk_pad128
-          * item_bytes
-      )
-      gath_blk_b = ny_loc * w_z_blk_size * k_pad * nx_blk_pad128 * item_bytes
-      fuse_gath_blk = (
-          b_len == 1 or (f_patch_blk_b + w_lon_blk_b + gath_blk_b) <= vmem_limit
-      )
-
-      z_blk_arange = jnp.arange(w_z_blk_size, dtype=jnp.int32)[:, jnp.newaxis]
-      z_lin_blk_arange = jnp.arange(w_z_lin_blk_size, dtype=jnp.int32)[
-          :, jnp.newaxis
-      ]
-      z_cell_blk_arange = (
-          jnp.arange(w_z_cell_blk_size, dtype=jnp.int32)[:, jnp.newaxis]
-          if c_lim > 0
-          else None
-      )
-      lat_cell_arange = (
-          jnp.arange(w_lat_cell_size, dtype=jnp.int32)[:, jnp.newaxis]
-          if c_lim > 0
-          else None
-      )
-
-      def _scan_block(inputs):
-        k_b, lon_b, sin_lat_b, sigma_b, sig_lo_b, sig_hi_b = inputs
-        if b_len == 1:
-          k0_s = k_b
-          lon_s = lon_b
-          sin_lat_s = sin_lat_b
-          sigma_s = sigma_b
-          sigma_bounds_s = (sig_lo_b, sig_hi_b)
-        else:
-          k0_s = k_b[0]
-          lon_s = jnp.swapaxes(lon_b, 0, 1).reshape(ny_loc, nx_blk)
-          sin_lat_s = jnp.swapaxes(sin_lat_b, 0, 1).reshape(ny_loc, nx_blk)
-          sigma_s = jnp.swapaxes(sigma_b, 0, 1).reshape(ny_loc, nx_blk)
-          # One clamp per query level of the block (not per block), laid out
-          # like the level-major `nx_blk` axis.
-          sigma_bounds_s = tuple(
-              jnp.broadcast_to(
-                  b[:, jnp.newaxis], (b_len, nx_loc)
-              ).reshape(1, nx_blk)
-              for b in (sig_lo_b, sig_hi_b)
-          )
-
-        if c_tri > 0 and need_separate_trilinear:
-          (
-              lon_idx,
-              lon_w,
-              lat_idx,
-              lat_w,
-              _,
-              lat_c0,
-              _,
-              (alpha_lon, alpha_lat),
-          ) = _horizontal_stencil_tuple(
-              grid,
-              lon_s,
-              sin_lat_s,
-              order,
-              include_linear_fractions=True,
-              lat_bounds=lat_bounds_t,
-          )
-          lvl_idx, lvl_w, _, lvl_c0, alpha_z = _vertical_stencil_tuple(
-              sigma_s,
-              sigma_nodes,
-              vertical_order,
-              include_linear_fractions=True,
-              sigma_bounds=sigma_bounds_s,
-          )
-        else:
-          (
-              lon_idx,
-              lon_w,
-              lat_idx,
-              lat_w,
-              _,
-              lat_c0,
-              _,
-          ) = _horizontal_stencil_tuple(
-              grid, lon_s, sin_lat_s, order, lat_bounds=lat_bounds_t
-          )
-          lvl_idx, lvl_w, _, lvl_c0 = _vertical_stencil_tuple(
-              sigma_s, sigma_nodes, vertical_order, sigma_bounds=sigma_bounds_s
-          )
-          alpha_lon = alpha_lat = alpha_z = None
-
-        k_glob = jnp.minimum(k_offset + k0_s, l_src - 1)
-        win_z_start = _z_window_start(
-            k_glob + z_start_offset, l_src, w_z_blk_size
-        )
-        buf_z_start = _buffer_window_start(
-            win_z_start, buf_z_origin, l_buf, w_z_blk_size
-        )
-
-        oh_lon = tuple(
-            (idx[:, jnp.newaxis, :] == m_arange).astype(dtype)
-            for idx in lon_idx
-        )
-        w_lon_mat = sum(
-            w[:, jnp.newaxis, :] * oh for w, oh in zip(lon_w, oh_lon)
-        )
-        w_z_mat = _weighted_window_one_hot(
-            lvl_idx, lvl_w, z_blk_arange, dtype, win_z_start
-        )
-        w_lat_mat = _weighted_window_one_hot(
-            lat_idx, lat_w, lat_arange, dtype, win_lat_start
-        )
-
-        # Slice the block vertical window once from `f_lat` across all `b_len`
-        # query levels so overlapping vertical levels are reused in VMEM.
-        f_win = lax.dynamic_slice_in_dim(
-            f_lat, buf_z_start, w_z_blk_size, axis=1
-        )
-
-        val_lin_jci = None
-        if c_tri > 0 and need_separate_trilinear:
-          assert (
-              alpha_lon is not None
-              and alpha_lat is not None
-              and alpha_z is not None
-          )
-          if order == 'linear':
-            w_lon_lin_mat = w_lon_mat
-            w_lat_lin_mat = w_lat_mat
-          else:
-            a_lon = alpha_lon[:, jnp.newaxis, :]
-            w_lon_lin_mat = (1.0 - a_lon) * oh_lon[c0_lon_pos] + a_lon * oh_lon[
-                c0_lon_pos + 1
-            ]
-            a_lat = alpha_lat[:, jnp.newaxis, :]
-            lat_rel = (lat_c0 - win_lat_start[:, jnp.newaxis])[
-                :, jnp.newaxis, :
-            ]
-            w_lat_lin_mat = (1.0 - a_lat) * (lat_rel == lat_arange).astype(
-                dtype
-            ) + a_lat * (lat_rel + 1 == lat_arange).astype(dtype)
-          if vertical_order == 'linear':
-            buf_z_lin_start = buf_z_start
-            w_z_lin_mat = w_z_mat
-          else:
-            win_z_lin_start = _z_window_start(
-                k_glob - eff_z_shift, l_src, w_z_lin_blk_size
-            )
-            buf_z_lin_start = _buffer_window_start(
-                win_z_lin_start, buf_z_origin, l_buf, w_z_lin_blk_size
-            )
-            a_z = alpha_z[:, jnp.newaxis, :]
-            z_rel = (lvl_c0 - win_z_lin_start)[:, jnp.newaxis, :]
-            w_z_lin_mat = (1.0 - a_z) * (
-                z_rel == z_lin_blk_arange
-            ).astype(dtype) + a_z * (z_rel + 1 == z_lin_blk_arange).astype(
-                dtype
-            )
-
-          k_tri_raw = c_tri * w_lat_size
-          k_tri_pad = _round_to_multiple(k_tri_raw, _TPU_SUBLANES)
-          f_tri_win = lax.dynamic_slice(
-              f_lat,
-              (
-                  jnp.int32(0),
-                  buf_z_lin_start,
-                  jnp.int32(tri_start * w_lat_size),
-                  jnp.int32(0),
-              ),
-              (ny_loc, w_z_lin_blk_size, k_tri_raw, n_lon),
-          )
-          if k_tri_pad > k_tri_raw:
-            f_tri_win = jnp.pad(
-                f_tri_win,
-                [(0, 0), (0, 0), (0, k_tri_pad - k_tri_raw), (0, 0)],
-            )
-          f_tri_patch = f_tri_win.reshape(
-              ny_loc, w_z_lin_blk_size * k_tri_pad, n_lon
-          )
-          tri_lon = jnp.einsum(
-              'jkm,jmi->jki', f_tri_patch, w_lon_lin_mat, precision=dot_prec_tri
-          )
-          tri_after_z = (
-              tri_lon.reshape(ny_loc, w_z_lin_blk_size, k_tri_pad, nx_blk)
-              * w_z_lin_mat[:, :, jnp.newaxis, :]
-          ).sum(axis=1)
-          val_lin_jci = (
-              tri_after_z[:, :k_tri_raw, :].reshape(
-                  ny_loc, c_tri, w_lat_size, nx_blk
-              )
-              * w_lat_lin_mat[:, jnp.newaxis, :, :]
-          ).sum(axis=2)
-
-        f_patch = f_win.reshape(ny_loc, w_z_blk_size * k_pad, n_lon)
-        if fuse_gath_blk:
-          gathered_lon = jnp.einsum(
-              'jkm,jmi->jki', f_patch, w_lon_mat, precision=dot_prec_f32
-          )
-          after_z = (
-              gathered_lon.reshape(ny_loc, w_z_blk_size, k_pad, nx_blk)
-              * w_z_mat[:, :, jnp.newaxis, :]
-          ).sum(axis=1)
-          val_jci = (
-              after_z[:, :k_raw, :].reshape(ny_loc, c_cur, w_lat_size, nx_blk)
-              * w_lat_mat[:, jnp.newaxis, :, :]
-          ).sum(axis=2)
-        else:
-          val_parts = []
-          f_patch_cur = f_patch
-          for b_idx in range(b_len):
-            s0 = b_idx * nx_loc
-            s1 = s0 + nx_loc
-            g_b = jnp.einsum(
-                'jkm,jmi->jki',
-                f_patch_cur,
-                w_lon_mat[:, :, s0:s1],
-                precision=dot_prec_f32,
-            )
-            az_b = (
-                g_b.reshape(ny_loc, w_z_blk_size, k_pad, nx_loc)
-                * w_z_mat[:, :, jnp.newaxis, s0:s1]
-            ).sum(axis=1)
-            v_b = (
-                az_b[:, :k_raw, :].reshape(ny_loc, c_cur, w_lat_size, nx_loc)
-                * w_lat_mat[:, jnp.newaxis, :, s0:s1]
-            ).sum(axis=2)
-            if b_idx + 1 < b_len:
-              v_b, f_patch_cur = lax.optimization_barrier((v_b, f_patch_cur))
-            val_parts.append(v_b)
-          val_jci = jnp.concatenate(val_parts, axis=2)
-
-        if c_tri > 0 and not need_separate_trilinear:
-          val_lin_jci = val_jci[:, tri_start:, :]
-
-        if c_lim > 0:
-          assert (
-              b_lat is not None
-              and win_lat_cell_start is not None
-              and z_cell_blk_arange is not None
-              and lat_cell_arange is not None
-          )
-          win_z_cell_start = _z_window_start(
-              k_glob - eff_z_shift, l_src - 1, w_z_cell_blk_size
-          )
-          buf_z_cell_start = _buffer_window_start(
-              win_z_cell_start, buf_z_origin, l_buf - 1, w_z_cell_blk_size
-          )
-          p_lon_mat = oh_lon[c0_lon_pos]
-          p_z_mat = (
-              (lvl_c0 - win_z_cell_start)[:, jnp.newaxis, :]
-              == z_cell_blk_arange
-          ).astype(dtype)
-          p_lat_mat = (
-              (lat_c0 - win_lat_cell_start[:, jnp.newaxis])[:, jnp.newaxis, :]
-              == lat_cell_arange
-          ).astype(dtype)
-          b_win = lax.dynamic_slice_in_dim(
-              b_lat, buf_z_cell_start, w_z_cell_blk_size, axis=1
-          )
-          b_patch = b_win.reshape(ny_loc, w_z_cell_blk_size * k_lim_pad, n_lon)
-          b_lon = jnp.einsum(
-              'jkm,jmi->jki', b_patch, p_lon_mat, precision=dot_prec_tri
-          )
-          b_after_z = (
-              b_lon.reshape(ny_loc, w_z_cell_blk_size, k_lim_pad, nx_blk)
-              * p_z_mat[:, :, jnp.newaxis, :]
-          ).sum(axis=1)
-          b_jci = (
-              b_after_z[:, :k_lim_raw, :].reshape(
-                  ny_loc, 2 * c_lim, w_lat_cell_size, nx_blk
-              )
-              * p_lat_mat[:, jnp.newaxis, :, :]
-          ).sum(axis=2)
-          lo_jci, hi_jci = b_jci[:, :c_lim, :], b_jci[:, c_lim:, :]
-          val_lim = val_jci[:, lim_start:, :]
-          if ref_buf is not None:
-            ref_win = lax.dynamic_slice_in_dim(
-                ref_buf, buf_z_start, w_z_blk_size, axis=0
-            )
-            ref_ji = (w_z_mat * ref_win[jnp.newaxis, :, jnp.newaxis]).sum(
-                axis=1
-            )[:, jnp.newaxis, :]
-            val_lim = jnp.clip(val_lim + ref_ji, lo_jci, hi_jci) - ref_ji
-          else:
-            val_lim = jnp.clip(val_lim, lo_jci, hi_jci)
-          val_jci = (
-              val_lim
-              if lim_start == 0
-              else jnp.concatenate([val_jci[:, :lim_start, :], val_lim], axis=1)
-          )
-
-        if b_len == 1:
-          if c_tri > 0:
-            return jnp.swapaxes(val_jci, 0, 1), jnp.swapaxes(val_lin_jci, 0, 1)
-          return jnp.swapaxes(val_jci, 0, 1)
-
-        out_blk = val_jci.reshape(ny_loc, c_cur, b_len, nx_loc).transpose(
-            2, 1, 0, 3
-        )
-        if c_tri > 0:
-          out_lin_blk = val_lin_jci.reshape(
-              ny_loc, c_tri, b_len, nx_loc
-          ).transpose(2, 1, 0, 3)
-          return out_blk, out_lin_blk
-        return out_blk
-
-      return _scan_block
-
-    if l_q_loc == 1:
-      _scan_1 = _eval_levels_grouped(1)
-      res_0 = _scan_1((
-          jnp.int32(0),
-          lon_q_t[0],
-          sin_lat_q_t[0],
-          sigma_q_t[0],
-          sig_lo_arr[0],
-          sig_hi_arr[0],
-      ))
-      if c_tri > 0:
-        out_0, out_lin_0 = res_0
-        return (
-            jnp.swapaxes(out_0, 1, 2)[:, jnp.newaxis, :, :],
-            jnp.swapaxes(out_lin_0, 1, 2)[:, jnp.newaxis, :, :],
-        )
-      out_single = jnp.swapaxes(res_0, 1, 2)[:, jnp.newaxis, :, :]
-      if tri_start is not None:
-        return out_single, jnp.zeros((0, 1, nx_loc, ny_loc), dtype=dtype)
-      return out_single
-
-    b_len = 1
-    if is_tpu:
-      for b_cand in _BLOCK_LEVEL_CANDIDATES:
-        if l_q_loc < b_cand:
-          continue
-        w_z_c = min(l_buf, min(l_src, w_z_size + b_cand - 1))
-        f_blk_vmem = ny_loc * w_z_c * k_pad * n_lon_pad128 * item_bytes
-        g_1_vmem = ny_loc * w_z_c * k_pad * nx_pad128 * item_bytes
-        nx_c_pad128 = _round_to_multiple(b_cand * nx_loc, _TPU_LANES)
-        w_lon_c_vmem = (
-            ny_loc
-            * _round_to_multiple(n_lon, _TPU_SUBLANES)
-            * nx_c_pad128
-            * item_bytes
-        )
-        b_vmem = 0
-        if c_lim > 0:
-          w_zc_c = min(
-              max(1, l_buf - 1),
-              min(max(1, l_src - 1), w_z_cell_size + b_cand - 1),
-          )
-          b_blk_vmem = ny_loc * w_zc_c * k_lim_pad * n_lon_pad128 * item_bytes
-          b_lon_vmem = ny_loc * w_zc_c * k_lim_pad * nx_c_pad128 * item_bytes
-          b_vmem = b_blk_vmem + w_lon_c_vmem + b_lon_vmem
-        if (
-            max(f_blk_vmem + w_lon_vmem_b + g_1_vmem, b_vmem)
-            <= _MATMUL_3D_BLOCK_VMEM_PROBE
-        ):
-          b_len = b_cand
-          break
-
-    _scan_fn = _eval_levels_grouped(b_len)
-    if b_len == 1:
-      _, scan_res = lax.scan(
-          lambda _, inp: (None, _scan_fn(inp)),
-          None,
-          (k_arr, lon_q_t, sin_lat_q_t, sigma_q_t, sig_lo_arr, sig_hi_arr),
-      )
-      if c_tri > 0:
-        out_l, out_lin_l = scan_res
-        return out_l.transpose(1, 0, 3, 2), out_lin_l.transpose(1, 0, 3, 2)
-      out_all = scan_res.transpose(1, 0, 3, 2)
-    else:
-      n_blocks = (l_q_loc + b_len - 1) // b_len
-      pad_l = n_blocks * b_len - l_q_loc
-      if pad_l > 0:
-        k_in = jnp.pad(k_arr, (0, pad_l), mode='edge').reshape(n_blocks, b_len)
-        lon_in = jnp.pad(
-            lon_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
-        ).reshape(n_blocks, b_len, ny_loc, nx_loc)
-        sin_lat_in = jnp.pad(
-            sin_lat_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
-        ).reshape(n_blocks, b_len, ny_loc, nx_loc)
-        sigma_in = jnp.pad(
-            sigma_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
-        ).reshape(n_blocks, b_len, ny_loc, nx_loc)
-        sig_lo_in, sig_hi_in = (
-            jnp.pad(b, (0, pad_l), mode='edge').reshape(n_blocks, b_len)
-            for b in (sig_lo_arr, sig_hi_arr)
-        )
-      else:
-        k_in = k_arr.reshape(n_blocks, b_len)
-        lon_in = lon_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
-        sin_lat_in = sin_lat_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
-        sigma_in = sigma_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
-        sig_lo_in = sig_lo_arr.reshape(n_blocks, b_len)
-        sig_hi_in = sig_hi_arr.reshape(n_blocks, b_len)
-      _, scan_res = lax.scan(
-          lambda _, inp: (None, _scan_fn(inp)),
-          None,
-          (k_in, lon_in, sin_lat_in, sigma_in, sig_lo_in, sig_hi_in),
-      )
-      if c_tri > 0:
-        out_blk, out_lin_blk = scan_res
-        out_l = out_blk.reshape(
-            n_blocks * b_len, c_cur, ny_loc, nx_loc
-        )[:l_q_loc]
-        out_lin_l = out_lin_blk.reshape(
-            n_blocks * b_len, c_tri, ny_loc, nx_loc
-        )[:l_q_loc]
-        return out_l.transpose(1, 0, 3, 2), out_lin_l.transpose(1, 0, 3, 2)
-      out_all = (
-          scan_res.reshape(n_blocks * b_len, c_cur, ny_loc, nx_loc)[:l_q_loc]
-          .transpose(1, 0, 3, 2)
-      )
-
-    if tri_start is not None:
-      return out_all, jnp.zeros((0, l_q_loc, nx_loc, ny_loc), dtype=dtype)
-    return out_all
-
-  if num_channels <= chunk_size:
-    return _eval_channel_chunk(
-        f_buf, limited_channel_start, trilinear_channel_start
-    )
-
-  if limited_channel_start == 0 and trilinear_channel_start in (None, 0):
-    c_pad = _round_to_multiple(num_channels, chunk_size)
-    f_pad = (
-        jnp.pad(f_buf, [(0, c_pad - num_channels), (0, 0), (0, 0), (0, 0)])
-        if c_pad > num_channels
-        else f_buf
-    )
-    f_grouped = f_pad.reshape(
-        c_pad // chunk_size, chunk_size, l_buf, n_lon, n_lat_buf
-    )
-    _, out_grouped = lax.scan(
-        lambda _, grp: (
-            None,
-            _eval_channel_chunk(grp, 0, trilinear_channel_start),
-        ),
-        None,
-        f_grouped,
-    )
-    if trilinear_channel_start is not None:
-      out_g, out_lin_g = out_grouped
-      return (
-          out_g.reshape(c_pad, l_q_loc, nx_loc, ny_loc)[:num_channels],
-          out_lin_g.reshape(c_pad, l_q_loc, nx_loc, ny_loc)[:num_channels],
-      )
-    return out_grouped.reshape(c_pad, l_q_loc, nx_loc, ny_loc)[:num_channels]
-
-  outs = []
-  outs_lin = []
-  for c0 in range(0, num_channels, chunk_size):
-    c1 = min(c0 + chunk_size, num_channels)
-    sub_len = c1 - c0
-    sub_lim = max(0, min(sub_len, limited_channel_start - c0))
-    if trilinear_channel_start is None or c1 <= trilinear_channel_start:
-      sub_tri = None
-    else:
-      sub_tri = max(0, trilinear_channel_start - c0)
-    res = _eval_channel_chunk(f_buf[c0:c1], sub_lim, sub_tri)
-    if sub_tri is not None:
-      outs.append(res[0])
-      outs_lin.append(res[1])
-    else:
-      outs.append(res)
-  out_cat = jnp.concatenate(outs, axis=0)
-  if trilinear_channel_start is not None:
-    out_lin_cat = (
-        jnp.concatenate(outs_lin, axis=0)
-        if outs_lin
-        else jnp.zeros((0, l_q_loc, nx_loc, ny_loc), dtype=dtype)
-    )
-    return out_cat, out_lin_cat
-  return out_cat
+  return _map_channel_chunks(
+      functools.partial(_matmul_3d_channel_chunk, ops=ops),
+      f_buf,
+      plan,
+      channel_plan.chunk_size,
+      limited_channel_start,
+      trilinear_channel_start,
+  )
 
 
 def _interpolate_3d_grid_matmul(
