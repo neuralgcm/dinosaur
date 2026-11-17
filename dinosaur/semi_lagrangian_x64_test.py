@@ -211,8 +211,10 @@ class DeparturePointsTest(parameterized.TestCase):
     u, v = solid_body_winds(grid, axis=[0, 1, 0], omega=omega)
     lon_mesh, sin_lat_mesh = grid.nodal_mesh
     dt = 0.2
+    # 0.2 radians is 8 latitude rows at T85, more than the default
+    # displacement limit, so the limit is lifted.
     departure = semi_lagrangian.horizontal_departure_points(
-        jnp.asarray(u), jnp.asarray(v), grid, dt=dt
+        jnp.asarray(u), jnp.asarray(v), grid, dt=dt, max_lat_shift=None
     )
     r_exact = rotation_matrix([0, 1, 0], -omega * dt) @ np.stack(
         semi_lagrangian.lon_lat_to_cartesian(lon_mesh, sin_lat_mesh)
@@ -377,10 +379,14 @@ class TransportTest(parameterized.TestCase):
     def blob(r):
       return np.exp(-((1 - np.einsum('c...,c->...', r, center)) / 0.05))
 
+    # 0.2 radians is 8 latitude rows at T85, more than the default
+    # displacement limit, so the limit is lifted.
     departure = semi_lagrangian.horizontal_departure_points(
-        jnp.asarray(u), jnp.asarray(v), grid, dt=dt
+        jnp.asarray(u), jnp.asarray(v), grid, dt=dt, max_lat_shift=None
     )
-    interpolator = semi_lagrangian.GridInterpolator(grid, order='cubic')
+    interpolator = semi_lagrangian.GridInterpolator(
+        grid, order='cubic', max_lat_shift=None
+    )
     transported = semi_lagrangian.transport_scalar_2d(
         jnp.asarray(blob(r)), departure, interpolator
     )

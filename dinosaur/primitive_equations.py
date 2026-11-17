@@ -2857,10 +2857,13 @@ class SemiLagrangianPrimitiveEquations(
       a barely-contracting iteration.
     interpolation_method: 'gather', 'matmul', or None (auto-selects 'matmul'
       on TPU or when `coords.spmd_mesh` is set, and 'gather' otherwise).
-    max_lat_shift: maximum meridional displacement in latitude grid cells for
-      windowed 'matmul' interpolation (None disables latitude windowing).
-    max_vertical_shift: maximum vertical displacement in levels for windowed
-      'matmul' interpolation (None disables vertical windowing).
+    max_lat_shift: maximum meridional displacement per step, in latitude
+      cells: departure points further from their arrival row are clamped to
+      this window (and trajectory midpoints to half of it) on every
+      interpolation method, and 'matmul' builds its stencils in it (see
+      `semi_lagrangian.interpolate_3d`). None disables the limit.
+    max_vertical_shift: maximum vertical displacement per step, in levels,
+      with the same meaning (None disables the limit).
   """
 
 

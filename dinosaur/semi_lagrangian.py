@@ -364,6 +364,186 @@ def _z_window_start(
   return jnp.clip(first_level, 0, n_source - size)
 
 
+# Clamping departures to the stencil windows.
+#
+# The 'matmul' interpolation builds each grid-aligned query's stencil inside a
+# window around its arrival point; a stencil point outside that window would
+# silently get no weight. Instead, whenever windows are in use (both backends,
+# whenever the caller gives the shifts), the interpolation query is clamped
+# into the window before its stencil is built: latitude and σ are limited so
+# that the bracketing cell is at most `max(1, shift)` cells from the arrival
+# cell, the displacement limit a CFL condition would impose. Every window of
+# the 'matmul' paths (main, limiter bracketing cell, trilinear, level-blocked)
+# contains the cells this allows, so with the clamp 'matmul' and 'gather'
+# interpolate the same query and agree to rounding.
+#
+# The upper bound is one ulp (of the query dtype) below the first node beyond
+# the window, which keeps the bracketing cell inside the window under every
+# cell search (`searchsorted` and the TPU threshold one-hot alike) while the
+# interpolated value is the window-edge value to rounding. The lower bound is
+# the lowest node of the lowest allowed cell, whose cell search returns that
+# cell. The clamp acts on latitude (after the arctan2 of sin_lat) and on σ
+# inside the stencil builders, so every gather, matmul and fused path clamps
+# the same query, and the bounds are static per arrival row/level (no table
+# lookups or gathers in the per-query work).
+
+
+def _next_below(x: np.ndarray, dtype: jnp.dtype) -> np.ndarray | jax.Array:
+  """The largest value of `dtype` strictly below each `x` (rounded to `dtype`)."""
+  dtype = np.dtype(dtype)
+  if dtype in (np.float16, np.float32, np.float64):
+    return np.nextafter(x.astype(dtype), np.asarray(-np.inf, dtype))
+  return jnp.nextafter(jnp.asarray(x, dtype), jnp.asarray(-jnp.inf, dtype))
+
+
+def _lat_clamp_bounds(
+    grid: spherical_harmonic.Grid,
+    max_lat_shift: int,
+    order: str,
+    dtype: jnp.dtype,
+) -> tuple[np.ndarray | jax.Array, np.ndarray | jax.Array]:
+  """Latitude (radians) clamp of grid-aligned queries, per arrival row.
+
+  A query in nodal latitude column `j` arrives at Gaussian row
+  `min(j, latitude_nodes - 1)` (padding columns map to the last physical row,
+  as in `_arrival_lat_rows`), i.e. at row `a = j + _HALO_WIDTH` of the
+  halo-extended axis `φ_ext`. Its bracketing cell is limited to
+  `[a - S, a + S]` (S = `max(1, max_lat_shift)`), intersected with the cells
+  a stencil of `order` can use; so φ is clamped to
+  `[φ_ext[lo_c], φ_ext[hi_c + 1])`. Physical latitudes never reach the halo
+  cells beyond the poles, so near the poles only the equatorward bound acts.
+
+  Args:
+    grid: the horizontal grid.
+    max_lat_shift: window half-width in latitude rows (0 is treated as 1).
+    order: horizontal interpolation order.
+    dtype: dtype of the query latitudes.
+
+  Returns:
+    `(lo, hi)`, each of shape [grid.nodal_shape[1]] and dtype `dtype`.
+  """
+  phi_extended = _latitude_halo_axis(grid)
+  offsets = _stencil_offsets(order)
+  c_min = -int(offsets[0])
+  c_max = phi_extended.size - 1 - int(offsets[-1])
+  shift = _effective_window_shift(max_lat_shift)
+  arrival = (
+      np.minimum(np.arange(grid.nodal_shape[1]), grid.latitude_nodes - 1)
+      + _HALO_WIDTH
+  )
+  lo_cell = np.clip(arrival - shift, c_min, c_max)
+  hi_cell = np.clip(arrival + shift, c_min, c_max)
+  lo = phi_extended[lo_cell].astype(np.dtype(dtype))
+  hi = _next_below(phi_extended[hi_cell + 1], dtype)
+  return lo, hi
+
+
+def _static_take(values: jax.Array, indices: np.ndarray) -> jax.Array:
+  """`values[indices]` for static non-decreasing `indices`, without a gather.
+
+  Built from static slices (runs of consecutive indices) and broadcasts (runs
+  of a repeated index), so it lowers to slices and a concatenate on every
+  backend.
+  """
+  pieces = []
+  start = 0
+  n = len(indices)
+  while start < n:
+    end = start + 1
+    if end < n and indices[end] == indices[start]:
+      while end < n and indices[end] == indices[start]:
+        end += 1
+      i0 = int(indices[start])
+      pieces.append(jnp.broadcast_to(values[i0 : i0 + 1], (end - start,)))
+    else:
+      while end < n and indices[end] == indices[end - 1] + 1:
+        end += 1
+      i0 = int(indices[start])
+      pieces.append(values[i0 : i0 + end - start])
+    start = end
+  return pieces[0] if len(pieces) == 1 else jnp.concatenate(pieces)
+
+
+def _level_clamp_bounds(
+    nodes: Array,
+    num_query_levels: int,
+    max_vertical_shift: int,
+    dtype: jnp.dtype,
+) -> tuple[jax.Array, jax.Array]:
+  """Vertical clamp of grid-aligned queries, per arrival level.
+
+  Query level `q` arrives at node level `k = min(q, len(nodes) - 1)` (as in
+  the 'matmul' windows). Its bracketing cell is limited to `[k - S, k + S]`
+  (S = `max(1, max_vertical_shift)`), intersected with the `len(nodes) - 1`
+  cells; so σ is clamped to `[nodes[lo_k], nodes[hi_k + 1])`, closed at the
+  top when `hi_k + 1` is the last node (where σ is clipped anyway). The node
+  values are those of `nodes` cast to `dtype`, as in the stencil builder.
+
+  Args:
+    nodes: increasing vertical nodes, possibly traced.
+    num_query_levels: number of query levels.
+    max_vertical_shift: window half-width in levels (0 is treated as 1).
+    dtype: dtype of the query σ.
+
+  Returns:
+    `(lo, hi)`, each of shape [num_query_levels].
+  """
+  nodes = lax.stop_gradient(jnp.asarray(nodes, dtype=dtype))
+  n = nodes.shape[0]
+  shift = _effective_window_shift(max_vertical_shift)
+  k = np.minimum(np.arange(num_query_levels), n - 1)
+  lo_index = np.maximum(k - shift, 0)
+  hi_index = np.minimum(k + shift + 1, n - 1)
+  lo = _static_take(nodes, lo_index)
+  hi = _static_take(nodes, hi_index)
+  open_top = hi_index < n - 1
+  if open_top.any():
+    hi = jnp.where(open_top, jnp.nextafter(hi, jnp.full_like(hi, -jnp.inf)), hi)
+  return lo, hi
+
+
+def _is_windowed_3d(
+    lon: jax.Array,
+    grid: spherical_harmonic.Grid,
+    max_lat_shift: int | None,
+    max_vertical_shift: int | None,
+) -> bool:
+  """Whether 3-D queries are grid-aligned with both windows given."""
+  return (
+      lon.ndim == 3
+      and lon.shape[1:] == grid.nodal_shape
+      and max_lat_shift is not None
+      and max_vertical_shift is not None
+  )
+
+
+def _window_clamp_bounds_3d(
+    grid: spherical_harmonic.Grid,
+    lon: jax.Array,
+    sin_lat: jax.Array,
+    sigma: jax.Array,
+    sigma_nodes: Array,
+    order: str,
+    max_lat_shift: int | None,
+    max_vertical_shift: int | None,
+) -> tuple[tuple[Array, Array] | None, tuple[Array, Array] | None]:
+  """Clamp bounds, broadcastable against `lon`, of windowed 3-D queries.
+
+  Returns `(lat_bounds, sigma_bounds)` for grid-aligned queries with both
+  shifts given (`_is_windowed_3d`), and `(None, None)` otherwise.
+  """
+  if not _is_windowed_3d(lon, grid, max_lat_shift, max_vertical_shift):
+    return None, None
+  lat_bounds = _lat_clamp_bounds(grid, max_lat_shift, order, sin_lat.dtype)
+  lo, hi = _level_clamp_bounds(
+      sigma_nodes, lon.shape[0], max_vertical_shift, sigma.dtype
+  )
+  return lat_bounds, (
+      lo[:, jnp.newaxis, jnp.newaxis],
+      hi[:, jnp.newaxis, jnp.newaxis],
+  )
+
+
 def _weighted_one_hot(
     indices: tuple[jax.Array, ...],
     weights: tuple[jax.Array, ...],
@@ -662,8 +842,15 @@ def _horizontal_stencil_tuple(
     order: str,
     *,
     include_linear_fractions: bool = False,
+    lat_bounds: tuple[Array, Array] | None = None,
 ):
-  """Computes tuple-unrolled horizontal stencil indices, weights, and cells."""
+  """Computes tuple-unrolled horizontal stencil indices, weights, and cells.
+
+  `lat_bounds`, if given, is the `(lo, hi)` latitude clamp of the queries
+  (from `_lat_clamp_bounds`, broadcastable against `lon`): the query
+  latitude is clipped to it before the stencil is located, so every result
+  (indices, weights, cells, fractions) belongs to the clamped query.
+  """
   offsets = _stencil_offsets(order)
   lon = jnp.asarray(lon)
   # Latitude via arctan2 rather than arcsin: for |sin_lat| within float
@@ -674,6 +861,10 @@ def _horizontal_stencil_tuple(
   sin_lat = jnp.clip(jnp.asarray(sin_lat), -1, 1)
   cos_lat = jnp.sqrt(jnp.maximum(1 - jnp.square(sin_lat), 1e-12))
   phi = jnp.arctan2(sin_lat, cos_lat)
+  if lat_bounds is not None:
+    # Clamped on φ itself (not on sin_lat before the arctan2, whose rounding
+    # could move a point on a window edge into the next cell).
+    phi = jnp.clip(phi, lat_bounds[0], lat_bounds[1])
 
   # Longitude nodes are uniform, so the bracketing index is a floor divide.
   # Weights are computed in closed form from the fractional cell coordinate;
@@ -800,6 +991,7 @@ def _horizontal_stencil(
     lon: Array,
     sin_lat: Array,
     order: str,
+    lat_bounds: tuple[Array, Array] | None = None,
 ) -> _HorizontalStencil:
   """Computes gather indices and weights for points (lon, sin_lat)."""
   (
@@ -810,7 +1002,9 @@ def _horizontal_stencil(
       _,
       _,
       ext_size,
-  ) = _horizontal_stencil_tuple(grid, lon, sin_lat, order)
+  ) = _horizontal_stencil_tuple(
+      grid, lon, sin_lat, order, lat_bounds=lat_bounds
+  )
   return _HorizontalStencil(
       lon_index=jnp.stack(lon_indices, axis=-1),
       lat_index=jnp.stack(lat_indices, axis=-1),
@@ -1041,8 +1235,13 @@ def _matmul_2d_local(
     j_offset: int | jax.Array,
     buf_lat_origin: int | jax.Array,
     max_lat_shift: int,
+    lat_bounds: tuple[Array, Array],
 ) -> jax.Array:
-  """Windowed MXU matmul 2-D interpolation on [C, n_lon, n_lat_buf]."""
+  """Windowed MXU matmul 2-D interpolation on [C, n_lon, n_lat_buf].
+
+  `lat_bounds` holds the `_lat_clamp_bounds` of the `ny_loc` local arrival
+  rows, which keep every query's stencil inside its window.
+  """
   dtype = f_buf.dtype
   num_channels, n_lon, n_lat_buf = f_buf.shape
   n_lat = grid.latitude_nodes
@@ -1061,7 +1260,9 @@ def _matmul_2d_local(
       lon_cell0,
       lat_cell0,
       _,
-  ) = _horizontal_stencil_tuple(grid, lon_q, sin_lat_q, order)
+  ) = _horizontal_stencil_tuple(
+      grid, lon_q, sin_lat_q, order, lat_bounds=lat_bounds
+  )
 
   j_global = _arrival_lat_rows(j_offset, ny_loc, n_lat)
   win_lat_start, buf_lat_start = _lat_window_starts(
@@ -1210,6 +1411,7 @@ def _interpolate_2d_grid_matmul(
 ) -> jax.Array:
   """Grid-aligned 2-D matmul interpolation (single-device and SPMD)."""
   mesh = grid.spmd_mesh
+  lat_lo, lat_hi = _lat_clamp_bounds(grid, max_lat_shift, order, sin_lat.dtype)
   if mesh is None:
     f_ext = _extend_with_pole_halo(fields, grid)
     return _matmul_2d_local(
@@ -1222,13 +1424,14 @@ def _interpolate_2d_grid_matmul(
         j_offset=0,
         buf_lat_origin=0,
         max_lat_shift=max_lat_shift,
+        lat_bounds=(lat_lo, lat_hi),
     )
 
   x_shards = mesh.shape['x']
   f_spec = P(None, 'x', 'y')
   q_spec = P('x', 'y')
 
-  def _sharded(f_loc, lon_loc, sin_lat_loc):
+  def _sharded(f_loc, lon_loc, sin_lat_loc, lat_lo_loc, lat_hi_loc):
     if x_shards > 1:
       f_x = lax.all_gather(f_loc, 'x', axis=1, tiled=True)
     else:
@@ -1247,14 +1450,17 @@ def _interpolate_2d_grid_matmul(
         j_offset=j_offset,
         buf_lat_origin=buf_lat_origin,
         max_lat_shift=max_lat_shift,
+        lat_bounds=(lat_lo_loc, lat_hi_loc),
     )
 
+  # The clamp bounds are sharded like the latitude axis, so each shard holds
+  # those of its own arrival rows.
   return jax.shard_map(
       _sharded,
       mesh=mesh,
-      in_specs=(f_spec, q_spec, q_spec),
+      in_specs=(f_spec, q_spec, q_spec, P('y'), P('y')),
       out_specs=f_spec,
-  )(fields, lon, sin_lat)
+  )(fields, lon, sin_lat, jnp.asarray(lat_lo), jnp.asarray(lat_hi))
 
 
 def _interpolate_2d_multi(
@@ -1283,7 +1489,15 @@ def _interpolate_2d_multi(
   if fields.ndim == 3:
     # [C, nx, ny] with lon [*points]
     if resolved == 'gather':
-      stencil = _horizontal_stencil(grid, lon, sin_lat, order)
+      # Grid-aligned queries are clamped to the same windows as 'matmul'.
+      lat_bounds = (
+          _lat_clamp_bounds(grid, max_lat_shift, order, sin_lat.dtype)
+          if lon.shape == grid.nodal_shape and max_lat_shift is not None
+          else None
+      )
+      stencil = _horizontal_stencil(
+          grid, lon, sin_lat, order, lat_bounds=lat_bounds
+      )
       flat_index = _gather_2d_flat_index(stencil)
       extended = _extend_with_pole_halo(fields, grid)
       return jax.vmap(
@@ -1332,6 +1546,9 @@ def _interpolate_2d_multi(
         and max_lat_shift is not None
     ):
       mesh = grid.spmd_mesh
+      lat_lo, lat_hi = _lat_clamp_bounds(
+          grid, max_lat_shift, order, sin_lat.dtype
+      )
       if mesh is None:
         f_ext = _extend_with_pole_halo(fields, grid)
         f_by_l = jnp.swapaxes(f_ext, 0, 1)
@@ -1348,6 +1565,7 @@ def _interpolate_2d_multi(
                     j_offset=0,
                     buf_lat_origin=0,
                     max_lat_shift=max_lat_shift,
+                    lat_bounds=(lat_lo, lat_hi),
                 ),
             ),
             None,
@@ -1374,7 +1592,7 @@ def _interpolate_2d_multi(
       f_spec = P(None, z_spec, 'x', 'y')
       q_spec = P(z_spec, 'x', 'y')
 
-      def _sharded_levels(f_loc, lon_loc, sin_lat_loc):
+      def _sharded_levels(f_loc, lon_loc, sin_lat_loc, lat_lo_loc, lat_hi_loc):
         if x_shards > 1:
           f_x = lax.all_gather(f_loc, 'x', axis=2, tiled=True)
         else:
@@ -1398,6 +1616,7 @@ def _interpolate_2d_multi(
                     j_offset=j_offset,
                     buf_lat_origin=buf_lat_origin,
                     max_lat_shift=max_lat_shift,
+                    lat_bounds=(lat_lo_loc, lat_hi_loc),
                 ),
             ),
             None,
@@ -1408,9 +1627,15 @@ def _interpolate_2d_multi(
       out_pad = jax.shard_map(
           _sharded_levels,
           mesh=mesh,
-          in_specs=(f_spec, q_spec, q_spec),
+          in_specs=(f_spec, q_spec, q_spec, P('y'), P('y')),
           out_specs=f_spec,
-      )(fields_pad, lon_pad, sin_lat_pad)
+      )(
+          fields_pad,
+          lon_pad,
+          sin_lat_pad,
+          jnp.asarray(lat_lo),
+          jnp.asarray(lat_hi),
+      )
       return out_pad[:, :levels, :, :]
 
     if resolved == 'matmul':
@@ -1468,22 +1693,22 @@ class GridInterpolator:
       interpolated values are clipped to the range of the 2✕2 bracketing
       cell corners, which prevents new extrema (and preserves positivity)
       at the cost of formal accuracy at extrema.
-    method: 'gather' (1-D gather + fused contraction, fastest on single GPU;
-      no window), 'matmul' (MXU matrix multiplication without unstructured
+    method: 'gather' (1-D gather + fused contraction, fastest on single GPU),
+      'matmul' (MXU matrix multiplication without unstructured
       gather/scatter, designed for TPU and SPMD sharding; windowed, see
       `max_lat_shift`), or None (auto-selects 'matmul' on TPU or when
-      `grid.spmd_mesh` is set, and 'gather' otherwise).
-    max_lat_shift: half-width, in latitude rows, of the window inside which
-      the 'matmul' method builds each query's stencil. For queries laid out
-      on the grid (`lon.shape == grid.nodal_shape`, or with a leading levels
-      axis) the window has `2 * max_lat_shift + stencil` latitude rows
-      (stencil is 2 for 'linear' and 4 for 'cubic'), starting `max_lat_shift`
-      rows before the first stencil row of a point that equals its arrival
-      node, clipped to the ends of the halo-extended latitude axis. A stencil
-      point outside the window contributes nothing, so the value is wrong
-      there (it is not clamped). A value of 0 is treated as 1. None disables
-      windowing, as does any other query layout (the queries are then
-      interpolated without a window). Ignored by 'gather'.
+      `grid.spmd_mesh` is set, and 'gather' otherwise). Both give the same
+      result to rounding.
+    max_lat_shift: limit, in latitude cells, on the displacement of
+      grid-aligned queries (`lon.shape == grid.nodal_shape`, or with a
+      leading levels axis), whose point `[..., i, j]` is taken to be the
+      departure point of a trajectory arriving at latitude row `j`: its
+      latitude is clamped to the window of `max(1, max_lat_shift)` cells
+      around the arrival row, by both methods (see `interpolate_3d` for the
+      exact bounds). For 'matmul' this is also the half-width of the window
+      in which each stencil is built. None disables the clamp and the
+      window, as does any other query layout; pass None to interpolate at
+      arbitrary points that happen to be laid out like the grid.
   """
 
   grid: spherical_harmonic.Grid
@@ -1567,14 +1792,25 @@ def _vertical_stencil_tuple(
     vertical_order: Literal['linear', 'cubic'],
     *,
     include_linear_fractions: bool = False,
+    sigma_bounds: tuple[Array, Array] | None = None,
 ):
-  """Returns tuple-unrolled (level_indices, level_weights, bracket_offset, level_cell)."""
+  """Returns tuple-unrolled (level_indices, level_weights, bracket_offset, level_cell).
+
+  σ is clipped to the node range (constant extrapolation). `sigma_bounds`, if
+  given, is the `(lo, hi)` σ clamp of the queries (from
+  `_level_clamp_bounds`, broadcastable against `sigma`, in `sigma.dtype`);
+  it lies within the node range and is applied in place of that clip.
+  """
   if vertical_order not in ('linear', 'cubic'):
     raise ValueError(f'unknown {vertical_order=}')
   sigma = jnp.asarray(sigma)
   sigma_nodes = jnp.asarray(sigma_nodes, dtype=sigma.dtype)
   num_levels = sigma_nodes.shape[0]
-  sigma = jnp.clip(sigma, sigma_nodes[0], sigma_nodes[-1])
+  if sigma_bounds is None:
+    sigma = jnp.clip(sigma, sigma_nodes[0], sigma_nodes[-1])
+  else:
+    # The window bounds lie within [sigma_nodes[0], sigma_nodes[-1]].
+    sigma = jnp.clip(sigma, sigma_bounds[0], sigma_bounds[1])
   if (
       jax.default_backend() == 'tpu'
       and (vertical_order == 'linear' or num_levels >= 4)
@@ -1696,6 +1932,8 @@ def _interpolate_3d_gather(
     limiter_bound_reference: Array | None,
     limited_channel_start: int = 0,
     trilinear_channel_start: int | None = None,
+    lat_bounds: tuple[Array, Array] | None = None,
+    sigma_bounds: tuple[Array, Array] | None = None,
 ) -> jnp.ndarray | tuple[jnp.ndarray, jnp.ndarray]:
   """Gather-based 3-D interpolation on channel-minor layout sharing one stencil.
 
@@ -1704,7 +1942,9 @@ def _interpolate_3d_gather(
   weights in a cascaded reduction without materializing `[..., 4, 4, 4]` index
   or value tensors, and extracts both quasi-monotone cell bounds and optional
   trilinear values (`trilinear_channel_start`) from the already-gathered
-  interior `2x2x2` corners with zero extra gathers.
+  interior `2x2x2` corners with zero extra gathers. `lat_bounds` and
+  `sigma_bounds` optionally clamp the queries (see `_window_clamp_bounds_3d`);
+  all outputs then belong to the clamped queries.
   """
   c_total = fields_4d.shape[0]
   eff_lim_start = (
@@ -1737,20 +1977,29 @@ def _interpolate_3d_gather(
         ext_size,
         (a_lon, a_lat),
     ) = _horizontal_stencil_tuple(
-        grid, lon, sin_lat, order, include_linear_fractions=True
+        grid,
+        lon,
+        sin_lat,
+        order,
+        include_linear_fractions=True,
+        lat_bounds=lat_bounds,
     )
     lvl_idx, lvl_w, b_off, _, f_lvl = _vertical_stencil_tuple(
         sigma,
         jnp.asarray(sigma_nodes),
         vertical_order,
         include_linear_fractions=True,
+        sigma_bounds=sigma_bounds,
     )
   else:
     lon_idx, lon_w, lat_idx, lat_w, _, _, ext_size = _horizontal_stencil_tuple(
-        grid, lon, sin_lat, order
+        grid, lon, sin_lat, order, lat_bounds=lat_bounds
     )
     lvl_idx, lvl_w, b_off, _ = _vertical_stencil_tuple(
-        sigma, jnp.asarray(sigma_nodes), vertical_order
+        sigma,
+        jnp.asarray(sigma_nodes),
+        vertical_order,
+        sigma_bounds=sigma_bounds,
     )
     a_lon = a_lat = f_lvl = None
 
@@ -2122,10 +2371,17 @@ def _matmul_3d_local(
     buf_lat_origin: int | jax.Array,
     max_lat_shift: int,
     max_vertical_shift: int,
+    lat_bounds: tuple[Array, Array],
+    sigma_bounds: tuple[Array, Array],
     limited_channel_start: int = 0,
     trilinear_channel_start: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
-  """Windowed MXU matmul 3-D interpolation on [C, L_buf, n_lon, n_lat_buf]."""
+  """Windowed MXU matmul 3-D interpolation on [C, L_buf, n_lon, n_lat_buf].
+
+  `lat_bounds` ([ny_loc] each) and `sigma_bounds` ([l_q_loc] each) are the
+  `_lat_clamp_bounds` / `_level_clamp_bounds` of the local arrival rows and
+  query levels; they keep every stencil inside its window.
+  """
   dtype = f_buf.dtype
   is_tpu = jax.default_backend() == 'tpu'
   n_lon = grid.longitude_nodes
@@ -2293,6 +2549,8 @@ def _matmul_3d_local(
         buf_lat_origin=buf_lat_origin,
         max_lat_shift=max_lat_shift,
         max_vertical_shift=max_vertical_shift,
+        lat_bounds=lat_bounds,
+        sigma_bounds=sigma_bounds,
     )
     split_pts = sorted(
         {0, num_channels}
@@ -2349,6 +2607,11 @@ def _matmul_3d_local(
   sin_lat_q_t = jnp.swapaxes(sin_lat_q, 1, 2)
   sigma_q_t = jnp.swapaxes(sigma_q, 1, 2)
   k_arr = jnp.arange(l_q_loc, dtype=jnp.int32)
+  # Queries are laid out [ny_loc, nx] inside the scan.
+  lat_bounds_t = tuple(
+      jnp.asarray(b)[:, jnp.newaxis] for b in lat_bounds
+  )
+  sig_lo_arr, sig_hi_arr = sigma_bounds
   m_arange = jnp.arange(n_lon, dtype=jnp.int32)[:, jnp.newaxis]
   w_z_lin_size = _window_size(l_buf, l_src, eff_z_shift, 2)
   lat_arange = jnp.arange(w_lat_size, dtype=jnp.int32)[:, jnp.newaxis]
@@ -2463,17 +2726,26 @@ def _matmul_3d_local(
       )
 
       def _scan_block(inputs):
-        k_b, lon_b, sin_lat_b, sigma_b = inputs
+        k_b, lon_b, sin_lat_b, sigma_b, sig_lo_b, sig_hi_b = inputs
         if b_len == 1:
           k0_s = k_b
           lon_s = lon_b
           sin_lat_s = sin_lat_b
           sigma_s = sigma_b
+          sigma_bounds_s = (sig_lo_b, sig_hi_b)
         else:
           k0_s = k_b[0]
           lon_s = jnp.swapaxes(lon_b, 0, 1).reshape(ny_loc, nx_blk)
           sin_lat_s = jnp.swapaxes(sin_lat_b, 0, 1).reshape(ny_loc, nx_blk)
           sigma_s = jnp.swapaxes(sigma_b, 0, 1).reshape(ny_loc, nx_blk)
+          # One clamp per query level of the block (not per block), laid out
+          # like the level-major `nx_blk` axis.
+          sigma_bounds_s = tuple(
+              jnp.broadcast_to(
+                  b[:, jnp.newaxis], (b_len, nx_loc)
+              ).reshape(1, nx_blk)
+              for b in (sig_lo_b, sig_hi_b)
+          )
 
         if c_tri > 0 and need_separate_trilinear:
           (
@@ -2486,13 +2758,19 @@ def _matmul_3d_local(
               _,
               (alpha_lon, alpha_lat),
           ) = _horizontal_stencil_tuple(
-              grid, lon_s, sin_lat_s, order, include_linear_fractions=True
+              grid,
+              lon_s,
+              sin_lat_s,
+              order,
+              include_linear_fractions=True,
+              lat_bounds=lat_bounds_t,
           )
           lvl_idx, lvl_w, _, lvl_c0, alpha_z = _vertical_stencil_tuple(
               sigma_s,
               sigma_nodes,
               vertical_order,
               include_linear_fractions=True,
+              sigma_bounds=sigma_bounds_s,
           )
         else:
           (
@@ -2503,9 +2781,11 @@ def _matmul_3d_local(
               _,
               lat_c0,
               _,
-          ) = _horizontal_stencil_tuple(grid, lon_s, sin_lat_s, order)
+          ) = _horizontal_stencil_tuple(
+              grid, lon_s, sin_lat_s, order, lat_bounds=lat_bounds_t
+          )
           lvl_idx, lvl_w, _, lvl_c0 = _vertical_stencil_tuple(
-              sigma_s, sigma_nodes, vertical_order
+              sigma_s, sigma_nodes, vertical_order, sigma_bounds=sigma_bounds_s
           )
           alpha_lon = alpha_lat = alpha_z = None
 
@@ -2728,9 +3008,14 @@ def _matmul_3d_local(
 
     if l_q_loc == 1:
       _scan_1 = _eval_levels_grouped(1)
-      res_0 = _scan_1(
-          (jnp.int32(0), lon_q_t[0], sin_lat_q_t[0], sigma_q_t[0])
-      )
+      res_0 = _scan_1((
+          jnp.int32(0),
+          lon_q_t[0],
+          sin_lat_q_t[0],
+          sigma_q_t[0],
+          sig_lo_arr[0],
+          sig_hi_arr[0],
+      ))
       if c_tri > 0:
         out_0, out_lin_0 = res_0
         return (
@@ -2778,7 +3063,7 @@ def _matmul_3d_local(
       _, scan_res = lax.scan(
           lambda _, inp: (None, _scan_fn(inp)),
           None,
-          (k_arr, lon_q_t, sin_lat_q_t, sigma_q_t),
+          (k_arr, lon_q_t, sin_lat_q_t, sigma_q_t, sig_lo_arr, sig_hi_arr),
       )
       if c_tri > 0:
         out_l, out_lin_l = scan_res
@@ -2798,15 +3083,21 @@ def _matmul_3d_local(
         sigma_in = jnp.pad(
             sigma_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
         ).reshape(n_blocks, b_len, ny_loc, nx_loc)
+        sig_lo_in, sig_hi_in = (
+            jnp.pad(b, (0, pad_l), mode='edge').reshape(n_blocks, b_len)
+            for b in (sig_lo_arr, sig_hi_arr)
+        )
       else:
         k_in = k_arr.reshape(n_blocks, b_len)
         lon_in = lon_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
         sin_lat_in = sin_lat_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
         sigma_in = sigma_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
+        sig_lo_in = sig_lo_arr.reshape(n_blocks, b_len)
+        sig_hi_in = sig_hi_arr.reshape(n_blocks, b_len)
       _, scan_res = lax.scan(
           lambda _, inp: (None, _scan_fn(inp)),
           None,
-          (k_in, lon_in, sin_lat_in, sigma_in),
+          (k_in, lon_in, sin_lat_in, sigma_in, sig_lo_in, sig_hi_in),
       )
       if c_tri > 0:
         out_blk, out_lin_blk = scan_res
@@ -2904,6 +3195,17 @@ def _interpolate_3d_grid_matmul(
   """Grid-aligned 3-D MXU matmul interpolation (single-device and SPMD)."""
   sigma_nodes = jnp.asarray(sigma_nodes)
   mesh = grid.spmd_mesh
+  lat_lo, lat_hi = _lat_clamp_bounds(grid, max_lat_shift, order, sin_lat.dtype)
+  z_shards = (
+      mesh.shape['z'] if mesh is not None and 'z' in mesh.axis_names else 1
+  )
+  # Bounds for every (padded) query level; sharded along 'z' with them.
+  sig_lo, sig_hi = _level_clamp_bounds(
+      sigma_nodes,
+      _round_to_multiple(lon.shape[0], z_shards),
+      max_vertical_shift,
+      sigma.dtype,
+  )
   if mesh is None:
     f_ext = _extend_with_pole_halo(fields_4d, grid)
     return _matmul_3d_local(
@@ -2923,11 +3225,12 @@ def _interpolate_3d_grid_matmul(
         buf_lat_origin=0,
         max_lat_shift=max_lat_shift,
         max_vertical_shift=max_vertical_shift,
+        lat_bounds=(lat_lo, lat_hi),
+        sigma_bounds=(sig_lo, sig_hi),
         limited_channel_start=limited_channel_start,
         trilinear_channel_start=trilinear_channel_start,
     )
 
-  z_shards = mesh.shape['z'] if 'z' in mesh.axis_names else 1
   x_shards = mesh.shape['x']
   l_src = fields_4d.shape[1]
   l_q = lon.shape[0]
@@ -2958,7 +3261,18 @@ def _interpolate_3d_grid_matmul(
   ref_spec = P(None) if limiter_bound_reference is not None else None
   out_specs = (f_spec, f_spec) if trilinear_channel_start is not None else f_spec
 
-  def _sharded(f_loc, lon_loc, sin_lat_loc, sigma_loc, nodes_loc, ref_loc):
+  def _sharded(
+      f_loc,
+      lon_loc,
+      sin_lat_loc,
+      sigma_loc,
+      nodes_loc,
+      ref_loc,
+      lat_lo_loc,
+      lat_hi_loc,
+      sig_lo_loc,
+      sig_hi_loc,
+  ):
     if x_shards > 1:
       f_x = lax.all_gather(f_loc, 'x', axis=2, tiled=True)
     else:
@@ -3009,6 +3323,8 @@ def _interpolate_3d_grid_matmul(
         buf_lat_origin=buf_lat_origin,
         max_lat_shift=max_lat_shift,
         max_vertical_shift=max_vertical_shift,
+        lat_bounds=(lat_lo_loc, lat_hi_loc),
+        sigma_bounds=(sig_lo_loc, sig_hi_loc),
         limited_channel_start=limited_channel_start,
         trilinear_channel_start=trilinear_channel_start,
     )
@@ -3016,9 +3332,31 @@ def _interpolate_3d_grid_matmul(
   out_pad = jax.shard_map(
       _sharded,
       mesh=mesh,
-      in_specs=(f_spec, q_spec, q_spec, q_spec, nodes_spec, ref_spec),
+      in_specs=(
+          f_spec,
+          q_spec,
+          q_spec,
+          q_spec,
+          nodes_spec,
+          ref_spec,
+          P('y'),
+          P('y'),
+          P(z_spec),
+          P(z_spec),
+      ),
       out_specs=out_specs,
-  )(f_pad, lon_pad, sin_lat_pad, sigma_pad, sigma_nodes, limiter_bound_reference)
+  )(
+      f_pad,
+      lon_pad,
+      sin_lat_pad,
+      sigma_pad,
+      sigma_nodes,
+      limiter_bound_reference,
+      jnp.asarray(lat_lo),
+      jnp.asarray(lat_hi),
+      sig_lo,
+      sig_hi,
+  )
   if trilinear_channel_start is not None:
     return out_pad[0][:, :l_q, :, :], out_pad[1][:, :l_q, :, :]
   return out_pad[:, :l_q, :, :]
@@ -3092,29 +3430,44 @@ def interpolate_3d(
       gauge-dependent. Ignored without a limiter.
     method: 'gather', 'matmul', or None (auto-selected: 'matmul' on TPU or
       when `grid.spmd_mesh` is set, 'gather' otherwise). 'gather' reads the
-      stencil points directly and has no window. 'matmul' selects them with
-      one-hot matrix products built inside a fixed window around each
-      query's arrival point (see `max_lat_shift` and `max_vertical_shift`).
-    max_lat_shift: half-width, in latitude rows, of the 'matmul' window. For
-      queries laid out on the grid (`lon.shape == (layers, *grid.nodal_shape)`)
-      each query's stencil is built inside a window of
-      `2 * max_lat_shift + stencil` latitude rows (stencil is 2 for 'linear'
-      and 4 for 'cubic'). The window starts `max_lat_shift` rows before the
-      first stencil row of a departure point that equals its arrival point,
-      and is clipped to the ends of the halo-extended latitude axis. A
-      stencil point outside the window contributes nothing, so the value
-      is wrong there (it is not clamped). A value of 0 is treated as 1.
-      None disables windowing, as does any other query layout (the queries
-      are then interpolated without a window). Ignored by 'gather'.
-    max_vertical_shift: half-width, in levels, of the same window in the
-      vertical: `2 * max_vertical_shift + stencil` levels (stencil is 2 for
-      `vertical_order='linear'` and 4 for 'cubic'), starting
-      `max_vertical_shift` levels before the first stencil level of a
-      departure point that equals its arrival point, clipped to the ends of
-      `sigma_nodes`. A stencil point outside it contributes nothing. A value
-      of 0 is treated as 1. Windowing needs both shifts to be set; None for
-      either disables it. The limiter's bracketing-cell corners are read from
-      a window of the same half-width. Ignored by 'gather'.
+      stencil points directly. 'matmul' selects them with one-hot matrix
+      products built inside a fixed window around each query's arrival point
+      (see `max_lat_shift` and `max_vertical_shift`). Both methods evaluate
+      the same (clamped) queries and agree to rounding.
+    max_lat_shift: limit, in latitude cells, on the meridional displacement
+      of grid-aligned queries: those laid out as
+      `lon.shape == (layers, *grid.nodal_shape)`, where query `[k, i, j]` is
+      the departure point of a trajectory arriving at latitude row `j` (the
+      last physical row for nodal padding) and level
+      `min(k, len(sigma_nodes) - 1)`. With `S = max(1, max_lat_shift)`, its
+      latitude is clamped to `[φ[j - S], φ[j + S + 1])`, φ being the node
+      latitudes by Gaussian row, continued across the poles by mirror
+      images (`φ[-1] = -π - φ[0]`, ...): the bracketing cell is at most S
+      cells from the cell starting at the arrival row. A departure point
+      further away is interpolated on the window edge (the upper edge one
+      ulp below its node, which keeps the bracketing cell). The value is
+      then a bounded interpolation near the edge, not an extrapolation, and
+      the gradient with respect to a clamped coordinate is zero. Bounds that
+      would lie beyond a pole are never reached, so near the poles only the
+      equatorward limit acts. The clamp is applied by both methods whenever
+      the shift is given, so results do not depend on the backend and the
+      shift must exceed the largest displacement a time step should
+      represent faithfully. 'matmul' builds each stencil in a window of
+      `2 * S + stencil` latitude rows (stencil is 2 for 'linear' and 4 for
+      'cubic'), clipped to the ends of the halo-extended latitude axis;
+      clamping keeps every stencil point inside it. None disables both the
+      clamp and the window, as does any other query layout (such queries
+      are interpolated where they are). Clamping needs both shifts; None for
+      either disables it in both directions.
+    max_vertical_shift: the same limit in the vertical, in cells of
+      `sigma_nodes` (z): the departure σ of a grid-aligned query arriving at
+      level k is clamped to `[z[k - S], z[k + S + 1])` with
+      `S = max(1, max_vertical_shift)` (intersected with `[z[0], z[-1]]`).
+      For 'matmul' it is the
+      half-width of a window of `2 * max(1, max_vertical_shift) + stencil`
+      levels (stencil 2 for `vertical_order='linear'`, 4 for 'cubic'). The
+      limiter's bracketing cell, the `limiter_bound_reference` shift, and
+      any trilinear companion output are those of the clamped query.
 
   Returns:
     Interpolated values of shape `(*channels, *lon.shape)`.
@@ -3150,6 +3503,17 @@ def interpolate_3d(
 
   fields_4d = field.reshape((c_total,) + field.shape[-3:])
   if resolved == 'gather':
+    # Windowed queries are clamped exactly as the 'matmul' method clamps them.
+    lat_bounds, sigma_bounds = _window_clamp_bounds_3d(
+        grid,
+        lon,
+        sin_lat,
+        sigma,
+        sigma_nodes,
+        order,
+        max_lat_shift,
+        max_vertical_shift,
+    )
     out_4d = _interpolate_3d_gather(
         fields_4d,
         grid,
@@ -3161,13 +3525,10 @@ def interpolate_3d(
         limiter=limiter,
         vertical_order=vertical_order,
         limiter_bound_reference=limiter_bound_reference,
+        lat_bounds=lat_bounds,
+        sigma_bounds=sigma_bounds,
     )
-  elif (
-      lon.ndim == 3
-      and lon.shape[1:] == grid.nodal_shape
-      and max_lat_shift is not None
-      and max_vertical_shift is not None
-  ):
+  elif _is_windowed_3d(lon, grid, max_lat_shift, max_vertical_shift):
     out_4d = _interpolate_3d_grid_matmul(
         fields_4d,
         grid,
@@ -3251,6 +3612,16 @@ def _interpolate_3d_mixed(
             (c_total - eff_tri, *lon.shape), dtype=fields_4d.dtype
         )
       return out_zero
+    lat_bounds, sigma_bounds = _window_clamp_bounds_3d(
+        grid,
+        lon,
+        sin_lat,
+        sigma,
+        sigma_nodes,
+        order,
+        max_lat_shift,
+        max_vertical_shift,
+    )
     return _interpolate_3d_gather(
         fields_4d,
         grid,
@@ -3258,6 +3629,8 @@ def _interpolate_3d_mixed(
         sin_lat,
         sigma,
         sigma_nodes,
+        lat_bounds=lat_bounds,
+        sigma_bounds=sigma_bounds,
         order=order,
         limiter=limiter if eff_lim_start < c_total else None,
         vertical_order=vertical_order,
@@ -3273,10 +3646,7 @@ def _interpolate_3d_mixed(
   if (
       c_total > 0
       and lon.size > 0
-      and lon.ndim == 3
-      and lon.shape[1:] == grid.nodal_shape
-      and max_lat_shift is not None
-      and max_vertical_shift is not None
+      and _is_windowed_3d(lon, grid, max_lat_shift, max_vertical_shift)
   ):
     return _interpolate_3d_grid_matmul(
         fields_4d,
@@ -3351,6 +3721,32 @@ def _interpolate_3d_mixed(
   return out
 
 
+def _wind_sigma_dot_clamp_bounds(
+    grid: spherical_harmonic.Grid,
+    lon: jax.Array,
+    sin_lat: jax.Array,
+    sigma: jax.Array,
+    centers: Array,
+    boundaries: Array,
+    max_lat_shift: int,
+    max_vertical_shift: int,
+) -> tuple[tuple[Array, Array], tuple[Array, Array], tuple[Array, Array]]:
+  """Clamps of the fused (bilinear) `wind` + `sigma_dot` midpoint queries.
+
+  Returns the latitude bounds ([nodal_shape[1]] each) and the σ bounds
+  ([layers] each) on the `centers` and on the `boundaries` nodes; the two σ
+  windows have the same half-width in cells of their own nodes.
+  """
+  num_levels = lon.shape[0]
+  return (
+      _lat_clamp_bounds(grid, max_lat_shift, 'linear', sin_lat.dtype),
+      _level_clamp_bounds(centers, num_levels, max_vertical_shift, sigma.dtype),
+      _level_clamp_bounds(
+          boundaries, num_levels, max_vertical_shift, sigma.dtype
+      ),
+  )
+
+
 def _matmul_3d_wind_and_sigma_dot_local(
     wind_buf: jax.Array,
     sd_buf: jax.Array,
@@ -3365,8 +3761,17 @@ def _matmul_3d_wind_and_sigma_dot_local(
     buf_lat_origin: int | jax.Array,
     max_lat_shift: int,
     max_vertical_shift: int,
+    lat_bounds: tuple[Array, Array],
+    centers_bounds: tuple[Array, Array],
+    boundaries_bounds: tuple[Array, Array],
 ) -> tuple[jax.Array, jax.Array]:
-  """Fused linear 3-D MXU interpolation of `wind` (centers) + `sigma_dot` (boundaries)."""
+  """Fused linear 3-D MXU interpolation of `wind` (centers) + `sigma_dot` (boundaries).
+
+  `lat_bounds` ([ny_loc] each) clamp the queries' latitude, and
+  `centers_bounds` / `boundaries_bounds` ([l_q_loc] each) their σ for the
+  `wind` and `sigma_dot` stencils respectively (each node set has its own
+  window, see `_level_clamp_bounds`).
+  """
   dtype = wind_buf.dtype
   is_tpu = jax.default_backend() == 'tpu'
   n_lon = grid.longitude_nodes
@@ -3438,6 +3843,8 @@ def _matmul_3d_wind_and_sigma_dot_local(
   sin_lat_q_t = jnp.swapaxes(sin_lat_q, 1, 2)
   sigma_q_t = jnp.swapaxes(sigma_q, 1, 2)
   k_arr = jnp.arange(l_q_loc, dtype=jnp.int32)
+  lat_bounds_t = tuple(jnp.asarray(b)[:, jnp.newaxis] for b in lat_bounds)
+  z_bounds = (*centers_bounds, *boundaries_bounds)
   m_arange = jnp.arange(n_lon, dtype=jnp.int32)[:, jnp.newaxis]
   lat_arange = jnp.arange(w_lat_size, dtype=jnp.int32)[:, jnp.newaxis]
 
@@ -3472,24 +3879,32 @@ def _matmul_3d_wind_and_sigma_dot_local(
   nx_blk = b_len * nx_loc
 
   def _scan_block(inputs):
-    k_b, lon_b, sin_lat_b, sigma_b = inputs
+    k_b, lon_b, sin_lat_b, sigma_b, *z_bounds_b = inputs
     if b_len == 1:
       k0_s = k_b
       lon_s, sin_lat_s, sigma_s = lon_b, sin_lat_b, sigma_b
+      z_bounds_s = z_bounds_b
     else:
       k0_s = k_b[0]
       lon_s = jnp.swapaxes(lon_b, 0, 1).reshape(ny_loc, nx_blk)
       sin_lat_s = jnp.swapaxes(sin_lat_b, 0, 1).reshape(ny_loc, nx_blk)
       sigma_s = jnp.swapaxes(sigma_b, 0, 1).reshape(ny_loc, nx_blk)
+      # One clamp per query level of the block, like the `nx_blk` axis.
+      z_bounds_s = [
+          jnp.broadcast_to(b[:, jnp.newaxis], (b_len, nx_loc)).reshape(
+              1, nx_blk
+          )
+          for b in z_bounds_b
+      ]
 
     lon_idx, lon_w, lat_idx, lat_w, _, _, _ = _horizontal_stencil_tuple(
-        grid, lon_s, sin_lat_s, 'linear'
+        grid, lon_s, sin_lat_s, 'linear', lat_bounds=lat_bounds_t
     )
     lvl_c_idx, lvl_c_w, _, _ = _vertical_stencil_tuple(
-        sigma_s, centers, 'linear'
+        sigma_s, centers, 'linear', sigma_bounds=tuple(z_bounds_s[:2])
     )
     lvl_b_idx, lvl_b_w, _, _ = _vertical_stencil_tuple(
-        sigma_s, boundaries, 'linear'
+        sigma_s, boundaries, 'linear', sigma_bounds=tuple(z_bounds_s[2:])
     )
 
     k_glob_c = jnp.minimum(k0_s, l_src_c - 1)
@@ -3549,15 +3964,19 @@ def _matmul_3d_wind_and_sigma_dot_local(
     return both_jci.reshape(ny_loc, 4, b_len, nx_loc).transpose(2, 1, 0, 3)
 
   if l_q_loc == 1:
-    out_0 = _scan_block(
-        (jnp.int32(0), lon_q_t[0], sin_lat_q_t[0], sigma_q_t[0])
-    )
+    out_0 = _scan_block((
+        jnp.int32(0),
+        lon_q_t[0],
+        sin_lat_q_t[0],
+        sigma_q_t[0],
+        *(b[0] for b in z_bounds),
+    ))
     out_4d = jnp.swapaxes(out_0, 1, 2)[:, jnp.newaxis, :, :]
   elif b_len == 1:
     _, out_l = lax.scan(
         lambda _, inp: (None, _scan_block(inp)),
         None,
-        (k_arr, lon_q_t, sin_lat_q_t, sigma_q_t),
+        (k_arr, lon_q_t, sin_lat_q_t, sigma_q_t, *z_bounds),
     )
     out_4d = out_l.transpose(1, 0, 3, 2)
   else:
@@ -3574,15 +3993,20 @@ def _matmul_3d_wind_and_sigma_dot_local(
       sigma_in = jnp.pad(
           sigma_q_t, [(0, pad_l), (0, 0), (0, 0)], mode='edge'
       ).reshape(n_blocks, b_len, ny_loc, nx_loc)
+      z_bounds_in = [
+          jnp.pad(b, (0, pad_l), mode='edge').reshape(n_blocks, b_len)
+          for b in z_bounds
+      ]
     else:
       k_in = k_arr.reshape(n_blocks, b_len)
       lon_in = lon_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
       sin_lat_in = sin_lat_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
       sigma_in = sigma_q_t.reshape(n_blocks, b_len, ny_loc, nx_loc)
+      z_bounds_in = [b.reshape(n_blocks, b_len) for b in z_bounds]
     _, out_blk = lax.scan(
         lambda _, inp: (None, _scan_block(inp)),
         None,
-        (k_in, lon_in, sin_lat_in, sigma_in),
+        (k_in, lon_in, sin_lat_in, sigma_in, *z_bounds_in),
     )
     out_4d = (
         out_blk.reshape(n_blocks * b_len, 4, ny_loc, nx_loc)[:l_q_loc]
@@ -3609,6 +4033,16 @@ def _interpolate_3d_wind_and_sigma_dot_matmul(
   boundaries_jax = jnp.asarray(boundaries)
   sd_4d = sigma_dot[jnp.newaxis, ...]
   mesh = grid.spmd_mesh
+  lat_bounds, centers_bounds, boundaries_bounds = _wind_sigma_dot_clamp_bounds(
+      grid,
+      lon,
+      sin_lat,
+      sigma,
+      centers_jax,
+      boundaries_jax,
+      max_lat_shift,
+      max_vertical_shift,
+  )
   if mesh is None:
     wind_ext = _extend_with_pole_halo(wind, grid)
     sd_ext = _extend_with_pole_halo(sd_4d, grid)
@@ -3625,13 +4059,18 @@ def _interpolate_3d_wind_and_sigma_dot_matmul(
         buf_lat_origin=0,
         max_lat_shift=max_lat_shift,
         max_vertical_shift=max_vertical_shift,
+        lat_bounds=lat_bounds,
+        centers_bounds=centers_bounds,
+        boundaries_bounds=boundaries_bounds,
     )
 
   x_shards = mesh.shape['x']
   f_spec = P(None, None, 'x', 'y')
   q_spec = P(None, 'x', 'y')
 
-  def _sharded(w_loc, sd_loc, lon_loc, sin_lat_loc, sigma_loc, c_loc, b_loc):
+  def _sharded(
+      w_loc, sd_loc, lon_loc, sin_lat_loc, sigma_loc, c_loc, b_loc, *bounds
+  ):
     if x_shards > 1:
       w_x = lax.all_gather(w_loc, 'x', axis=2, tiled=True)
       sd_x = lax.all_gather(sd_loc, 'x', axis=2, tiled=True)
@@ -3656,15 +4095,31 @@ def _interpolate_3d_wind_and_sigma_dot_matmul(
         buf_lat_origin=buf_lat_origin,
         max_lat_shift=max_lat_shift,
         max_vertical_shift=max_vertical_shift,
+        lat_bounds=bounds[0:2],
+        centers_bounds=bounds[2:4],
+        boundaries_bounds=bounds[4:6],
     )
     return w_mid, sd_mid[jnp.newaxis, ...]
 
   wind_mid, sd_mid_4d = jax.shard_map(
       _sharded,
       mesh=mesh,
-      in_specs=(f_spec, f_spec, q_spec, q_spec, q_spec, P(None), P(None)),
+      in_specs=(f_spec, f_spec, q_spec, q_spec, q_spec, P(None), P(None))
+      + (P('y'),) * 2
+      + (P(None),) * 4,
       out_specs=(f_spec, f_spec),
-  )(wind, sd_4d, lon, sin_lat, sigma, centers_jax, boundaries_jax)
+  )(
+      wind,
+      sd_4d,
+      lon,
+      sin_lat,
+      sigma,
+      centers_jax,
+      boundaries_jax,
+      *(jnp.asarray(b) for b in lat_bounds),
+      *centers_bounds,
+      *boundaries_bounds,
+  )
   return wind_mid, sd_mid_4d[0]
 
 
@@ -3767,10 +4222,14 @@ def horizontal_departure_points(
       the IFS practice noted above); defaults to the arrival points.
     method: 'gather', 'matmul', or None (auto-selected per backend/mesh); see
       `interpolate_3d`.
-    max_lat_shift: latitude half-width of the 'matmul' window, in rows; the
-      wind interpolated at a trajectory midpoint that lies further than this
-      from its arrival row is wrong (not clamped). 0 is treated as 1, None
-      disables windowing, and 'gather' has no window. See `interpolate_3d`.
+    max_lat_shift: latitude displacement limit, in cells, of the transport
+      this solve serves (see `interpolate_3d`). The trajectory midpoint lies
+      about half as far from the arrival point as the departure point, so
+      the wind is interpolated there with the limit
+      `max(1, (max_lat_shift + 1) // 2)`: a midpoint beyond it is clamped to
+      that window (on both methods), which also bounds the departure
+      displacement. The returned departure points themselves are not
+      clamped. None disables the clamp and the 'matmul' window.
 
   Returns:
     DeparturePoints with fields of shape [*batch, longitude_nodes,
@@ -3828,16 +4287,41 @@ def _interpolate_3d_wind_and_sigma_dot_gather(
     sigma: jax.Array,
     centers: Array,
     boundaries: Array,
+    *,
+    max_lat_shift: int | None,
+    max_vertical_shift: int | None,
 ) -> tuple[jax.Array, jax.Array]:
-  """Fused trilinear gather of 3-component `wind` and `sigma_dot` sharing one horizontal stencil."""
+  """Fused trilinear gather of 3-component `wind` and `sigma_dot` sharing one horizontal stencil.
+
+  With both shifts given, the queries are clamped to the same windows as in
+  `_interpolate_3d_wind_and_sigma_dot_matmul`.
+  """
+  lat_bounds = centers_bounds = boundaries_bounds = None
+  if max_lat_shift is not None and max_vertical_shift is not None:
+    lat_bounds, centers_bounds, boundaries_bounds = (
+        _wind_sigma_dot_clamp_bounds(
+            grid,
+            lon,
+            sin_lat,
+            sigma,
+            centers,
+            boundaries,
+            max_lat_shift,
+            max_vertical_shift,
+        )
+    )
+    centers_bounds, boundaries_bounds = (
+        tuple(b[:, jnp.newaxis, jnp.newaxis] for b in bounds)
+        for bounds in (centers_bounds, boundaries_bounds)
+    )
   lon_idx, lon_w, lat_idx, lat_w, _, _, ext_size = _horizontal_stencil_tuple(
-      grid, lon, sin_lat, 'linear'
+      grid, lon, sin_lat, 'linear', lat_bounds=lat_bounds
   )
   lvl_c_idx, lvl_c_w, _, _ = _vertical_stencil_tuple(
-      sigma, jnp.asarray(centers), 'linear'
+      sigma, jnp.asarray(centers), 'linear', sigma_bounds=centers_bounds
   )
   lvl_b_idx, lvl_b_w, _, _ = _vertical_stencil_tuple(
-      sigma, jnp.asarray(boundaries), 'linear'
+      sigma, jnp.asarray(boundaries), 'linear', sigma_bounds=boundaries_bounds
   )
   wind_ext = _extend_with_pole_halo(wind, grid)
   wind_c = jnp.moveaxis(wind_ext, 0, -1).reshape(-1, wind.shape[0])
@@ -3916,12 +4400,17 @@ def departure_points_3d(
       defaults to the arrival points. See `horizontal_departure_points`.
     method: 'gather', 'matmul', or None (auto-selected per backend/mesh); see
       `interpolate_3d`.
-    max_lat_shift: latitude half-width of the 'matmul' window, in rows.
-    max_vertical_shift: vertical half-width of the 'matmul' window, in levels.
-      The winds and σ̇ interpolated at a trajectory midpoint that lies outside
-      either window are wrong (not clamped). A shift of 0 is treated as 1,
-      None for either disables windowing, and 'gather' has no window. See
-      `interpolate_3d`.
+    max_lat_shift: latitude displacement limit, in cells, of the transport
+      this solve serves (see `interpolate_3d`).
+    max_vertical_shift: vertical displacement limit, in cells, of the same.
+      The trajectory midpoint lies about half as far from the arrival point
+      as the departure point, so the winds (on layer centers) and σ̇ (on
+      layer boundaries) are interpolated there with the limits
+      `max(1, (shift + 1) // 2)`, in cells of each one's own nodes: a
+      midpoint beyond them is clamped to those windows (on both methods),
+      which also bounds the departure displacement. The returned departure
+      points themselves are not clamped. None for either shift disables the
+      clamp and the 'matmul' window.
 
   Returns:
     DeparturePoints with fields of shape [layers, longitude_nodes,
@@ -4049,6 +4538,8 @@ def departure_points_3d(
             sigma_mid,
             centers_np,
             boundaries_np,
+            max_lat_shift=mid_lat_shift,
+            max_vertical_shift=mid_vertical_shift,
         )
       else:
         point = dict(lon=lon_mid, sin_lat=sin_lat_mid, sigma=sigma_mid)
@@ -4134,11 +4625,11 @@ def transport_scalar(
     vertical_order: vertical interpolation order (see `interpolate_3d`).
     limiter_bound_reference: optional per-level bound shift for the
       limiter (see `interpolate_3d`).
-    max_vertical_shift: vertical half-width of the 'matmul' window, in levels;
-      the latitude half-width is the interpolator's `max_lat_shift`. A
-      departure point outside either window is interpolated wrongly (not
-      clamped). 0 is treated as 1, None disables windowing, and the 'gather'
-      method has no window. See `interpolate_3d`.
+    max_vertical_shift: vertical displacement limit, in levels; the latitude
+      limit is the interpolator's `max_lat_shift`. A departure point beyond
+      either limit is interpolated at the edge of the window (on both
+      methods); None for either disables the clamp and the 'matmul' window.
+      See `interpolate_3d`.
 
   Returns:
     The transported field(s) at arrival points, of shape
@@ -4267,11 +4758,11 @@ def transport_wind(
       caller's (u, v) must carry the state winds with coefficient exactly
       one (see `SemiLagrangianImplicitExplicitODE.semi_lagrangian_transport`).
     vertical_order: vertical interpolation order (see `interpolate_3d`).
-    max_vertical_shift: vertical half-width of the 'matmul' window, in levels;
-      the latitude half-width is the interpolator's `max_lat_shift`. A
-      departure point outside either window is interpolated wrongly (not
-      clamped). 0 is treated as 1, None disables windowing, and the 'gather'
-      method has no window. See `interpolate_3d`.
+    max_vertical_shift: vertical displacement limit, in levels; the latitude
+      limit is the interpolator's `max_lat_shift`. A departure point beyond
+      either limit is interpolated at the edge of the window (on both
+      methods); None for either disables the clamp and the 'matmul' window.
+      See `interpolate_3d`.
 
   Returns:
     Tuple (u, v) of transported winds at arrival points.
