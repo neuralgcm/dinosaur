@@ -24,10 +24,12 @@ switching modes per-test inside `semi_lagrangian_test.py`.
 """
 
 import functools
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
 from dinosaur import coordinate_systems
+from dinosaur import lagrange_interpolation
 from dinosaur import primitive_equations
 from dinosaur import primitive_equations_states
 from dinosaur import scales
@@ -211,8 +213,10 @@ class DeparturePointsTest(parameterized.TestCase):
     u, v = solid_body_winds(grid, axis=[0, 1, 0], omega=omega)
     lon_mesh, sin_lat_mesh = grid.nodal_mesh
     dt = 0.2
+    # 0.2 radians is 8 latitude rows at T85, more than the default
+    # displacement limit, so the limit is lifted.
     departure = semi_lagrangian.horizontal_departure_points(
-        jnp.asarray(u), jnp.asarray(v), grid, dt=dt
+        jnp.asarray(u), jnp.asarray(v), grid, dt=dt, max_lat_shift=None
     )
     r_exact = rotation_matrix([0, 1, 0], -omega * dt) @ np.stack(
         semi_lagrangian.lon_lat_to_cartesian(lon_mesh, sin_lat_mesh)
@@ -377,10 +381,14 @@ class TransportTest(parameterized.TestCase):
     def blob(r):
       return np.exp(-((1 - np.einsum('c...,c->...', r, center)) / 0.05))
 
+    # 0.2 radians is 8 latitude rows at T85, more than the default
+    # displacement limit, so the limit is lifted.
     departure = semi_lagrangian.horizontal_departure_points(
-        jnp.asarray(u), jnp.asarray(v), grid, dt=dt
+        jnp.asarray(u), jnp.asarray(v), grid, dt=dt, max_lat_shift=None
     )
-    interpolator = semi_lagrangian.GridInterpolator(grid, order='cubic')
+    interpolator = semi_lagrangian.GridInterpolator(
+        grid, order='cubic', max_lat_shift=None
+    )
     transported = semi_lagrangian.transport_scalar_2d(
         jnp.asarray(blob(r)), departure, interpolator
     )
@@ -922,6 +930,150 @@ class SemiLagrangianGradientTest(parameterized.TestCase):
           gradient[direction], finite_difference, rtol=1e-4,
           err_msg=f'{direction=}',
       )
+
+
+# The helpers below are also defined in `semi_lagrangian_test.py`; test
+# modules do not import one another.
+#
+# Window half-width of the out-of-window tests, and the displacement range (in
+# grid cells) of their departure points: beyond the window, by up to 2S + 3.
+_SHIFT = 2
+_FAR = (3.0, 7.0)
+
+
+def _far_queries(grid, layers, seed, dtype=np.float32, cells=_FAR):
+  """Grid-aligned [layers, *nodal_shape] queries displaced by `cells`."""
+  rng = np.random.RandomState(seed)
+  lon_mesh, sin_lat_mesh = grid.nodal_mesh
+  phi_mesh = np.arcsin(sin_lat_mesh)
+  shape = (layers,) + grid.nodal_shape
+
+  def shifts():
+    return rng.uniform(*cells, size=shape) * rng.choice([-1.0, 1.0], size=shape)
+
+  phi = np.clip(
+      phi_mesh + shifts() * np.pi / grid.latitude_nodes,
+      -np.pi / 2 + 1e-4,
+      np.pi / 2 - 1e-4,
+  )
+  lon = (lon_mesh + rng.uniform(-0.3, 0.3, size=shape)) % (2 * np.pi)
+  centers = sigma_coordinates.SigmaCoordinates.equidistant(layers).centers
+  sigma = np.clip(
+      centers[:, np.newaxis, np.newaxis] + shifts() / layers,
+      centers[0] - 0.02,
+      centers[-1] + 0.02,
+  )
+  return tuple(jnp.asarray(x, dtype) for x in (lon, np.sin(phi), sigma))
+
+
+def _library_phi(sin_lat):
+  s = jnp.clip(sin_lat, -1, 1)
+  return jnp.arctan2(s, jnp.sqrt(jnp.maximum(1 - jnp.square(s), 1e-12)))
+
+
+def _reference_clamp(grid, nodes, sin_lat, sigma, order, shift):
+  """The window clamp, written out independently of the library's code.
+
+  Query [k, i, j] arrives at halo-extended latitude row a = j + 2 and level
+  k: its latitude is clamped to [φ_ext[a - S], φ_ext[a + S + 1]) and its σ to
+  [z[k - S], z[k + S + 1]) (indices clipped to the axes; the upper bounds one
+  ulp below the node). The clamped latitude is handed back as sin(latitude),
+  nudged by whole ulps until the arctan2 maps it a few ulps inside the
+  interval (the library's arctan2, compiled in another program, may round
+  differently by an ulp), so it represents the clamped point, in the same
+  bracketing cell, to within the resolution of sin(latitude).
+  """
+  phi_ext = np.asarray(lagrange_interpolation.latitude_halo_axis(grid))
+  n_ext = phi_ext.size
+  c_min, c_max = (0, n_ext - 2) if order == 'linear' else (1, n_ext - 3)
+  a = np.minimum(np.arange(grid.nodal_shape[1]), grid.latitude_nodes - 1) + 2
+  dtype = sin_lat.dtype
+  lo = phi_ext[np.clip(a - shift, c_min, c_max)].astype(dtype)
+  hi = np.nextafter(
+      phi_ext[np.clip(a + shift, c_min, c_max) + 1].astype(dtype),
+      np.asarray(-np.inf, dtype),
+  )
+  phi = _library_phi(sin_lat)
+  sl = jnp.where((phi < lo) | (phi > hi), jnp.sin(jnp.clip(phi, lo, hi)), sin_lat)
+  one = jnp.ones_like(sl)
+  lo_in, hi_in = jnp.asarray(lo), jnp.asarray(hi)
+  for _ in range(4):
+    lo_in = jnp.nextafter(lo_in, jnp.full_like(lo_in, jnp.inf))
+    hi_in = jnp.nextafter(hi_in, jnp.full_like(hi_in, -jnp.inf))
+  for _ in range(32):
+    q = _library_phi(sl)
+    sl = jnp.where(
+        q > hi_in,
+        jnp.nextafter(sl, -one),
+        jnp.where(q < lo_in, jnp.nextafter(sl, one), sl),
+    )
+  z = np.asarray(nodes).astype(dtype)
+  k = np.minimum(np.arange(sigma.shape[0]), z.size - 1)
+  hi_i = np.minimum(k + shift + 1, z.size - 1)
+  z_lo = z[np.maximum(k - shift, 0)]
+  z_hi = np.where(
+      hi_i < z.size - 1, np.nextafter(z[hi_i], np.asarray(-np.inf, dtype)),
+      z[hi_i],
+  )
+  sg = jnp.clip(sigma, z_lo[:, None, None], z_hi[:, None, None])
+  return sl, sg
+
+
+class WindowClampFloat64Test(parameterized.TestCase):
+  """The window clamp, checked tightly in float64 (see `WindowClampTest`)."""
+
+  @parameterized.product(
+      order=('linear', 'cubic'),
+      limiter=(None, 'quasi_monotone'),
+  )
+  def test_out_of_window_interpolation_is_at_clamped_points(
+      self, order, limiter
+  ):
+    grid = spherical_harmonic.Grid.T21()
+    layers = 12
+    centers = sigma_coordinates.SigmaCoordinates.equidistant(layers).centers
+    lon, sin_lat, sigma = _far_queries(
+        grid, layers, seed=1, dtype=np.float64
+    )
+    field = jnp.asarray(
+        1.0
+        + np.abs(
+            np.random.RandomState(2).normal(size=(2, layers) + grid.nodal_shape)
+        )
+    )
+    ref = jnp.asarray(np.linspace(220.0, 295.0, layers)) if limiter else None
+    kw = dict(
+        order=order,
+        limiter=limiter,
+        vertical_order='cubic',
+        limiter_bound_reference=ref,
+    )
+    shift = _SHIFT
+    windows = dict(max_lat_shift=shift, max_vertical_shift=shift)
+    out_g = semi_lagrangian.interpolate_3d(
+        field, grid, lon, sin_lat, sigma, centers, method='gather',
+        **kw, **windows,
+    )
+    out_m = semi_lagrangian.interpolate_3d(
+        field, grid, lon, sin_lat, sigma, centers, method='matmul',
+        **kw, **windows,
+    )
+    with mock.patch.object(jax, 'default_backend', return_value='tpu'):
+      jax.clear_caches()
+      out_t = semi_lagrangian.interpolate_3d(
+          field, grid, lon, sin_lat, sigma, centers, method='matmul',
+          **kw, **windows,
+      )
+    jax.clear_caches()
+    sl_c, sg_c = _reference_clamp(
+        grid, centers, sin_lat, sigma, order, shift
+    )
+    out_ref = semi_lagrangian.interpolate_3d(
+        field, grid, lon, sl_c, sg_c, centers, method='gather', **kw,
+        max_lat_shift=None, max_vertical_shift=None,
+    )
+    for out in (out_g, out_m, out_t):
+      np.testing.assert_allclose(out, out_ref, rtol=0, atol=1e-11)
 
 
 if __name__ == '__main__':

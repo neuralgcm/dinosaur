@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import math
 from typing import Any, Callable, Optional, Sequence, TypeVar, Union
 
@@ -175,8 +176,18 @@ class SemiLagrangianImplicitExplicitODE:
       nodal_velocities: Callable[[PyTreeState], typing.Pytree],
       departure_points: Callable[..., Any],
       semi_lagrangian_transport: Callable[[PyTreeState, Any], PyTreeState],
+      nonadvective_terms_and_velocities: (
+          Callable[[PyTreeState], tuple[PyTreeState, typing.Pytree]] | None
+      ) = None,
   ) -> SemiLagrangianImplicitExplicitODE:
-    """Constructs a `SemiLagrangianImplicitExplicitODE` with given methods."""
+    """Constructs a `SemiLagrangianImplicitExplicitODE` with given methods.
+
+    `semi_lagrangian_transport` may take `(state, departure)` only, or also
+    the keyword `predictor_stage` (see `semi_lagrangian_transport`).
+    `nonadvective_terms_and_velocities` is optional: it must return what
+    `nonadvective_terms` and `nodal_velocities` return, and defaults to
+    calling them (see the method of that name).
+    """
     ode = cls()
     ode.nonadvective_terms = nonadvective_terms
     ode.implicit_terms = implicit_terms
@@ -184,6 +195,8 @@ class SemiLagrangianImplicitExplicitODE:
     ode.nodal_velocities = nodal_velocities
     ode.departure_points = departure_points
     ode.semi_lagrangian_transport = semi_lagrangian_transport
+    if nonadvective_terms_and_velocities is not None:
+      ode.nonadvective_terms_and_velocities = nonadvective_terms_and_velocities
     return ode
 
   def nodal_velocities(self, state: PyTreeState) -> typing.Pytree:
@@ -200,6 +213,26 @@ class SemiLagrangianImplicitExplicitODE:
       `departure_points`.
     """
     raise NotImplementedError
+
+  def nonadvective_terms_and_velocities(
+      self, state: PyTreeState
+  ) -> tuple[PyTreeState, typing.Pytree]:
+    """Evaluates `(nonadvective_terms(state), nodal_velocities(state))`.
+
+    Time steppers evaluate both on the same state. Equations for which the
+    two share work (e.g. one diagnostic state) override this to compute them
+    together; the result must equal calling the two methods separately, so
+    an override must not be inherited by a subclass that replaces either
+    method without also replacing this one. The default makes the two
+    calls.
+
+    Args:
+      state: the (modal) state.
+
+    Returns:
+      The pair `(nonadvective_terms(state), nodal_velocities(state))`.
+    """
+    return self.nonadvective_terms(state), self.nodal_velocities(state)
 
   def departure_points(
       self,
@@ -224,7 +257,11 @@ class SemiLagrangianImplicitExplicitODE:
     raise NotImplementedError
 
   def semi_lagrangian_transport(
-      self, state: PyTreeState, departure: Any
+      self,
+      state: PyTreeState,
+      departure: Any,
+      *,
+      predictor_stage: bool = False,
   ) -> PyTreeState:
     """Remaps a state-like pytree from departure to arrival points.
 
@@ -242,11 +279,37 @@ class SemiLagrangianImplicitExplicitODE:
     Args:
       state: modal state-like pytree to transport.
       departure: departure points from `departure_points`.
+      predictor_stage: True when `state` is the predictor stage's bracket
+        in `semi_lagrangian_crank_nicolson_rk2`, whose transported result
+        is only used to evaluate `implicit_inverse`, `nonadvective_terms`
+        and `nodal_velocities`. An implementation may then skip work on
+        components of the result that none of those read; the default
+        implementation ignores it. Time steppers pass it only to equations
+        whose `semi_lagrangian_transport` declares the keyword (see
+        `_accepts_predictor_stage`), so overrides written as
+        `(state, departure)` keep working.
 
     Returns:
       The transported pytree, in the same (modal) representation.
     """
     raise NotImplementedError
+
+
+def _accepts_predictor_stage(
+    equation: SemiLagrangianImplicitExplicitODE,
+) -> bool:
+  """Returns True if `equation`'s transport takes the `predictor_stage` keyword.
+
+  `semi_lagrangian_transport(state, departure)` is the original interface;
+  `predictor_stage` was added to it afterwards, and equations written
+  against the original (subclass overrides, or the plain function given to
+  `from_functions`) do not declare it. Passing the keyword to them would
+  raise, so the predictor-stage call is made with it only when declared.
+  """
+  return (
+      'predictor_stage'
+      in inspect.signature(equation.semi_lagrangian_transport).parameters
+  )
 
 
 def semi_lagrangian_crank_nicolson_rk2(
@@ -304,28 +367,57 @@ def semi_lagrangian_crank_nicolson_rk2(
     Temperton, C., Hortal, M. & Simmons, A. A two-time-level semi-Lagrangian
     global spectral model. Q. J. R. Meteorol. Soc. 127, 111-127 (2001).
   """
+  step_from_first_stage = _semi_lagrangian_rk2_from_first_stage(
+      equation, time_step, off_centering, warm_start_corrector
+  )
+
+  def step_fn(x0: PyTreeState) -> PyTreeState:
+    n0, v0 = equation.nonadvective_terms_and_velocities(x0)
+    # Stage 1 (predictor): first-order trajectories from current winds.
+    departure1 = equation.departure_points(v0, time_step)
+    return step_from_first_stage(x0, n0, v0, departure1)
+
+  return step_fn
+
+
+def _semi_lagrangian_rk2_from_first_stage(
+    equation: SemiLagrangianImplicitExplicitODE,
+    time_step: float,
+    off_centering: float,
+    warm_start_corrector: bool,
+) -> Callable[..., PyTreeState]:
+  """The step of `semi_lagrangian_crank_nicolson_rk2`, given its first terms.
+
+  Returns a function `(x0, n0, v0, departure1) -> x1`, where `n0` and `v0`
+  are the non-advective terms and nodal velocities of `x0` and `departure1`
+  the departure points of the trajectories of `v0` over `time_step`: a caller
+  that needs those values itself (`semi_lagrangian_settls_init`) computes
+  them once.
+  """
   dt = time_step
   α = (0.5 + off_centering) * dt
   β = (0.5 - off_centering) * dt
+  supports_predictor_stage = _accepts_predictor_stage(equation)
 
-  def step_fn(x0: PyTreeState) -> PyTreeState:
-    n0 = equation.nonadvective_terms(x0)
+  def step_fn(
+      x0: PyTreeState, n0: PyTreeState, v0: typing.Pytree, departure1: Any
+  ) -> PyTreeState:
     l0 = equation.implicit_terms(x0)
-    v0 = equation.nodal_velocities(x0)
-
-    # Stage 1 (predictor): first-order trajectories from current winds.
-    departure1 = equation.departure_points(v0, dt)
     bracket1 = tree_map(lambda x, l, n: x + β * l + dt * n, x0, l0, n0)
-    x_star = equation.implicit_inverse(
-        equation.semi_lagrangian_transport(bracket1, departure1), α
+    transported1 = (
+        equation.semi_lagrangian_transport(
+            bracket1, departure1, predictor_stage=True
+        )
+        if supports_predictor_stage
+        else equation.semi_lagrangian_transport(bracket1, departure1)
     )
+    x_star = equation.implicit_inverse(transported1, α)
 
     # Stage 2 (corrector): time-centered trajectories and trapezoidal update.
-    v_star = equation.nodal_velocities(x_star)
+    n_star, v_star = equation.nonadvective_terms_and_velocities(x_star)
     v_mid = tree_map(lambda a, b: 0.5 * (a + b), v0, v_star)
     guess = departure1 if warm_start_corrector else None
     departure2 = equation.departure_points(v_mid, dt, initial_guess=guess)
-    n_star = equation.nonadvective_terms(x_star)
     bracket2 = tree_map(lambda x, l, n: x + β * (l + n), x0, l0, n0)
     transported = equation.semi_lagrangian_transport(bracket2, departure2)
     combined = tree_map(lambda t, n: t + α * n, transported, n_star)
@@ -393,9 +485,8 @@ def semi_lagrangian_settls(
     else:
       x, (n_prev, v_prev) = carry
       dep_prev = None
-    n = equation.nonadvective_terms(x)
+    n, v = equation.nonadvective_terms_and_velocities(x)
     l = equation.implicit_terms(x)
-    v = equation.nodal_velocities(x)
     v_mid = tree_map(lambda a, b: 1.5 * a - 0.5 * b, v, v_prev)
     departure = equation.departure_points(v_mid, dt, initial_guess=dep_prev)
     bracket = tree_map(
@@ -444,15 +535,19 @@ def semi_lagrangian_settls_init(
     tuple (plus carried departure points if warm-starting) consumed by
     `semi_lagrangian_settls`.
   """
-  rk2_step = semi_lagrangian_crank_nicolson_rk2(equation, time_step)
+  # The defaults of `semi_lagrangian_crank_nicolson_rk2`; the step reuses the
+  # terms, velocities and departure points this function returns.
+  rk2_step = _semi_lagrangian_rk2_from_first_stage(
+      equation, time_step, off_centering=0.0, warm_start_corrector=True
+  )
 
   def init_fn(x0):
-    n0 = equation.nonadvective_terms(x0)
-    v0 = equation.nodal_velocities(x0)
+    n0, v0 = equation.nonadvective_terms_and_velocities(x0)
+    dep0 = equation.departure_points(v0, time_step)
+    x1 = rk2_step(x0, n0, v0, dep0)
     if warm_start_departures:
-      dep0 = equation.departure_points(v0, time_step)
-      return (rk2_step(x0), (n0, v0, dep0))
-    return (rk2_step(x0), (n0, v0))
+      return (x1, (n0, v0, dep0))
+    return (x1, (n0, v0))
 
   return init_fn
 
@@ -507,6 +602,15 @@ class TimeReversedSemiLagrangianODE(SemiLagrangianImplicitExplicitODE):
   def nodal_velocities(self, state: PyTreeState) -> typing.Pytree:
     return tree_map(jnp.negative, self.forward_eq.nodal_velocities(state))
 
+  def nonadvective_terms_and_velocities(
+      self, state: PyTreeState
+  ) -> tuple[PyTreeState, typing.Pytree]:
+    # Forwarded so that the forward equation's shared evaluation is kept.
+    terms, velocities = self.forward_eq.nonadvective_terms_and_velocities(
+        state
+    )
+    return tree_map(jnp.negative, terms), tree_map(jnp.negative, velocities)
+
   def departure_points(
       self,
       velocities: typing.Pytree,
@@ -516,8 +620,15 @@ class TimeReversedSemiLagrangianODE(SemiLagrangianImplicitExplicitODE):
     return self.forward_eq.departure_points(velocities, dt, initial_guess)
 
   def semi_lagrangian_transport(
-      self, state: PyTreeState, departure: Any
+      self,
+      state: PyTreeState,
+      departure: Any,
+      *,
+      predictor_stage: bool = False,
   ) -> PyTreeState:
+    # `predictor_stage` is not forwarded: `forward_eq` may predate the
+    # keyword, and transport is unchanged by time reversal.
+    del predictor_stage
     return self.forward_eq.semi_lagrangian_transport(state, departure)
 
 
@@ -560,7 +671,10 @@ def compose_equations(
   If the ImplicitExplicitODE instance is a SemiLagrangianImplicitExplicitODE,
   the composed equation is too, delegating trajectories and transport to it:
   the explicit terms of the other equations are treated as additional
-  non-advective forcing.
+  non-advective forcing. Those forcings are evaluated on the predictor state
+  of `semi_lagrangian_crank_nicolson_rk2` and may read any of its fields, so
+  the composed equation's transport does not take `predictor_stage`: the
+  predictor state is always transported in full.
 
   All equations must return tendency pytrees with matching structure. In
   particular, forcings that construct states with empty `tracers` (e.g.
@@ -590,13 +704,33 @@ def compose_equations(
   ):
     base = implicit_explicit_equation
 
-    def nonadvective_fn(x: PyTreeState) -> PyTreeState:
+    def add_forcings(base_terms: PyTreeState, x: PyTreeState) -> PyTreeState:
       tendencies = [
-          base.nonadvective_terms(x) if fn is base else fn.explicit_terms(x)
+          base_terms if fn is base else fn.explicit_terms(x)
           for fn in equations
       ]
       return tree_map(
           lambda *args: sum([x for x in args if x is not None]), *tendencies)
+
+    def nonadvective_fn(x: PyTreeState) -> PyTreeState:
+      return add_forcings(base.nonadvective_terms(x), x)
+
+    def nonadvective_and_velocities_fn(
+        x: PyTreeState,
+    ) -> tuple[PyTreeState, typing.Pytree]:
+      # Keeps the work `base` shares between its terms and its velocities.
+      base_terms, velocities = base.nonadvective_terms_and_velocities(x)
+      return add_forcings(base_terms, x), velocities
+
+    if len(equations) > 1:
+      # `base` may leave fields that none of its own methods read
+      # untransported in the predictor stage (`predictor_stage=True`). The
+      # other equations' forcings are evaluated on that state and may read
+      # them, so the keyword is not offered and nothing is skipped.
+      def transport_fn(state: PyTreeState, departure: Any) -> PyTreeState:
+        return base.semi_lagrangian_transport(state, departure)
+    else:
+      transport_fn = base.semi_lagrangian_transport
 
     return SemiLagrangianImplicitExplicitODE.from_functions(
         nonadvective_terms=nonadvective_fn,
@@ -604,7 +738,8 @@ def compose_equations(
         implicit_inverse=base.implicit_inverse,
         nodal_velocities=base.nodal_velocities,
         departure_points=base.departure_points,
-        semi_lagrangian_transport=base.semi_lagrangian_transport,
+        semi_lagrangian_transport=transport_fn,
+        nonadvective_terms_and_velocities=nonadvective_and_velocities_fn,
     )
 
   return ImplicitExplicitODE.from_functions(

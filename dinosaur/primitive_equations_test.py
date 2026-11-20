@@ -13,6 +13,7 @@
 # limitations under the License.
 import dataclasses
 import functools
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -1742,6 +1743,175 @@ class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
     with self.subTest('mass approximately conserved'):
       self.assertLess(results[True]['mass_drift'], 0.05)
 
+  @parameterized.parameters('class', 'instance')
+  def test_predictor_stage_transports_tracers_read_by_overridden_terms(
+      self, override_on
+  ):
+    """The passive-tracer shortcut is off when `nonadvective_terms` is replaced.
+
+    In the predictor stage the library's own equations leave tracers that do
+    not couple to the dynamics untransported, because nothing evaluated on
+    the predictor state reads them. A replaced `nonadvective_terms` may read
+    them, so it must receive the transported tracer.
+    """
+    equation, state, _, _ = self._setup(humidity=True)
+    passive = primitive_equations_states.gaussian_scalar(
+        equation.coords, equation.physics_specs
+    )
+    state.tracers = {**state.tracers, 'passive': passive}
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+    departure = equation.departure_points(equation.nodal_velocities(state), dt)
+
+    def passive_tracer_after_transport(eq, predictor_stage):
+      return eq.semi_lagrangian_transport(
+          state, departure, predictor_stage=predictor_stage
+      ).tracers['passive']
+
+    def heating_from_passive_tracer(eq, state):
+      library_terms = (
+          primitive_equations.SemiLagrangianPrimitiveEquations.nonadvective_terms
+      )
+      tendency = library_terms(eq, state)
+      return tendency.replace(
+          temperature_variation=(
+              tendency.temperature_variation + state.tracers['passive']
+          )
+      )
+
+    class ReadsPassiveTracer(
+        primitive_equations.SemiLagrangianPrimitiveEquations
+    ):
+
+      def nonadvective_terms(self, state):
+        return heating_from_passive_tracer(self, state)
+
+    transported = passive_tracer_after_transport(
+        equation, predictor_stage=False
+    )
+    with self.subTest('library equation skips passive tracers'):
+      np.testing.assert_array_equal(
+          passive_tracer_after_transport(equation, predictor_stage=True),
+          passive,
+      )
+      self.assertFalse(np.allclose(transported, passive))
+    if override_on == 'class':
+      overridden = ReadsPassiveTracer(
+          equation.reference_temperature,
+          equation.orography,
+          equation.coords,
+          equation.physics_specs,
+          humidity_key='specific_humidity',
+      )
+    else:
+      overridden = dataclasses.replace(equation)
+      overridden.nonadvective_terms = functools.partial(
+          heating_from_passive_tracer, overridden
+      )
+    with self.subTest('overridden terms receive the transported tracer'):
+      np.testing.assert_array_equal(
+          passive_tracer_after_transport(overridden, predictor_stage=True),
+          transported,
+      )
+
+  def test_composed_forcing_reads_transported_passive_tracer(self):
+    """A composed forcing sees passive tracers transported in the predictor.
+
+    `compose_equations` evaluates the other equations' explicit terms on the
+    predictor state, so the predictor stage must not leave passive tracers
+    untransported for the composed equation, even though the base equation's
+    own methods never read them.
+    """
+    equation, state, _, _ = self._setup(humidity=True)
+    passive = primitive_equations_states.gaussian_scalar(
+        equation.coords, equation.physics_specs
+    )
+    state.tracers = {**state.tracers, 'passive': passive}
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+
+    def heating_from_passive_tracer(state):
+      zeros = jax.tree_util.tree_map(jnp.zeros_like, state)
+      return zeros.replace(
+          temperature_variation=state.tracers['passive'], sim_time=None
+      )
+
+    forcing = time_integration.ExplicitODE.from_functions(
+        heating_from_passive_tracer
+    )
+    composed = time_integration.compose_equations([equation, forcing])
+
+    # The same forcing as part of `nonadvective_terms`, which switches the
+    # shortcut off (see the test above), is the reference.
+    reference = dataclasses.replace(equation)
+    library_terms = (
+        primitive_equations.SemiLagrangianPrimitiveEquations.nonadvective_terms
+    )
+
+    def nonadvective_terms(state):
+      return library_terms(reference, state) + heating_from_passive_tracer(
+          state
+      )
+
+    reference.nonadvective_terms = nonadvective_terms
+
+    def step(eq):
+      return jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(eq, dt)
+      )(state)
+
+    actual = step(composed)
+    expected = step(reference)
+    for field in ('temperature_variation', 'divergence', 'vorticity'):
+      np.testing.assert_allclose(
+          getattr(actual, field), getattr(expected, field), rtol=1e-5,
+          atol=1e-7, err_msg=field,
+      )
+    # The check has teeth: the forcing changes the step, and evaluating it on
+    # an untransported tracer in the predictor would change it differently.
+    plain = step(equation)
+    self.assertFalse(
+        np.allclose(
+            actual.temperature_variation, plain.temperature_variation,
+            rtol=1e-5, atol=1e-7,
+        )
+    )
+
+  def test_fused_terms_and_velocities_respect_overrides(self):
+    """The shared-diagnostics path is used only for the library's methods."""
+    equation, state, _, _ = self._setup(humidity=True)
+
+    class DoubledVelocities(
+        primitive_equations.SemiLagrangianPrimitiveEquations
+    ):
+
+      def nodal_velocities(self, state, aux_state=None):
+        velocities = super().nodal_velocities(state, aux_state)
+        return jax.tree_util.tree_map(lambda x: 2 * x, velocities)
+
+    overridden = DoubledVelocities(
+        equation.reference_temperature,
+        equation.orography,
+        equation.coords,
+        equation.physics_specs,
+        humidity_key='specific_humidity',
+    )
+    with self.subTest('library velocities'):
+      _, velocities = equation.nonadvective_terms_and_velocities(state)
+      jax.tree_util.tree_map(
+          np.testing.assert_array_equal,
+          velocities,
+          equation.nodal_velocities(state),
+      )
+    with self.subTest('overridden velocities'):
+      _, velocities = overridden.nonadvective_terms_and_velocities(state)
+      jax.tree_util.tree_map(
+          np.testing.assert_array_equal,
+          velocities,
+          overridden.nodal_velocities(state),
+      )
+      self.assertFalse(
+          np.allclose(velocities.u, equation.nodal_velocities(state).u)
+      )
+
   def test_nodal_tracer_positivity(self):
     """Nodal tracer storage delivers exact non-negativity for sharp tracers.
 
@@ -2197,6 +2367,124 @@ class SemiLagrangianHybridTest(parameterized.TestCase):
     equation, state, _, _ = self._hybrid_setup(hybrid_levels)
     with self.assertRaisesRegex(TypeError, 'semi-Lagrangian'):
       equation.explicit_terms(state)
+
+  def test_nonadvective_terms_and_velocities_matches_separate(self):
+    """Fused nonadvective_terms_and_velocities matches separate evaluations."""
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        8, sigma_exponent=1.5, stretch_exponent=0.5
+    )
+    eq_hybrid, state_h, ref_temps_h, orog_h = self._hybrid_setup(
+        hybrid_levels,
+        humidity_key='specific_humidity',
+        cloud_keys=('cloud_liq',),
+    )
+    q = primitive_equations_states.gaussian_scalar(
+        eq_hybrid.coords, eq_hybrid.physics_specs, amplitude=0.01
+    )
+    state_h.tracers = {'specific_humidity': q, 'cloud_liq': 0.1 * q}
+    n_ref_h = eq_hybrid.nonadvective_terms(state_h)
+    v_ref_h = eq_hybrid.nodal_velocities(state_h)
+    n_fused_h, v_fused_h = eq_hybrid.nonadvective_terms_and_velocities(state_h)
+    assert_states_close(n_fused_h, n_ref_h, rtol=1e-5, atol=1e-6)
+    for name in ('u', 'v', 'sigma_dot', 'u_mean', 'v_mean'):
+      np.testing.assert_allclose(
+          getattr(v_fused_h, name),
+          getattr(v_ref_h, name),
+          rtol=1e-5,
+          atol=1e-6,
+          err_msg=name,
+      )
+
+    sigma_levels = sigma_coordinates.SigmaCoordinates.equidistant(8)
+    coords_s = coordinate_systems.CoordinateSystem(
+        eq_hybrid.coords.horizontal, sigma_levels
+    )
+    eq_sigma = primitive_equations.SemiLagrangianPrimitiveEquations(
+        ref_temps_h,
+        orog_h,
+        coords_s,
+        eq_hybrid.physics_specs,
+        humidity_key='specific_humidity',
+    )
+    state_s = state_h.replace(tracers={'specific_humidity': q})
+    n_ref_s = eq_sigma.nonadvective_terms(state_s)
+    v_ref_s = eq_sigma.nodal_velocities(state_s)
+    n_fused_s, v_fused_s = eq_sigma.nonadvective_terms_and_velocities(state_s)
+    assert_states_close(n_fused_s, n_ref_s, rtol=1e-5, atol=1e-6)
+    for name in ('u', 'v', 'sigma_dot', 'u_mean', 'v_mean'):
+      np.testing.assert_allclose(
+          getattr(v_fused_s, name),
+          getattr(v_ref_s, name),
+          rtol=1e-5,
+          atol=1e-6,
+          err_msg=name,
+      )
+
+  def test_semi_lagrangian_transport_with_low_order_tracers(self):
+    """The low-order nodal tracers come with an unchanged transported state."""
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        8, sigma_exponent=1.5, stretch_exponent=0.5
+    )
+    base_eq, state, _, _ = self._hybrid_setup(
+        hybrid_levels,
+        humidity_key='specific_humidity',
+        nodal_tracers=('specific_humidity', 'aerosol'),
+        monotone_tracers=True,
+        vertical_interpolation_order='cubic',
+    )
+    grid = base_eq.coords.horizontal
+    q_nodal = jnp.maximum(
+        grid.to_nodal(
+            primitive_equations_states.gaussian_scalar(
+                base_eq.coords, base_eq.physics_specs, amplitude=0.01
+            )
+        ),
+        0.0,
+    )
+    state.tracers = {
+        'specific_humidity': q_nodal,
+        'aerosol': 0.5 * jnp.roll(q_nodal, shift=5, axis=1),
+        'modal_passive': primitive_equations_states.gaussian_scalar(
+            base_eq.coords, base_eq.physics_specs
+        ),
+    }
+    dt = self._nondim_minutes(base_eq.physics_specs, 30)
+    vel = base_eq.nodal_velocities(state)
+    dep = base_eq.departure_points(vel, dt)
+    linear_interp = semi_lagrangian.GridInterpolator(
+        grid, 'linear', limiter=None, method='gather'
+    )
+    expected_low = {
+        k: semi_lagrangian.transport_scalar(
+            state.tracers[k],
+            dep.full,
+            base_eq._reference_vertical_nodes,
+            linear_interp,
+            vertical_order='linear',
+        )
+        for k in ('specific_humidity', 'aerosol')
+    }
+
+    for method, backend in (('gather', 'cpu'), ('matmul', 'tpu')):
+      with self.subTest(method=method, backend=backend):
+        eq = dataclasses.replace(base_eq, interpolation_method=method)
+        with mock.patch.object(jax, 'default_backend', return_value=backend):
+          jax.clear_caches()
+          ref_out = jax.jit(
+              lambda s: eq.semi_lagrangian_transport(s, dep)
+          )(state)
+          fused_out, tr_low = jax.jit(
+              lambda s: eq.semi_lagrangian_transport_with_low_order_tracers(
+                  s, dep
+              )
+          )(state)
+        assert_states_close(fused_out, ref_out, rtol=2e-5, atol=2e-5)
+        self.assertEqual(set(tr_low.keys()), {'specific_humidity', 'aerosol'})
+        for k in ('specific_humidity', 'aerosol'):
+          np.testing.assert_allclose(
+              tr_low[k], expected_low[k], rtol=2e-5, atol=2e-5, err_msg=k
+          )
+    jax.clear_caches()
 
 
 def interpolate_state_hybrid_to_sigma(

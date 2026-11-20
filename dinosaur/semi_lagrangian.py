@@ -17,12 +17,18 @@
 This module provides the building blocks for semi-Lagrangian advection on
 full Gaussian grids: spherical geometry helpers (Cartesian coordinates,
 tangent bases, and parallel transport of tangent vectors), a fixed-iteration
-departure-point solver, and gather-based linear/cubic Lagrange interpolation
-with longitude wrapping, cross-pole halos, and an optional quasi-monotone
-limiter (Bermejo & Staniforth 1992).
+departure-point solver, and linear/cubic Lagrange interpolation (both
+gather-based and TPU/SPMD-friendly MXU matmul-based) with longitude wrapping,
+cross-pole halos, and an optional quasi-monotone limiter (Bermejo & Staniforth
+1992).
 
 All operations use static shapes and a fixed number of iterations, so they
 are reverse-mode differentiable and compatible with `jax.jit`/`jax.vmap`.
+
+This module is the public API. The interpolation itself lives in two
+implementation modules: `lagrange_interpolation` (stencils, the window clamp
+and the gather kernels) and `semi_lagrangian_matmul` (halo exchanges, memory
+planners and the matmul kernels for TPUs and SPMD meshes).
 
 Conventions:
 
@@ -51,22 +57,29 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 from typing import Literal, NamedTuple
 
 from dinosaur import coordinate_systems
+from dinosaur import lagrange_interpolation
+from dinosaur import semi_lagrangian_matmul
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import typing
 import jax
+from jax import lax
 import jax.numpy as jnp
 import numpy as np
 import tree_math
 
-
 Array = typing.Array
+InterpolationMethod = Literal['gather', 'matmul']
 
-# All `einsum`s should be done at highest available precision.
-einsum = functools.partial(jnp.einsum, precision=jax.lax.Precision.HIGHEST)
+# Default limit, in grid cells, on the displacement of a departure point from
+# its arrival point in latitude and in the vertical (`max_lat_shift` and
+# `max_vertical_shift`; see `interpolate_3d`).
+DEFAULT_MAX_SHIFT = 6
+_INTERPOLATION_METHODS = ('gather', 'matmul')
 
 
 #  =============================================================================
@@ -126,11 +139,13 @@ def cartesian_wind(u: Array, v: Array, lon: Array, sin_lat: Array) -> Array:
   cos_lat = jnp.sqrt(1 - jnp.square(sin_lat))
   sin_lon = jnp.sin(lon)
   cos_lon = jnp.cos(lon)
-  return jnp.stack([
-      -u * sin_lon - v * sin_lat * cos_lon,
-      u * cos_lon - v * sin_lat * sin_lon,
-      v * cos_lat,
-  ])
+  return jnp.stack(
+      [
+          -u * sin_lon - v * sin_lat * cos_lon,
+          u * cos_lon - v * sin_lat * sin_lon,
+          v * cos_lat,
+      ]
+  )
 
 
 def tangent_wind(
@@ -188,261 +203,171 @@ def _normalize(r: Array) -> jnp.ndarray:
   return r / jnp.sqrt(jnp.square(r).sum(axis=0, keepdims=True))
 
 
-#  =============================================================================
-#  Gather-based interpolation on the full Gaussian grid.
-#  =============================================================================
-
-
-def _lagrange_weights(x: Array, nodes: Array) -> jnp.ndarray:
-  """Computes Lagrange interpolation weights.
+def validate_window_shift(name: str, max_shift: int | None) -> None:
+  """Raises unless `max_shift` is None or a non-negative integer.
 
   Args:
-    x: coordinates at which to interpolate, of shape [...].
-    nodes: stencil node coordinates, of shape [..., stencil_size]. Nodes need
-      not be uniformly spaced.
-
-  Returns:
-    Weights of shape [..., stencil_size] that are exact for polynomials of
-    degree `stencil_size - 1`.
+    name: name of the argument, for the error message (`'max_lat_shift'` or
+      `'max_vertical_shift'`).
+    max_shift: the displacement limit to check.
   """
-  stencil_size = nodes.shape[-1]
-  diff = x[..., jnp.newaxis] - nodes
-  denom = nodes[..., :, jnp.newaxis] - nodes[..., jnp.newaxis, :]
-  eye = np.eye(stencil_size, dtype=bool)
-  num = jnp.where(eye, 1.0, diff[..., jnp.newaxis, :])
-  den = jnp.where(eye, 1.0, denom)
-  return jnp.prod(num / den, axis=-1)
-
-
-def _contract_stencil(values: Array, *weights: Array) -> jnp.ndarray:
-  """Contracts gathered stencil values with per-dimension weights.
-
-  `values` has one trailing axis per weight vector (the tensor-product
-  stencil); each `weights[k]` has shape [..., stencil_size_k]. Production
-  SL codes evaluate this contraction as a cascade of 1-D interpolations so
-  the full stencil tensor never exists in memory; the XLA equivalent is
-  fusion. An einsum lowers to dot_general, whose operands must be
-  materialized — the gathered stencil tensor is written to memory — which
-  is the fastest form on CPU (0.55✕ the fused form) but measurably slower
-  on GPU, where a broadcast-multiply + reduce fuses with the producing
-  gather and skips the materialization (1.15–1.20✕ isolated on A100 at
-  T170/L32, and considerably more in a full model step, where the skipped
-  materializations compound: 32.0 → 26.3 ms/step with linear vertical and
-  58.4 → 33.3 ms/step with cubic on the 2-day ERA5 benchmark). The
-  backend is known at trace time, so pick per platform.
-  """
-  if jax.default_backend() == 'cpu':
-    n = len(weights)
-    letters = 'ijkl'[:n]
-    operands = ','.join(f'...{c}' for c in letters)
-    return einsum(f'{operands},...{letters}->...', *weights, values)
-  return _contract_stencil_fused(values, *weights)
-
-
-def _contract_stencil_fused(values: Array, *weights: Array) -> jnp.ndarray:
-  """The gather-fusable form of `_contract_stencil` (any backend)."""
-  n = len(weights)
-  result = values
-  for axis, w in enumerate(weights):
-    # place the weight's stencil axis at the matching values axis, with
-    # explicit size-1 axes on both sides so batch dimensions stay aligned.
-    shape = w.shape[:-1] + (1,) * axis + (w.shape[-1],) + (1,) * (n - 1 - axis)
-    result = result * w.reshape(shape)
-  return result.sum(axis=tuple(range(-n, 0)))
-
-
-_HALO_WIDTH = 2  # supports stencils up to 4 points wide in latitude.
-
-
-def _latitude_halo_axis(grid: spherical_harmonic.Grid) -> np.ndarray:
-  """Returns latitudes (radians) extended with `_HALO_WIDTH` rows per pole.
-
-  A point beyond the pole at "latitude" φ > π/2 corresponds to the physical
-  location (π - φ, λ + π), so halo rows take coordinates mirrored about the
-  pole. The extended axis is strictly increasing, which makes latitude (not
-  its sine, which folds at the poles) the coordinate used for interpolation.
-  """
-  phi = grid.latitudes
-  if not np.all(np.diff(phi) > 0):
-    raise ValueError('expected latitudes in increasing order')
-  south = -np.pi - phi[_HALO_WIDTH - 1 :: -1]
-  north = np.pi - phi[: -_HALO_WIDTH - 1 : -1]
-  extended = np.concatenate([south, phi, north])
-  if not np.all(np.diff(extended) > 0):
-    # e.g. 'equiangular_with_poles' grids, whose mirrored halo coordinates
-    # duplicate the pole nodes and would produce 0/0 Lagrange weights.
+  if max_shift is None:
+    return
+  if (
+      isinstance(max_shift, bool)
+      or not isinstance(max_shift, (int, np.integer))
+      or max_shift < 0
+  ):
     raise ValueError(
-        'halo-extended latitudes are not strictly increasing; grids with '
-        'nodes at the poles are not supported'
+        f'{name} must be None or a non-negative integer; got {max_shift!r}'
     )
-  return extended
 
 
-def _extend_with_pole_halo(field: Array, grid: spherical_harmonic.Grid) -> Array:
-  """Appends `_HALO_WIDTH` cross-pole halo rows on both latitude ends.
-
-  Halo values are taken from the antipodal longitude (a roll by half the
-  longitude nodes), which is exact for even numbers of longitude nodes. Only
-  scalar fields (including Cartesian components of tangent vectors) may be
-  extended this way; (u, v) wind components would need sign flips.
-
-  Args:
-    field: array of shape [..., longitude_nodes, latitude_nodes].
-    grid: the horizontal grid.
-
-  Returns:
-    Array of shape [..., longitude_nodes, latitude_nodes + 2 * _HALO_WIDTH].
-  """
-  num_lon = grid.longitude_nodes
-  if num_lon % 2:
+def validate_interpolation_method(method: str | None) -> None:
+  """Raises unless `method` is None, 'gather' or 'matmul'."""
+  if method is not None and method not in _INTERPOLATION_METHODS:
     raise ValueError(
-        'cross-pole halos require an even number of longitude nodes; '
-        f'got {num_lon}. Note that `Grid.with_wavenumbers` may produce odd '
-        'longitude counts; the `Grid.T*` and `Grid.TL*` constructors do not.'
+        f'unknown interpolation {method=}; valid values are None (auto) or '
+        f'one of {_INTERPOLATION_METHODS}'
     )
-  rolled = jnp.roll(field, num_lon // 2, axis=-2)
-  south = rolled[..., _HALO_WIDTH - 1 :: -1]
-  north = rolled[..., : -_HALO_WIDTH - 1 : -1]
-  return jnp.concatenate([south, field, north], axis=-1)
 
 
-def _stencil_offsets(order: str) -> np.ndarray:
-  """Returns stencil offsets relative to the lower bracketing node."""
-  if order == 'linear':
-    return np.arange(2)
-  elif order == 'cubic':
-    return np.arange(-1, 3)
-  else:
-    raise ValueError(f'unknown interpolation {order=}')
+def _resolve_interpolation_method(
+    method: str | None, grid: spherical_harmonic.Grid
+) -> str:
+  """Resolves `method=None` lazily at trace time (never at init/import time)."""
+  validate_interpolation_method(method)
+  if method is not None:
+    return method
+  if semi_lagrangian_matmul.spatial_mesh(
+      grid
+  ) is not None or lagrange_interpolation.targets_tpu(grid):
+    return 'matmul'
+  return 'gather'
 
 
-@dataclasses.dataclass
-class _HorizontalStencil:
-  """Precomputed gather indices and weights for horizontal interpolation.
-
-  Attributes:
-    lon_index: [..., stencil] longitude gather indices (wrapped).
-    lat_index: [..., stencil] latitude gather indices into the halo-extended
-      latitude axis.
-    lon_weights: [..., stencil] interpolation weights along longitude.
-    lat_weights: [..., stencil] interpolation weights along latitude.
-    extended_latitude_size: size of the halo-extended latitude axis.
-  """
-
-  lon_index: Array
-  lat_index: Array
-  lon_weights: Array
-  lat_weights: Array
-  extended_latitude_size: int
-
-
-def _horizontal_stencil(
+def _interpolate_2d_multi(
+    fields: Array,
     grid: spherical_harmonic.Grid,
     lon: Array,
     sin_lat: Array,
-    order: str,
-) -> _HorizontalStencil:
-  """Computes gather indices and weights for points (lon, sin_lat)."""
-  offsets = _stencil_offsets(order)
-  lon = jnp.asarray(lon)
-  # Latitude via arctan2 rather than arcsin: for |sin_lat| within float
-  # rounding of 1 (a trajectory point on a pole), arcsin has an infinite
-  # derivative and its reverse-mode gradient becomes NaN. The epsilon keeps
-  # the gradient finite while perturbing the pole latitude by less than
-  # 1e-6 radians.
-  sin_lat = jnp.clip(jnp.asarray(sin_lat), -1, 1)
-  cos_lat = jnp.sqrt(jnp.maximum(1 - jnp.square(sin_lat), 1e-12))
-  phi = jnp.arctan2(sin_lat, cos_lat)
-
-  # Longitude nodes are uniform, so the bracketing index is a floor divide.
-  # Weights are computed with unwrapped (real line) node coordinates; only
-  # gather indices are wrapped.
-  longitudes = grid.nodal_axes[0]
-  lon_spacing = 2 * np.pi / grid.longitude_nodes
-  lon_cell = jnp.floor((lon - longitudes[0]) / lon_spacing).astype(jnp.int32)
-  lon_stencil = lon_cell[..., jnp.newaxis] + offsets
-  lon_nodes = lon_stencil * lon_spacing + longitudes[0]
-  lon_weights = _lagrange_weights(lon, lon_nodes)
-  lon_index = lon_stencil % grid.longitude_nodes
-
-  # Latitude nodes are non-uniform; searchsorted locates the bracketing ring
-  # on the halo-extended axis and Lagrange weights use actual node latitudes.
-  phi_extended = _latitude_halo_axis(grid)
-  lat_cell = (
-      jnp.searchsorted(jnp.asarray(phi_extended), phi, side='right') - 1
-  ).astype(jnp.int32)
-  # Physical points always satisfy |φ| <= π/2, which keeps cubic stencils
-  # within the extended axis; clip for numerical safety only.
-  lat_cell = jnp.clip(
-      lat_cell, -offsets[0], phi_extended.size - 1 - offsets[-1]
-  )
-  lat_stencil = lat_cell[..., jnp.newaxis] + offsets
-  lat_nodes = jnp.asarray(phi_extended)[lat_stencil]
-  lat_weights = _lagrange_weights(phi, lat_nodes)
-
-  return _HorizontalStencil(
-      lon_index=lon_index,
-      lat_index=lat_stencil,
-      lon_weights=lon_weights,
-      lat_weights=lat_weights,
-      extended_latitude_size=phi_extended.size,
-  )
-
-
-_LIMITERS = ('quasi_monotone',)
-
-
-def _validate_limiter(limiter: str | None) -> None:
-  if limiter is not None and limiter not in _LIMITERS:
-    raise ValueError(
-        f'unknown interpolation {limiter=}; valid values are None (no '
-        f'limiting) or one of {_LIMITERS}'
-    )
-
-
-def _linear_cell_slice(order: str) -> slice:
-  """Slice selecting the 2-point bracketing cell within a stencil."""
-  start = -int(_stencil_offsets(order)[0])
-  return slice(start, start + 2)
-
-
-def _gather_2d(field_extended: Array, stencil: _HorizontalStencil) -> Array:
-  """Gathers stencil values [..., stencil, stencil] from [lon, lat_ext].
-
-  Uses a single 1-D gather with precomputed linear indices; the `ravel` of
-  the contiguous field compiles to a zero-cost bitcast (see the analogous
-  gather in `interpolate_3d`).
-  """
-  flat_index = (
-      stencil.lon_index[..., :, jnp.newaxis] * stencil.extended_latitude_size
-      + stencil.lat_index[..., jnp.newaxis, :]
-  )
-  return jnp.take(field_extended.ravel(), flat_index, mode='clip')
-
-
-def _interpolate_horizontal(
-    field: Array,
-    grid: spherical_harmonic.Grid,
-    stencil: _HorizontalStencil,
-    order: str,
-    limiter: str | None,
+    *,
+    order: str = 'cubic',
+    limiter: str | None = None,
+    method: InterpolationMethod | None = None,
+    max_lat_shift: int | None = DEFAULT_MAX_SHIFT,
 ) -> jnp.ndarray:
-  """Interpolates a single [lon, lat] field with a precomputed stencil."""
-  values = _gather_2d(_extend_with_pole_halo(field, grid), stencil)
-  result = _contract_stencil(
-      values, stencil.lon_weights, stencil.lat_weights
-  )
-  if limiter is not None:
-    if limiter != 'quasi_monotone':
-      raise ValueError(f'unimplemented interpolation {limiter=}')
-    cell = _linear_cell_slice(order)
-    corners = values[..., cell, cell]
-    result = jnp.clip(
-        result,
-        corners.min(axis=(-2, -1)),
-        corners.max(axis=(-2, -1)),
+  """Interpolates [C, nx, ny] or [C, levels, nx, ny] at shared points."""
+  lagrange_interpolation.validate_limiter(limiter)
+  validate_window_shift('max_lat_shift', max_lat_shift)
+  resolved = _resolve_interpolation_method(method, grid)
+  fields = jnp.asarray(fields)
+  lon = jnp.asarray(lon)
+  sin_lat = jnp.asarray(sin_lat)
+  if fields.shape[-2:] != grid.nodal_shape:
+    raise ValueError(
+        f'expected field with trailing shape {grid.nodal_shape}; got'
+        f' {fields.shape}'
     )
-  return result
+
+  if fields.ndim == 3:
+    # [C, nx, ny] with lon [*points]
+    if resolved == 'gather':
+      return lagrange_interpolation.interpolate_2d_gather(
+          fields,
+          grid,
+          lon,
+          sin_lat,
+          order=order,
+          limiter=limiter,
+          max_lat_shift=max_lat_shift,
+      )
+    if lon.shape == grid.nodal_shape and max_lat_shift is not None:
+      return semi_lagrangian_matmul.interpolate_2d_grid(
+          fields,
+          grid,
+          lon,
+          sin_lat,
+          order=order,
+          limiter=limiter,
+          max_lat_shift=max_lat_shift,
+      )
+    return semi_lagrangian_matmul.interpolate_2d_points(
+        fields, grid, lon, sin_lat, order=order, limiter=limiter
+    )
+
+  if fields.ndim == 4:
+    # [C, levels, nx, ny] with lon [levels, *points]
+    levels = fields.shape[1]
+    if lon.shape[0] != levels:
+      raise ValueError(
+          'batched interpolation requires points with a leading levels axis '
+          f'matching the field: {fields.shape=}, {lon.shape=}'
+      )
+    if levels == 1:
+      out = _interpolate_2d_multi(
+          fields[:, 0],
+          grid,
+          lon[0],
+          sin_lat[0],
+          order=order,
+          limiter=limiter,
+          method=resolved,
+          max_lat_shift=max_lat_shift,
+      )
+      return out[:, jnp.newaxis, ...]
+
+    if (
+        resolved == 'matmul'
+        and lon.shape == (levels, *grid.nodal_shape)
+        and max_lat_shift is not None
+    ):
+      return semi_lagrangian_matmul.interpolate_2d_grid_levels(
+          fields,
+          grid,
+          lon,
+          sin_lat,
+          order=order,
+          limiter=limiter,
+          max_lat_shift=max_lat_shift,
+      )
+
+    if resolved == 'matmul':
+      _, out_by_l = lax.scan(
+          lambda _, inp: (
+              None,
+              _interpolate_2d_multi(
+                  inp[0],
+                  grid,
+                  inp[1],
+                  inp[2],
+                  order=order,
+                  limiter=limiter,
+                  method=resolved,
+                  max_lat_shift=max_lat_shift,
+              ),
+          ),
+          None,
+          (jnp.swapaxes(fields, 0, 1), lon, sin_lat),
+      )
+      return jnp.swapaxes(out_by_l, 0, 1)
+
+    return jax.vmap(
+        lambda f_l, lon_l, sl_l: _interpolate_2d_multi(
+            f_l,
+            grid,
+            lon_l,
+            sl_l,
+            order=order,
+            limiter=limiter,
+            method=resolved,
+            max_lat_shift=max_lat_shift,
+        ),
+        in_axes=(1, 0, 0),
+        out_axes=1,
+    )(fields, lon, sin_lat)
+
+  raise ValueError(f'expected 3-D or 4-D fields; got {fields.shape=}')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -462,14 +387,38 @@ class GridInterpolator:
       interpolated values are clipped to the range of the 2✕2 bracketing
       cell corners, which prevents new extrema (and preserves positivity)
       at the cost of formal accuracy at extrema.
+    method: 'gather' (1-D gather + fused contraction, fastest on single GPU),
+      'matmul' (MXU matrix multiplication without unstructured
+      gather/scatter, designed for TPU and SPMD sharding; windowed, see
+      `max_lat_shift`), or None (auto-selects 'matmul' on TPU or when
+      `grid.spmd_mesh` shards a spatial axis, and 'gather' otherwise). Both
+      give the same result to rounding.
+    max_lat_shift: limit, in latitude cells, on the displacement of
+      grid-aligned queries (`lon.shape == grid.nodal_shape`, or with a
+      leading levels axis), whose point `[..., i, j]` is taken to be the
+      departure point of a trajectory arriving at latitude row `j`: its
+      latitude is clamped to the window of `max(1, max_lat_shift)` cells
+      around the arrival row, by both methods (see `interpolate_3d` for the
+      exact bounds). For 'matmul' this is also the half-width of the window
+      in which each stencil is built. None disables the clamp and the
+      window, as does any other query layout; pass None to interpolate at
+      arbitrary points that happen to be laid out like the grid.
   """
 
   grid: spherical_harmonic.Grid
   order: str = 'cubic'
   limiter: str | None = None
+  method: InterpolationMethod | None = dataclasses.field(
+      default=None, kw_only=True
+  )
+  max_lat_shift: int | None = dataclasses.field(
+      default=DEFAULT_MAX_SHIFT, kw_only=True
+  )
 
   def __post_init__(self):
-    _validate_limiter(self.limiter)
+    lagrange_interpolation.validate_limiter(self.limiter)
+    validate_interpolation_method(self.method)
+    validate_window_shift('max_lat_shift', self.max_lat_shift)
 
   def __call__(self, field: Array, lon: Array, sin_lat: Array) -> jnp.ndarray:
     """Interpolates `field` at the points (lon, sin_lat).
@@ -478,7 +427,7 @@ class GridInterpolator:
       field: nodal values of shape [longitude_nodes, latitude_nodes] (points
         may then have any shape), or [levels, longitude_nodes,
         latitude_nodes], in which case each level is interpolated at its own
-        set of points via `jax.vmap` over the leading axis.
+        set of points.
       lon: longitudes in radians, of shape [*points] or [levels, *points].
       sin_lat: sine of latitudes, same shape as `lon`.
 
@@ -486,28 +435,32 @@ class GridInterpolator:
       Interpolated values of shape `lon.shape`.
     """
     field = jnp.asarray(field)
-    interpolate = functools.partial(
-        _interpolate_horizontal_single,
-        grid=self.grid,
-        order=self.order,
-        limiter=self.limiter,
-    )
-    if field.ndim == 2:
-      return interpolate(field, lon, sin_lat)
-    if field.ndim != 3:
+    if field.ndim not in (2, 3):
       raise ValueError(
           f'expected a field with 2 or 3 dimensions; got {field.shape=}'
       )
-    if lon.shape[0] != field.shape[0]:
+    if field.ndim == 3 and lon.shape[0] != field.shape[0]:
       raise ValueError(
           'batched interpolation requires points with a leading levels axis '
           f'matching the field: {field.shape=}, {lon.shape=}'
       )
-    return jax.vmap(interpolate)(field, lon, sin_lat)
+    return _interpolate_horizontal_dispatched(
+        field,
+        lon,
+        sin_lat,
+        grid=self.grid,
+        order=self.order,
+        limiter=self.limiter,
+        method=self.method,
+        max_lat_shift=self.max_lat_shift,
+    )
 
 
-@functools.partial(jax.jit, static_argnames=('grid', 'order', 'limiter'))
-def _interpolate_horizontal_single(
+@functools.partial(
+    jax.jit,
+    static_argnames=('grid', 'order', 'limiter', 'method', 'max_lat_shift'),
+)
+def _interpolate_horizontal_dispatched(
     field: Array,
     lon: Array,
     sin_lat: Array,
@@ -515,79 +468,32 @@ def _interpolate_horizontal_single(
     grid: spherical_harmonic.Grid,
     order: str,
     limiter: str | None,
+    method: InterpolationMethod | None = None,
+    max_lat_shift: int | None = DEFAULT_MAX_SHIFT,
 ) -> jnp.ndarray:
-  stencil = _horizontal_stencil(grid, lon, sin_lat, order)
-  return _interpolate_horizontal(field, grid, stencil, order, limiter)
-
-
-def _vertical_stencil(
-    sigma: Array,
-    sigma_nodes: Array,
-    vertical_order: Literal['linear', 'cubic'],
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-  """Returns (level_index, level_weights, bracket_offset) for the vertical.
-
-  σ is clipped to the node range first, so boundary weights saturate and
-  interpolation never extrapolates (constant extrapolation beyond the first
-  and last nodes). 'linear' uses the two bracketing nodes. 'cubic' uses a
-  4-point Lagrange stencil on the (possibly non-uniform) nodes, degraded to
-  linear within the first and last cells — the standard operational rule
-  (e.g. IFS), which also keeps the no-extrapolation property exact.
-  `bracket_offset` is the position of the lower bracketing node within the
-  stencil (needed by the quasi-monotone limiter, which clips against the
-  bracketing cell only).
-  """
-  num_levels = sigma_nodes.shape[0]
-  sigma = jnp.clip(jnp.asarray(sigma), sigma_nodes[0], sigma_nodes[-1])
-  level_cell = (
-      jnp.searchsorted(sigma_nodes, sigma, side='right') - 1
-  ).astype(jnp.int32)
-  level_cell = jnp.clip(level_cell, 0, num_levels - 2)
-  below = sigma_nodes[level_cell]
-  above = sigma_nodes[level_cell + 1]
-  fraction = (sigma - below) / (above - below)
-  if vertical_order == 'linear':
-    level_weights = jnp.stack([1 - fraction, fraction], axis=-1)
-    level_index = level_cell[..., jnp.newaxis] + np.arange(2)
-    bracket_offset = jnp.zeros_like(level_cell)
-    return level_index, level_weights, bracket_offset
-  if vertical_order != 'cubic':
-    raise ValueError(f'unknown {vertical_order=}')
-  start = jnp.clip(level_cell - 1, 0, num_levels - 4)
-  level_index = start[..., jnp.newaxis] + np.arange(4)
-  cubic_weights = _lagrange_weights(sigma, sigma_nodes[level_index])
-  bracket_offset = level_cell - start
-  linear_weights = (1 - fraction)[..., jnp.newaxis] * jax.nn.one_hot(
-      bracket_offset, 4, dtype=cubic_weights.dtype
-  ) + fraction[..., jnp.newaxis] * jax.nn.one_hot(
-      bracket_offset + 1, 4, dtype=cubic_weights.dtype
-  )
-  boundary_cell = (level_cell == 0) | (level_cell == num_levels - 2)
-  level_weights = jnp.where(
-      boundary_cell[..., jnp.newaxis], linear_weights, cubic_weights
-  )
-  return level_index, level_weights, bracket_offset
-
-
-def _bracketing_level_corners(
-    corners: Array, bracket_offset: Array
-) -> jnp.ndarray:
-  """Restricts corner values to the two levels bracketing the departure σ.
-
-  The quasi-monotone limiter must clip against the bracketing cell only:
-  including outer stencil levels would admit values the departure point
-  does not lie between. For the linear vertical stencil the offset is zero
-  and this selection is the identity.
-  """
-  index = (
-      bracket_offset[..., jnp.newaxis, jnp.newaxis, jnp.newaxis]
-      + np.arange(2)[:, np.newaxis, np.newaxis]
-  )
-  return jnp.take_along_axis(corners, index, axis=-3)
+  return _interpolate_2d_multi(
+      field[jnp.newaxis, ...],
+      grid,
+      lon,
+      sin_lat,
+      order=order,
+      limiter=limiter,
+      method=method,
+      max_lat_shift=max_lat_shift,
+  )[0]
 
 
 @functools.partial(
-    jax.jit, static_argnames=('grid', 'order', 'limiter', 'vertical_order')
+    jax.jit,
+    static_argnames=(
+        'grid',
+        'order',
+        'limiter',
+        'vertical_order',
+        'method',
+        'max_lat_shift',
+        'max_vertical_shift',
+    ),
 )
 def interpolate_3d(
     field: Array,
@@ -601,8 +507,11 @@ def interpolate_3d(
     limiter: str | None = None,
     vertical_order: Literal['linear', 'cubic'] = 'linear',
     limiter_bound_reference: Array | None = None,
+    method: InterpolationMethod | None = None,
+    max_lat_shift: int | None = DEFAULT_MAX_SHIFT,
+    max_vertical_shift: int | None = DEFAULT_MAX_SHIFT,
 ) -> jnp.ndarray:
-  """Interpolates a 3-D field at points (lon, sin_lat, sigma).
+  """Interpolates a 3-D (or multi-channel 3-D) field at (lon, sin_lat, sigma).
 
   Horizontal interpolation follows `GridInterpolator` (tensor-product
   Lagrange of the given order); vertical interpolation is Lagrange in σ
@@ -614,11 +523,12 @@ def interpolate_3d(
   conditions of `sigma_coordinates.centered_vertical_advection`).
 
   Args:
-    field: nodal values of shape [len(sigma_nodes), longitude_nodes,
-      latitude_nodes].
+    field: nodal values of shape [len(sigma_nodes), *grid.nodal_shape], or
+      [*channels, len(sigma_nodes), *grid.nodal_shape] to interpolate multiple
+      fields at the same departure points in a single batched pass.
     grid: the horizontal grid holding the source data.
-    lon: longitudes in radians, of any shape (typically [layers, longitude
-      nodes, latitude_nodes] for departure points of full-level arrivals).
+    lon: longitudes in radians, of any shape (typically [layers, *nodal_shape]
+      for departure points of full-level arrivals).
     sin_lat: sine of latitudes, same shape as `lon`.
     sigma: σ coordinates of the interpolation points, same shape as `lon`.
     sigma_nodes: increasing σ values at which `field` levels live (layer
@@ -639,67 +549,319 @@ def interpolate_3d(
       used to bound `T′ = T − T_ref(σ)` transport in full temperature,
       where a bound on T′ across levels with different `T_ref` would be
       gauge-dependent. Ignored without a limiter.
+    method: 'gather', 'matmul', or None (auto-selected: 'matmul' on TPU or
+      when `grid.spmd_mesh` shards a spatial axis, 'gather' otherwise).
+      'gather' reads the stencil points directly. 'matmul' selects them with
+      one-hot matrix products built inside a fixed window around each
+      query's arrival point (see `max_lat_shift` and `max_vertical_shift`).
+      Both methods evaluate the same (clamped) queries and agree to rounding.
+    max_lat_shift: limit, in latitude cells, on the meridional displacement
+      of grid-aligned queries: those laid out as
+      `lon.shape == (layers, *grid.nodal_shape)`, where query `[k, i, j]` is
+      the departure point of a trajectory arriving at latitude row `j` (the
+      last physical row for nodal padding) and level
+      `min(k, len(sigma_nodes) - 1)`. With `S = max(1, max_lat_shift)`, its
+      latitude is clamped to `[φ[j - S], φ[j + S + 1])`, φ being the node
+      latitudes by Gaussian row, continued across the poles by mirror
+      images (`φ[-1] = -π - φ[0]`, ...): the bracketing cell is at most S
+      cells from the cell starting at the arrival row. A departure point
+      further away is interpolated on the window edge (the upper edge one
+      ulp below its node, which keeps the bracketing cell). The value is
+      then a bounded interpolation near the edge, not an extrapolation, and
+      the gradient with respect to a clamped coordinate is zero. Bounds that
+      would lie beyond a pole are never reached, so near the poles only the
+      equatorward limit acts. The clamp is applied by both methods whenever
+      the shift is given, so results do not depend on the backend and the
+      shift must exceed the largest displacement a time step should
+      represent faithfully. 'matmul' builds each stencil in a window of
+      `2 * S + stencil` latitude rows (stencil is 2 for 'linear' and 4 for
+      'cubic'), clipped to the ends of the halo-extended latitude axis;
+      clamping keeps every stencil point inside it. None disables both the
+      clamp and the window, as does any other query layout (such queries
+      are interpolated where they are). Clamping needs both shifts; None for
+      either disables it in both directions.
+    max_vertical_shift: the same limit in the vertical, in cells of
+      `sigma_nodes` (z): the departure σ of a grid-aligned query arriving at
+      level k is clamped to `[z[k - S], z[k + S + 1])` with
+      `S = max(1, max_vertical_shift)` (intersected with `[z[0], z[-1]]`).
+      For 'matmul' it is the
+      half-width of a window of `2 * max(1, max_vertical_shift) + stencil`
+      levels (stencil 2 for `vertical_order='linear'`, 4 for 'cubic'). The
+      limiter's bracketing cell, the `limiter_bound_reference` shift, and
+      any trilinear companion output are those of the clamped query.
 
   Returns:
-    Interpolated values of shape `lon.shape`.
+    Interpolated values of shape `(*channels, *lon.shape)`.
   """
-  _validate_limiter(limiter)
+  lagrange_interpolation.validate_limiter(limiter)
+  validate_window_shift('max_lat_shift', max_lat_shift)
+  validate_window_shift('max_vertical_shift', max_vertical_shift)
+  resolved = _resolve_interpolation_method(method, grid)
   if vertical_order not in ('linear', 'cubic'):
     raise ValueError(f'unsupported {vertical_order=}')
   field = jnp.asarray(field)
+  lon = jnp.asarray(lon)
+  sin_lat = jnp.asarray(sin_lat)
+  sigma = jnp.asarray(sigma)
   min_levels = 2 if vertical_order == 'linear' else 4
   if len(sigma_nodes) < min_levels:
     raise ValueError(
         f'{vertical_order} vertical interpolation requires at least'
         f' {min_levels} levels'
     )
-  if field.ndim != 3 or field.shape[0] != len(sigma_nodes):
+  if (
+      field.ndim < 3
+      or field.shape[-3] != len(sigma_nodes)
+      or field.shape[-2:] != grid.nodal_shape
+  ):
     raise ValueError(
-        f'expected field of shape [{len(sigma_nodes)}, lon, lat]; '
-        f'got {field.shape}'
+        f'expected field of shape [..., {len(sigma_nodes)}, '
+        f'{grid.nodal_shape[0]}, {grid.nodal_shape[1]}]; got {field.shape}'
     )
-  stencil = _horizontal_stencil(grid, lon, sin_lat, order)
-  level_index, level_weights, bracket_offset = _vertical_stencil(
-      sigma, jnp.asarray(sigma_nodes), vertical_order
-  )
 
-  extended = _extend_with_pole_halo(field, grid)
-  extended_latitude_size = extended.shape[-1]
-  # One 1-D gather on the flattened field with precomputed linear indices:
-  # `ravel` of the contiguous field compiles to a zero-cost bitcast, and the
-  # single gather lowers more efficiently than the equivalent multi-array
-  # advanced indexing, with defined out-of-bounds semantics via mode='clip'.
-  # int32 indices limit the flattened size to 2**31 elements: ample for any
-  # realistic grid (the limit is roughly T1700 at 137 levels).
-  flat_index = (
-      level_index[..., :, jnp.newaxis, jnp.newaxis] * grid.longitude_nodes
-      + stencil.lon_index[..., jnp.newaxis, :, jnp.newaxis]
-  ) * extended_latitude_size + stencil.lat_index[
-      ..., jnp.newaxis, jnp.newaxis, :
-  ]
-  values = jnp.take(extended.ravel(), flat_index, mode='clip')
-  result = _contract_stencil(
-      values, level_weights, stencil.lon_weights, stencil.lat_weights
-  )
-  if limiter is not None:
-    if limiter != 'quasi_monotone':
-      raise ValueError(f'unimplemented interpolation {limiter=}')
-    cell = _linear_cell_slice(order)
-    corners = values[..., :, cell, cell]
-    reference_at_departure = 0.0
-    if limiter_bound_reference is not None:
-      reference = jnp.asarray(limiter_bound_reference)[level_index]
-      reference_at_departure = (level_weights * reference).sum(-1)
-      corners = corners + reference[..., :, jnp.newaxis, jnp.newaxis]
-      result = result + reference_at_departure
-    corners = _bracketing_level_corners(corners, bracket_offset)
-    result = jnp.clip(
-        result,
-        corners.min(axis=(-3, -2, -1)),
-        corners.max(axis=(-3, -2, -1)),
+  channel_shape = field.shape[:-3]
+  c_total = math.prod(channel_shape)
+  if c_total == 0 or lon.size == 0:
+    return jnp.zeros((*channel_shape, *lon.shape), dtype=field.dtype)
+
+  fields_4d = field.reshape((c_total,) + field.shape[-3:])
+  if resolved == 'gather':
+    # Windowed queries are clamped exactly as the 'matmul' method clamps them.
+    lat_bounds, sigma_bounds = lagrange_interpolation.window_clamp_bounds_3d(
+        grid,
+        lon,
+        sin_lat,
+        sigma,
+        sigma_nodes,
+        order,
+        max_lat_shift,
+        max_vertical_shift,
     )
-    result = result - reference_at_departure
-  return result
+    out_4d, _ = lagrange_interpolation.interpolate_3d_gather(
+        fields_4d,
+        grid,
+        lon,
+        sin_lat,
+        sigma,
+        sigma_nodes,
+        order=order,
+        limiter=limiter,
+        vertical_order=vertical_order,
+        limiter_bound_reference=limiter_bound_reference,
+        lat_bounds=lat_bounds,
+        sigma_bounds=sigma_bounds,
+    )
+  elif lagrange_interpolation.is_windowed_3d(
+      lon, grid, max_lat_shift, max_vertical_shift
+  ):
+    out_4d, _ = semi_lagrangian_matmul.interpolate_3d_grid(
+        fields_4d,
+        grid,
+        lon,
+        sin_lat,
+        sigma,
+        jnp.asarray(sigma_nodes),
+        order=order,
+        limiter=limiter,
+        vertical_order=vertical_order,
+        limiter_bound_reference=limiter_bound_reference,
+        max_lat_shift=max_lat_shift,
+        max_vertical_shift=max_vertical_shift,
+    )
+  else:
+    out_4d = semi_lagrangian_matmul.interpolate_3d_points(
+        fields_4d,
+        grid,
+        lon,
+        sin_lat,
+        sigma,
+        jnp.asarray(sigma_nodes),
+        order=order,
+        limiter=limiter,
+        vertical_order=vertical_order,
+        limiter_bound_reference=limiter_bound_reference,
+    )
+  return out_4d.reshape((*channel_shape, *lon.shape))
+
+
+def _interpolate_3d_mixed(
+    fields_4d: Array,
+    grid: spherical_harmonic.Grid,
+    lon: Array,
+    sin_lat: Array,
+    sigma: Array,
+    sigma_nodes: np.ndarray,
+    *,
+    order: str = 'cubic',
+    limiter: str | None = None,
+    limited_channel_start: int = 0,
+    trilinear_channel_start: int | None = None,
+    vertical_order: Literal['linear', 'cubic'] = 'linear',
+    limiter_bound_reference: Array | None = None,
+    method: InterpolationMethod | None = None,
+    max_lat_shift: int | None = DEFAULT_MAX_SHIFT,
+    max_vertical_shift: int | None = DEFAULT_MAX_SHIFT,
+) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+  """Interpolates a stack of fields of which only some channels are limited.
+
+  As `interpolate_3d` for `fields_4d` of shape [C, levels, *nodal_shape], with
+  the limiter applied to the channels from `limited_channel_start` on only,
+  and optionally a second, trilinear (low-order, unlimited) interpolation of
+  the channels from `trilinear_channel_start` on at the same queries, which
+  shares the stencil search and the gathered values of the first.
+
+  Returns:
+    `(values, trilinear)`: `values` of shape [C, *lon.shape], and `trilinear`
+    of shape [C - trilinear_channel_start, *lon.shape], or None if
+    `trilinear_channel_start` is None.
+  """
+  lagrange_interpolation.validate_limiter(limiter)
+  validate_window_shift('max_lat_shift', max_lat_shift)
+  validate_window_shift('max_vertical_shift', max_vertical_shift)
+  resolved = _resolve_interpolation_method(method, grid)
+  fields_4d = jnp.asarray(fields_4d)
+  lon = jnp.asarray(lon)
+  sin_lat = jnp.asarray(sin_lat)
+  sigma = jnp.asarray(sigma)
+  c_total = fields_4d.shape[0]
+  eff_lim_start = min(c_total, max(0, limited_channel_start))
+
+  if resolved == 'gather':
+    min_levels = 2 if vertical_order == 'linear' else 4
+    if len(sigma_nodes) < min_levels:
+      raise ValueError(
+          f'{vertical_order} vertical interpolation requires at least'
+          f' {min_levels} levels'
+      )
+    if (
+        fields_4d.ndim != 4
+        or fields_4d.shape[1] != len(sigma_nodes)
+        or fields_4d.shape[2:] != grid.nodal_shape
+    ):
+      raise ValueError(
+          f'expected fields_4d of shape [C, {len(sigma_nodes)}, '
+          f'{grid.nodal_shape[0]}, {grid.nodal_shape[1]}]; got'
+          f' {fields_4d.shape}'
+      )
+    if c_total == 0 or lon.size == 0:
+      out_zero = jnp.zeros((c_total, *lon.shape), dtype=fields_4d.dtype)
+      if trilinear_channel_start is not None:
+        eff_tri = min(c_total, max(0, trilinear_channel_start))
+        return out_zero, jnp.zeros(
+            (c_total - eff_tri, *lon.shape), dtype=fields_4d.dtype
+        )
+      return out_zero, None
+    lat_bounds, sigma_bounds = lagrange_interpolation.window_clamp_bounds_3d(
+        grid,
+        lon,
+        sin_lat,
+        sigma,
+        sigma_nodes,
+        order,
+        max_lat_shift,
+        max_vertical_shift,
+    )
+    return lagrange_interpolation.interpolate_3d_gather(
+        fields_4d,
+        grid,
+        lon,
+        sin_lat,
+        sigma,
+        sigma_nodes,
+        lat_bounds=lat_bounds,
+        sigma_bounds=sigma_bounds,
+        order=order,
+        limiter=limiter if eff_lim_start < c_total else None,
+        vertical_order=vertical_order,
+        limiter_bound_reference=(
+            limiter_bound_reference
+            if limiter is not None and eff_lim_start < c_total
+            else None
+        ),
+        limited_channel_start=eff_lim_start,
+        trilinear_channel_start=trilinear_channel_start,
+    )
+
+  if (
+      c_total > 0
+      and lon.size > 0
+      and lagrange_interpolation.is_windowed_3d(
+          lon, grid, max_lat_shift, max_vertical_shift
+      )
+  ):
+    return semi_lagrangian_matmul.interpolate_3d_grid(
+        fields_4d,
+        grid,
+        lon,
+        sin_lat,
+        sigma,
+        jnp.asarray(sigma_nodes),
+        order=order,
+        limiter=limiter if eff_lim_start < c_total else None,
+        vertical_order=vertical_order,
+        limiter_bound_reference=limiter_bound_reference,
+        max_lat_shift=max_lat_shift,
+        max_vertical_shift=max_vertical_shift,
+        limited_channel_start=eff_lim_start,
+        trilinear_channel_start=trilinear_channel_start,
+    )
+
+  common_kw = dict(
+      grid=grid,
+      lon=lon,
+      sin_lat=sin_lat,
+      sigma=sigma,
+      sigma_nodes=sigma_nodes,
+      order=order,
+      vertical_order=vertical_order,
+      method=method,
+      max_lat_shift=max_lat_shift,
+      max_vertical_shift=max_vertical_shift,
+  )
+  if limiter is None or eff_lim_start == 0 or eff_lim_start == c_total:
+    eff_lim = limiter if eff_lim_start < c_total else None
+    out = interpolate_3d(
+        fields_4d,
+        limiter=eff_lim,
+        limiter_bound_reference=limiter_bound_reference if eff_lim else None,
+        **common_kw,
+    )
+  else:
+    out_unlim = interpolate_3d(
+        fields_4d[:eff_lim_start], limiter=None, **common_kw
+    )
+    out_lim = interpolate_3d(
+        fields_4d[eff_lim_start:],
+        limiter=limiter,
+        limiter_bound_reference=limiter_bound_reference,
+        **common_kw,
+    )
+    out = jnp.concatenate([out_unlim, out_lim], axis=0)
+
+  out_lin = None
+  if trilinear_channel_start is not None:
+    if (
+        order == 'linear'
+        and vertical_order == 'linear'
+        and (limiter is None or trilinear_channel_start < eff_lim_start)
+    ):
+      out_lin = out[trilinear_channel_start:]
+    else:
+      out_lin = interpolate_3d(
+          fields_4d[trilinear_channel_start:],
+          grid=grid,
+          lon=lon,
+          sin_lat=sin_lat,
+          sigma=sigma,
+          sigma_nodes=sigma_nodes,
+          order='linear',
+          limiter=None,
+          vertical_order='linear',
+          method=method,
+          max_lat_shift=max_lat_shift,
+          max_vertical_shift=max_vertical_shift,
+      )
+  return out, out_lin
 
 
 #  =============================================================================
@@ -760,6 +922,8 @@ def horizontal_departure_points(
     *,
     iterations: int = 2,
     initial_guess: DeparturePoints | None = None,
+    method: InterpolationMethod | None = None,
+    max_lat_shift: int | None = DEFAULT_MAX_SHIFT,
 ) -> DeparturePoints:
   """Solves for departure points of horizontal-only trajectories.
 
@@ -797,11 +961,23 @@ def horizontal_departure_points(
     initial_guess: optional departure points to warm-start the iteration
       (e.g. a predictor stage's or the previous step's solution, following
       the IFS practice noted above); defaults to the arrival points.
+    method: 'gather', 'matmul', or None (auto-selected per backend/mesh); see
+      `interpolate_3d`.
+    max_lat_shift: latitude displacement limit, in cells, of the transport
+      this solve serves (see `interpolate_3d`). The trajectory midpoint lies
+      about half as far from the arrival point as the departure point, so
+      the wind is interpolated there with the limit
+      `max(1, (max_lat_shift + 1) // 2)`: a midpoint beyond it is clamped to
+      that window (on both methods), which also bounds the departure
+      displacement. The returned departure points themselves are not
+      clamped. None disables the clamp and the 'matmul' window.
 
   Returns:
     DeparturePoints with fields of shape [*batch, longitude_nodes,
     latitude_nodes] and `sigma=None`.
   """
+  validate_interpolation_method(method)
+  validate_window_shift('max_lat_shift', max_lat_shift)
   u = jnp.asarray(u)
   lon_mesh, sin_lat_mesh = grid.nodal_mesh
   arrival = lon_lat_to_cartesian(
@@ -809,18 +985,36 @@ def horizontal_departure_points(
       jnp.broadcast_to(sin_lat_mesh, u.shape),
   )
   wind = cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
-  interpolator = GridInterpolator(grid, order='linear')
   angular_dt = dt / grid.radius
 
+  can_eval_at_arrival = (
+      initial_guess is None
+      and grid.nodal_padding == (0, 0)
+      and u.shape[-2:] == grid.nodal_shape
+  )
+  mid_lat_shift = (
+      None if max_lat_shift is None else max(1, (max_lat_shift + 1) // 2)
+  )
   departure = arrival if initial_guess is None else initial_guess.cartesian
-  for _ in range(iterations):
-    midpoint = _normalize((arrival + departure) / 2)
-    lon_mid, sin_lat_mid = cartesian_to_lon_sin_lat(midpoint)
-    # vmap over the three Cartesian components: the stencil indices and
-    # weights are computed once and the gathers batch into one.
-    wind_mid = jax.vmap(
-        lambda component: interpolator(component, lon_mid, sin_lat_mid)
-    )(wind)
+  for iter_idx in range(iterations):
+    if iter_idx == 0 and can_eval_at_arrival:
+      # On a cold first iteration, `midpoint == arrival` sits directly on the
+      # horizontal grid nodes, where bilinear Lagrange interpolation is the
+      # identity.
+      wind_mid = wind
+    else:
+      midpoint = _normalize((arrival + departure) / 2)
+      lon_mid, sin_lat_mid = cartesian_to_lon_sin_lat(midpoint)
+      wind_mid = _interpolate_2d_multi(
+          wind,
+          grid,
+          lon_mid,
+          sin_lat_mid,
+          order='linear',
+          limiter=None,
+          method=method,
+          max_lat_shift=mid_lat_shift,
+      )
     departure = _normalize(arrival - angular_dt * wind_mid)
 
   return DeparturePoints(cartesian=departure, sigma=None)
@@ -836,6 +1030,9 @@ def departure_points_3d(
     iterations: int = 2,
     vertical_nodes: VerticalNodes | None = None,
     initial_guess: DeparturePoints | None = None,
+    method: InterpolationMethod | None = None,
+    max_lat_shift: int | None = DEFAULT_MAX_SHIFT,
+    max_vertical_shift: int | None = DEFAULT_MAX_SHIFT,
 ) -> DeparturePoints:
   """Solves for 3-D departure points of trajectories arriving at layer centers.
 
@@ -860,11 +1057,27 @@ def departure_points_3d(
       `sigma_dot` the rate of change of that node coordinate).
     initial_guess: optional departure points to warm-start the iteration;
       defaults to the arrival points. See `horizontal_departure_points`.
+    method: 'gather', 'matmul', or None (auto-selected per backend/mesh); see
+      `interpolate_3d`.
+    max_lat_shift: latitude displacement limit, in cells, of the transport
+      this solve serves (see `interpolate_3d`).
+    max_vertical_shift: vertical displacement limit, in cells, of the same.
+      The trajectory midpoint lies about half as far from the arrival point
+      as the departure point, so the winds (on layer centers) and σ̇ (on
+      layer boundaries) are interpolated there with the limits
+      `max(1, (shift + 1) // 2)`, in cells of each one's own nodes: a
+      midpoint beyond them is clamped to those windows (on both methods),
+      which also bounds the departure displacement. The returned departure
+      points themselves are not clamped. None for either shift disables the
+      clamp and the 'matmul' window.
 
   Returns:
     DeparturePoints with fields of shape [layers, longitude_nodes,
     latitude_nodes], including departure σ coordinates.
   """
+  validate_interpolation_method(method)
+  validate_window_shift('max_lat_shift', max_lat_shift)
+  validate_window_shift('max_vertical_shift', max_vertical_shift)
   grid = coords.horizontal
   if vertical_nodes is None:
     vertical_nodes = VerticalNodes(
@@ -872,6 +1085,8 @@ def departure_points_3d(
     )
   centers = vertical_nodes.centers
   boundaries = vertical_nodes.boundaries
+  centers_np = np.asarray(centers)
+  boundaries_np = np.asarray(boundaries)
   u = jnp.asarray(u)
 
   lon_mesh, sin_lat_mesh = grid.nodal_mesh
@@ -880,12 +1095,58 @@ def departure_points_3d(
       jnp.broadcast_to(sin_lat_mesh, u.shape),
   )
   sigma_arrival = jnp.broadcast_to(
-      jnp.asarray(centers, dtype=u.dtype)[:, jnp.newaxis, jnp.newaxis], u.shape
+      jnp.asarray(centers_np, dtype=u.dtype)[:, jnp.newaxis, jnp.newaxis],
+      u.shape,
   )
   wind = cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
   angular_dt = dt / grid.radius
+  sigma_dot_arr = jnp.asarray(sigma_dot)
+  mid_lat_shift = (
+      None if max_lat_shift is None else max(1, (max_lat_shift + 1) // 2)
+  )
+  mid_vertical_shift = (
+      None
+      if max_vertical_shift is None
+      else max(1, (max_vertical_shift + 1) // 2)
+  )
+  can_eval_at_arrival = (
+      initial_guess is None
+      and grid.nodal_padding == (0, 0)
+      and u.ndim == 3
+      and u.shape == (len(centers_np),) + grid.nodal_shape
+      and sigma_dot_arr.shape == (len(boundaries_np),) + grid.nodal_shape
+      and len(boundaries_np) == len(centers_np) + 1
+      and bool(np.all(np.diff(boundaries_np) > 0))
+      and bool(
+          np.all(
+              (centers_np >= boundaries_np[:-1])
+              & (centers_np <= boundaries_np[1:])
+          )
+      )
+  )
+  resolved_mid_method = _resolve_interpolation_method(method, grid)
+  can_fuse_midpoint = (
+      u.ndim == 3
+      and u.shape == (len(centers_np),) + grid.nodal_shape
+      and sigma_dot_arr.shape == (len(boundaries_np),) + grid.nodal_shape
+      and len(centers_np) >= 2
+      and len(boundaries_np) >= 2
+  )
+  use_fused_matmul = (
+      resolved_mid_method == 'matmul'
+      and can_fuse_midpoint
+      and mid_lat_shift is not None
+      and mid_vertical_shift is not None
+      and semi_lagrangian_matmul.mesh_z_shards(grid.spmd_mesh) == 1
+  )
+  use_fused_gather = resolved_mid_method == 'gather' and can_fuse_midpoint
   interpolate = functools.partial(
-      interpolate_3d, grid=grid, order='linear'
+      interpolate_3d,
+      grid=grid,
+      order='linear',
+      method=method,
+      max_lat_shift=mid_lat_shift,
+      max_vertical_shift=mid_vertical_shift,
   )
 
   if initial_guess is None:
@@ -894,20 +1155,66 @@ def departure_points_3d(
   else:
     departure = initial_guess.cartesian
     sigma_departure = initial_guess.sigma
-  for _ in range(iterations):
-    midpoint = _normalize((arrival + departure) / 2)
-    sigma_mid = (sigma_arrival + sigma_departure) / 2
-    lon_mid, sin_lat_mid = cartesian_to_lon_sin_lat(midpoint)
-    point = dict(lon=lon_mid, sin_lat=sin_lat_mid, sigma=sigma_mid)
-    # vmap over the three Cartesian components: the stencil indices and
-    # weights are computed once and the gathers batch into one.
-    wind_mid = jax.vmap(
-        functools.partial(interpolate, sigma_nodes=centers, **point)
-    )(wind)
-    sigma_dot_mid = interpolate(sigma_dot, sigma_nodes=boundaries, **point)
+  for iter_idx in range(iterations):
+    if iter_idx == 0 and can_eval_at_arrival:
+      # On a cold first iteration, `midpoint == arrival` and
+      # `sigma_mid == centers`, so 3-D trilinear interpolation reduces
+      # identically to `wind` at layer centers and 1-D vertical linear
+      # interpolation of `sigma_dot` from layer boundaries to centers.
+      wind_mid = wind
+      w_hi = jnp.asarray(
+          (centers_np - boundaries_np[:-1])
+          / (boundaries_np[1:] - boundaries_np[:-1]),
+          dtype=sigma_dot_arr.dtype,
+      )[:, jnp.newaxis, jnp.newaxis]
+      sigma_dot_mid = (1.0 - w_hi) * sigma_dot_arr[:-1] + w_hi * sigma_dot_arr[
+          1:
+      ]
+    else:
+      midpoint = _normalize((arrival + departure) / 2)
+      sigma_mid = (sigma_arrival + sigma_departure) / 2
+      lon_mid, sin_lat_mid = cartesian_to_lon_sin_lat(midpoint)
+      if use_fused_matmul:
+        wind_mid, sigma_dot_mid = (
+            semi_lagrangian_matmul.interpolate_3d_wind_and_sigma_dot(
+                wind,
+                sigma_dot_arr,
+                grid,
+                lon_mid,
+                sin_lat_mid,
+                sigma_mid,
+                centers_np,
+                boundaries_np,
+                max_lat_shift=mid_lat_shift,
+                max_vertical_shift=mid_vertical_shift,
+            )
+        )
+      elif use_fused_gather:
+        wind_mid, sigma_dot_mid = (
+            lagrange_interpolation.interpolate_3d_wind_and_sigma_dot_gather(
+                wind,
+                sigma_dot_arr,
+                grid,
+                lon_mid,
+                sin_lat_mid,
+                sigma_mid,
+                centers_np,
+                boundaries_np,
+                max_lat_shift=mid_lat_shift,
+                max_vertical_shift=mid_vertical_shift,
+            )
+        )
+      else:
+        point = dict(lon=lon_mid, sin_lat=sin_lat_mid, sigma=sigma_mid)
+        wind_mid = interpolate(wind, sigma_nodes=centers_np, **point)
+        sigma_dot_mid = interpolate(
+            sigma_dot_arr, sigma_nodes=boundaries_np, **point
+        )
     departure = _normalize(arrival - angular_dt * wind_mid)
     sigma_departure = jnp.clip(
-        sigma_arrival - dt * sigma_dot_mid, float(centers[0]), float(centers[-1])
+        sigma_arrival - dt * sigma_dot_mid,
+        float(centers_np[0]),
+        float(centers_np[-1]),
     )
 
   return DeparturePoints(cartesian=departure, sigma=sigma_departure)
@@ -927,14 +1234,34 @@ def transport_scalar_2d(
 
   Args:
     field: nodal values of shape [longitude_nodes, latitude_nodes] or
-      [levels, longitude_nodes, latitude_nodes].
-    departure: horizontal departure points with fields shaped like `field`.
+      [levels, longitude_nodes, latitude_nodes], or batched as
+      [channels, longitude_nodes, latitude_nodes] /
+      [channels, levels, longitude_nodes, latitude_nodes].
+    departure: horizontal departure points with fields shaped like the spatial
+      dimensions of `field`.
     interpolator: horizontal interpolation rule.
 
   Returns:
-    The transported field at arrival points, shaped like `departure.lon`.
+    The transported field at arrival points, shaped like `field` with trailing
+    axes matching `departure.lon`.
   """
-  return interpolator(field, departure.lon, departure.sin_lat)
+  field = jnp.asarray(field)
+  lon = departure.lon
+  sin_lat = departure.sin_lat
+  if field.ndim == 4 or (field.ndim == 3 and lon.ndim == 2):
+    out = _interpolate_2d_multi(
+        field,
+        interpolator.grid,
+        lon,
+        sin_lat,
+        order=interpolator.order,
+        limiter=interpolator.limiter,
+        method=interpolator.method,
+        max_lat_shift=interpolator.max_lat_shift,
+    )
+  else:
+    out = interpolator(field, lon, sin_lat)
+  return interpolator.grid.zero_nodal_padding(out)
 
 
 def transport_scalar(
@@ -945,28 +1272,35 @@ def transport_scalar(
     *,
     vertical_order: Literal['linear', 'cubic'] = 'linear',
     limiter_bound_reference: Array | None = None,
+    max_vertical_shift: int | None = DEFAULT_MAX_SHIFT,
 ) -> jnp.ndarray:
-  """Remaps a scalar field to arrival points along 3-D trajectories.
+  """Remaps scalar field(s) to arrival points along 3-D trajectories.
 
   Args:
-    field: nodal values at layer centers, of shape [layers, longitude_nodes,
-      latitude_nodes].
+    field: nodal values at layer centers, of shape
+      [*channels, layers, longitude_nodes, latitude_nodes].
     departure: 3-D departure points (with σ coordinates).
     vertical: vertical coordinates on which `field` lives: anything with
       increasing `.centers` node values (`SigmaCoordinates` or
       `VerticalNodes`).
-    interpolator: interpolation rule (its grid, order and limiter settings
-      are used).
+    interpolator: interpolation rule (its grid, order, limiter, method, and
+      `max_lat_shift` window settings are used).
     vertical_order: vertical interpolation order (see `interpolate_3d`).
     limiter_bound_reference: optional per-level bound shift for the
       limiter (see `interpolate_3d`).
+    max_vertical_shift: vertical displacement limit, in levels; the latitude
+      limit is the interpolator's `max_lat_shift`. A departure point beyond
+      either limit is interpolated at the edge of the window (on both
+      methods); None for either disables the clamp and the 'matmul' window.
+      See `interpolate_3d`.
 
   Returns:
-    The transported field at arrival points, shaped like `departure.lon`.
+    The transported field(s) at arrival points, of shape
+    `[*channels, *departure.lon.shape]`.
   """
   if departure.sigma is None:
     raise ValueError('transport_scalar requires 3-D departure points')
-  return interpolate_3d(
+  out = interpolate_3d(
       field,
       interpolator.grid,
       departure.lon,
@@ -977,7 +1311,11 @@ def transport_scalar(
       limiter=interpolator.limiter,
       vertical_order=vertical_order,
       limiter_bound_reference=limiter_bound_reference,
+      method=interpolator.method,
+      max_lat_shift=interpolator.max_lat_shift,
+      max_vertical_shift=max_vertical_shift,
   )
+  return interpolator.grid.zero_nodal_padding(out)
 
 
 def planetary_velocity(r: Array, rotation_rate: float, radius: float) -> Array:
@@ -1011,8 +1349,8 @@ def _finish_wind_transport(
   """Rotates interpolated Cartesian winds to arrival and projects to (u, v)."""
   lon_mesh, sin_lat_mesh = grid.nodal_mesh
   arrival = lon_lat_to_cartesian(
-      jnp.broadcast_to(lon_mesh, departure.lon.shape),
-      jnp.broadcast_to(sin_lat_mesh, departure.lon.shape),
+      jnp.broadcast_to(lon_mesh, departure.cartesian.shape[1:]),
+      jnp.broadcast_to(sin_lat_mesh, departure.cartesian.shape[1:]),
   )
   if planetary_rotation_rate is not None:
     # add the analytic planetary momentum at the departure point (only the
@@ -1030,7 +1368,8 @@ def _finish_wind_transport(
     wind_arrival = wind_arrival - planetary_velocity(
         arrival, planetary_rotation_rate, grid.radius
     )
-  return tangent_wind(wind_arrival, lon_mesh, sin_lat_mesh)
+  u_arr, v_arr = tangent_wind(wind_arrival, lon_mesh, sin_lat_mesh)
+  return grid.zero_nodal_padding(u_arr), grid.zero_nodal_padding(v_arr)
 
 
 def transport_wind(
@@ -1043,6 +1382,7 @@ def transport_wind(
     rotate: bool = True,
     planetary_rotation_rate: float | None = None,
     vertical_order: Literal['linear', 'cubic'] = 'linear',
+    max_vertical_shift: int | None = DEFAULT_MAX_SHIFT,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
   """Remaps horizontal winds to arrival points along 3-D trajectories.
 
@@ -1077,6 +1417,12 @@ def transport_wind(
       steps. Note this makes transport affine rather than linear: the
       caller's (u, v) must carry the state winds with coefficient exactly
       one (see `SemiLagrangianImplicitExplicitODE.semi_lagrangian_transport`).
+    vertical_order: vertical interpolation order (see `interpolate_3d`).
+    max_vertical_shift: vertical displacement limit, in levels; the latitude
+      limit is the interpolator's `max_lat_shift`. A departure point beyond
+      either limit is interpolated at the edge of the window (on both
+      methods); None for either disables the clamp and the 'matmul' window.
+      See `interpolate_3d`.
 
   Returns:
     Tuple (u, v) of transported winds at arrival points.
@@ -1086,22 +1432,142 @@ def transport_wind(
   grid = interpolator.grid
   lon_mesh, sin_lat_mesh = grid.nodal_mesh
   wind = cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
-  interpolate = functools.partial(
-      interpolate_3d,
-      grid=grid,
-      lon=departure.lon,
-      sin_lat=departure.sin_lat,
-      sigma=departure.sigma,
+  wind_departure = interpolate_3d(
+      wind,
+      grid,
+      departure.lon,
+      departure.sin_lat,
+      departure.sigma,
       sigma_nodes=vertical.centers,
       order=interpolator.order,
       limiter=interpolator.limiter,
       vertical_order=vertical_order,
+      method=interpolator.method,
+      max_lat_shift=interpolator.max_lat_shift,
+      max_vertical_shift=max_vertical_shift,
   )
-  # vmap over the three Cartesian components: the stencil indices and
-  # weights are computed once and the gathers batch into one.
-  wind_departure = jax.vmap(interpolate)(wind)
   return _finish_wind_transport(
       wind_departure, departure, grid, rotate, planetary_rotation_rate
+  )
+
+
+class TransportedWindAndScalars(NamedTuple):
+  """Result of `transport_wind_and_scalars`.
+
+  Attributes:
+    u: transported zonal wind at arrival points.
+    v: transported meridional wind at arrival points.
+    scalars: transported scalar fields, [scalars, *departure.lon.shape].
+    low_order_scalars: trilinear (low-order, unlimited) interpolation of the
+      scalars from `low_order_scalar_start` on, at the same departure points;
+      it has zero scalars if none was requested.
+  """
+
+  u: jnp.ndarray
+  v: jnp.ndarray
+  scalars: jnp.ndarray
+  low_order_scalars: jnp.ndarray
+
+
+def transport_wind_and_scalars(
+    u: Array,
+    v: Array,
+    scalars: Array,
+    departure: DeparturePoints,
+    vertical: sigma_coordinates.SigmaCoordinates,
+    interpolator: GridInterpolator,
+    *,
+    limited_scalar_start: int = 0,
+    low_order_scalar_start: int | None = None,
+    rotate: bool = True,
+    planetary_rotation_rate: float | None = None,
+    vertical_order: Literal['linear', 'cubic'] = 'linear',
+    max_vertical_shift: int | None = DEFAULT_MAX_SHIFT,
+) -> TransportedWindAndScalars:
+  """Remaps winds and scalars along the same 3-D trajectories in one pass.
+
+  The result is that of `transport_wind` (with an unlimited interpolator)
+  and `transport_scalar`, but the three Cartesian wind components and the
+  scalars are interpolated as one stack of fields: the stencils of the
+  departure points are located once and every field is read at them
+  together.
+
+  Optionally the same pass also returns a second, trilinear interpolation of
+  some of the scalars (`low_order_scalar_start`). Mass fixers of the
+  Bermejo-Conde type compare a tracer's high-order interpolant with its
+  low-order one at the same departure points; obtaining it here reuses the
+  stencil search and the values already read.
+
+  Args:
+    u: nodal zonal wind (true winds, not cosθ-scaled) at layer centers, of
+      shape [layers, longitude_nodes, latitude_nodes].
+    v: nodal meridional wind, same shape as `u`.
+    scalars: nodal scalar fields at layer centers, of shape
+      [scalars, layers, longitude_nodes, latitude_nodes] and the dtype of the
+      winds.
+    departure: 3-D departure points (with σ coordinates).
+    vertical: vertical coordinates on which the fields live (anything with
+      increasing `.centers` node values).
+    interpolator: interpolation rule (its grid, order, method and
+      `max_lat_shift`). Its limiter, if any, is applied to the scalars from
+      `limited_scalar_start` on, and never to the wind: use `transport_wind`
+      for limited winds.
+    limited_scalar_start: index of the first scalar the limiter applies to.
+    low_order_scalar_start: if not None, the scalars from this index on are
+      also interpolated trilinearly, without limiter.
+    rotate: whether to parallel-transport the interpolated wind vectors from
+      the departure to the arrival tangent plane (see `transport_wind`).
+    planetary_rotation_rate: if not None, transport the planetary momentum
+      `v + 2Ω ✕ R` (see `transport_wind`).
+    vertical_order: vertical interpolation order (see `interpolate_3d`).
+    max_vertical_shift: vertical displacement limit, in levels (see
+      `transport_scalar`).
+
+  Returns:
+    The transported winds and scalars (`TransportedWindAndScalars`).
+  """
+  if departure.sigma is None:
+    raise ValueError('transport_wind_and_scalars requires 3-D departure points')
+  grid = interpolator.grid
+  scalars = jnp.asarray(scalars)
+  if scalars.ndim != 4:
+    raise ValueError(
+        'expected scalars of shape [scalars, layers, longitude_nodes,'
+        f' latitude_nodes]; got {scalars.shape}'
+    )
+  lon_mesh, sin_lat_mesh = grid.nodal_mesh
+  wind = cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
+  num_wind = wind.shape[0]
+  values, low_order = _interpolate_3d_mixed(
+      jnp.concatenate([wind, scalars], axis=0),
+      grid,
+      departure.lon,
+      departure.sin_lat,
+      departure.sigma,
+      sigma_nodes=vertical.centers,
+      order=interpolator.order,
+      limiter=interpolator.limiter,
+      limited_channel_start=num_wind + limited_scalar_start,
+      trilinear_channel_start=(
+          None
+          if low_order_scalar_start is None
+          else num_wind + low_order_scalar_start
+      ),
+      vertical_order=vertical_order,
+      method=interpolator.method,
+      max_lat_shift=interpolator.max_lat_shift,
+      max_vertical_shift=max_vertical_shift,
+  )
+  u_arrival, v_arrival = _finish_wind_transport(
+      values[:num_wind], departure, grid, rotate, planetary_rotation_rate
+  )
+  if low_order is None:
+    low_order = jnp.zeros((0, *values.shape[1:]), dtype=values.dtype)
+  return TransportedWindAndScalars(
+      u=u_arrival,
+      v=v_arrival,
+      scalars=grid.zero_nodal_padding(values[num_wind:]),
+      low_order_scalars=grid.zero_nodal_padding(low_order),
   )
 
 
@@ -1135,11 +1601,16 @@ def transport_wind_2d(
   grid = interpolator.grid
   lon_mesh, sin_lat_mesh = grid.nodal_mesh
   wind = cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
-  # vmap over the three Cartesian components: the stencil indices and
-  # weights are computed once and the gathers batch into one.
-  wind_departure = jax.vmap(
-      lambda component: interpolator(component, departure.lon, departure.sin_lat)
-  )(wind)
+  wind_departure = _interpolate_2d_multi(
+      wind,
+      grid,
+      departure.lon,
+      departure.sin_lat,
+      order=interpolator.order,
+      limiter=interpolator.limiter,
+      method=interpolator.method,
+      max_lat_shift=interpolator.max_lat_shift,
+  )
   return _finish_wind_transport(
       wind_departure, departure, grid, rotate, planetary_rotation_rate
   )
