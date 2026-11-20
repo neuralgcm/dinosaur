@@ -1212,13 +1212,8 @@ class WindowClampTest(parameterized.TestCase):
     self.addCleanup(jax.clear_caches)
     return mock.patch.object(jax, 'default_backend', return_value='tpu')
 
-  def _assert_close(self, actual, desired, scale, widened=False, rel=1e-5):
-    # Mocked-TPU limited float32 interpolation widens the bounds by
-    # `_BF16X3_BOUND_WIDENING` (relative), as it does inside the windows.
-    atol = rel * scale
-    if widened:
-      atol += 2 * semi_lagrangian._BF16X3_BOUND_WIDENING * scale
-    np.testing.assert_allclose(actual, desired, rtol=0, atol=atol)
+  def _assert_close(self, actual, desired, scale, rel=1e-5):
+    np.testing.assert_allclose(actual, desired, rtol=0, atol=rel * scale)
 
   @parameterized.product(
       order=('linear', 'cubic'),
@@ -1264,7 +1259,7 @@ class WindowClampTest(parameterized.TestCase):
     scale = float(jnp.max(field)) + (295.0 if use_ref else 0.0)
     self._assert_close(out_m, out_g, scale)
     self._assert_close(
-        out_t, out_m, scale, widened=limiter is not None, rel=2e-5
+        out_t, out_m, scale, rel=2e-5
     )
     for out in (out_m, out_t):
       self.assertGreater(float(jnp.min(out)), 0.0)
@@ -1310,7 +1305,7 @@ class WindowClampTest(parameterized.TestCase):
         else:
           high_m, low_m = mixed('matmul')
         scale = float(jnp.max(fields))
-        self._assert_close(high_m, high_g, scale, widened=backend == 'tpu')
+        self._assert_close(high_m, high_g, scale)
         self._assert_close(low_m, low_g, scale, rel=2e-5)
         self.assertGreater(float(jnp.min(high_m)), 0.0)
         self.assertGreater(float(jnp.min(low_m)), 0.0)
@@ -1423,7 +1418,7 @@ class WindowClampTest(parameterized.TestCase):
         self._assert_close(out_m[name], ref, scale)
         self._assert_close(
             out_t[name], out_m[name], scale + (295.0 * (name == 'scalar_ref')),
-            widened=limiter is not None, rel=2e-5,
+            rel=2e-5,
         )
         if name in ('scalar', 'scalar_ref', 'scalar_2d', 'scalar_2d_levels',
                     'levels'):

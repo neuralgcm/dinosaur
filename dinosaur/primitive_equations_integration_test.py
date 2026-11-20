@@ -14,6 +14,7 @@
 
 """Integration tests for primitive_equations."""
 import functools
+from unittest import mock
 
 from absl.testing import absltest
 import chex
@@ -24,7 +25,6 @@ from dinosaur import primitive_equations_states
 from dinosaur import pytree_utils
 from dinosaur import scales
 from dinosaur import semi_lagrangian
-from dinosaur import semi_lagrangian_test
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
@@ -35,10 +35,57 @@ from jax import config  # pylint: disable=g-importing-member
 import jax.numpy as jnp
 import numpy as np
 
+_NUM_DEVICES = 8
+
 try:
-  chex.set_n_cpu_devices(8)  # set at top level so standalone pytest works
+  chex.set_n_cpu_devices(_NUM_DEVICES)  # at top level for standalone pytest
 except RuntimeError:
+  # The backend was initialized before this module was imported. That is fine
+  # if it already has enough devices; `IntegrationTest.setUp` checks.
   pass
+
+
+# A sharded grid pads its nodal axes by default (to a multiple of 8 per shard),
+# and the semi-Lagrangian interpolation then all-gathers the latitude axis. The
+# nearest-neighbour halo exchange needs the unpadded grid, which is requested
+# with `nodal_shape_multiple=1`.
+_UNPADDED_FAST_HARMONICS = functools.partial(
+    spherical_harmonic.FastSphericalHarmonics, nodal_shape_multiple=1
+)
+
+# Window half-width of the out-of-window test, and the displacement range (in
+# grid cells) of its departure points: beyond the window, by up to 2S + 3.
+_SHIFT = 2
+_FAR = (3.0, 7.0)
+
+
+def _displaced_queries(grid, layers, seed, cells, dtype=np.float32):
+  """Grid-aligned [layers, *nodal_shape] queries displaced by `cells`.
+
+  Each query is moved from its arrival point by a number of latitude rows and
+  of levels drawn uniformly from the interval `cells`, in either direction.
+  """
+  rng = np.random.RandomState(seed)
+  lon_mesh, sin_lat_mesh = grid.nodal_mesh
+  phi_mesh = np.arcsin(sin_lat_mesh)
+  shape = (layers,) + grid.nodal_shape
+
+  def shifts():
+    return rng.uniform(*cells, size=shape) * rng.choice([-1.0, 1.0], size=shape)
+
+  phi = np.clip(
+      phi_mesh + shifts() * np.pi / grid.latitude_nodes,
+      -np.pi / 2 + 1e-4,
+      np.pi / 2 - 1e-4,
+  )
+  lon = (lon_mesh + rng.uniform(-0.3, 0.3, size=shape)) % (2 * np.pi)
+  centers = sigma_coordinates.SigmaCoordinates.equidistant(layers).centers
+  sigma = np.clip(
+      centers[:, np.newaxis, np.newaxis] + shifts() / layers,
+      centers[0] - 0.02,
+      centers[-1] + 0.02,
+  )
+  return tuple(jnp.asarray(x, dtype) for x in (lon, np.sin(phi), sigma))
 
 
 def make_coords(
@@ -142,6 +189,16 @@ def trim_state(state, distributed_coords):
 
 
 class IntegrationTest(absltest.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.assertGreaterEqual(
+        len(jax.devices()),
+        _NUM_DEVICES,
+        f'these tests need {_NUM_DEVICES} devices; if the JAX backend was'
+        ' initialized before this module was imported, set'
+        f' XLA_FLAGS=--xla_force_host_platform_device_count={_NUM_DEVICES}',
+    )
 
   def test_distributed_simulation_consistency(self):
     physics_specs = units.SimUnits.from_si()
@@ -401,7 +458,7 @@ class IntegrationTest(absltest.TestCase):
     def build_hybrid_coords(mesh):
       return coordinate_systems.CoordinateSystem(
           spherical_harmonic.Grid.T31(
-              spherical_harmonics_impl=spherical_harmonic.FastSphericalHarmonics,
+              spherical_harmonics_impl=_UNPADDED_FAST_HARMONICS,
               radius=physics_specs.radius,
           ),
           hybrid_levels,
@@ -509,12 +566,12 @@ class IntegrationTest(absltest.TestCase):
   def test_semi_lagrangian_window_clamp_sharded(self):
     """Departures beyond the windows are clamped identically under a mesh."""
     num_layers = 16
-    shift = semi_lagrangian_test._SHIFT
+    shift = _SHIFT
 
     def build_coords(mesh):
       return coordinate_systems.CoordinateSystem(
           spherical_harmonic.Grid.T31(
-              spherical_harmonics_impl=spherical_harmonic.FastSphericalHarmonics
+              spherical_harmonics_impl=_UNPADDED_FAST_HARMONICS
           ),
           sigma_coordinates.SigmaCoordinates.equidistant(num_layers),
           spmd_mesh=mesh,
@@ -524,8 +581,8 @@ class IntegrationTest(absltest.TestCase):
     grid = coords.horizontal
     nx, ny = grid.nodal_shape
     centers = coords.vertical.centers
-    lon, sin_lat, sigma = semi_lagrangian_test._far_queries(
-        grid, num_layers, seed=3
+    lon, sin_lat, sigma = _displaced_queries(
+        grid, num_layers, seed=3, cells=_FAR
     )
     rng = np.random.RandomState(4)
     fields = jnp.asarray(
@@ -600,6 +657,261 @@ class IntegrationTest(absltest.TestCase):
           np.testing.assert_allclose(
               o, r, rtol=0, atol=2e-5 * float(np.max(np.abs(r)))
           )
+
+  def test_semi_lagrangian_z_sharded_level_blocks(self):
+    """A z-sharded 3-D interpolation matches the unsharded one on TPU layouts.
+
+    On TPU the 'matmul' method evaluates several query levels per block, with
+    one vertical window for the block. That window is wider than a single
+    level's, and on the first and last z-shard it must stay off the halo
+    levels the cyclic exchange fills from the opposite end of the column;
+    with a level count that is not a multiple of the block length the last
+    block also reaches past the shard's own levels.
+    """
+    grid_kwargs = dict(spherical_harmonics_impl=_UNPADDED_FAST_HARMONICS)
+    grid = spherical_harmonic.Grid.T21(**grid_kwargs)
+    cases = [
+        # (layers, z-shards, max_vertical_shift, vertical order)
+        (32, 4, 6, 'cubic'),  # 8 levels per shard: exactly the halo width.
+        (20, 2, 6, 'cubic'),  # 10 levels per shard: not a multiple of 4.
+        (40, 4, 6, 'cubic'),  # interior shards with a ragged last block.
+        (32, 4, 6, 'linear'),
+        (32, 4, 2, 'cubic'),
+    ]
+    for layers, z_shards, shift, vertical_order in cases:
+      centers = sigma_coordinates.SigmaCoordinates.equidistant(layers).centers
+      lon, sin_lat, sigma = _displaced_queries(
+          grid, layers, seed=layers, cells=(0.0, shift - 0.25)
+      )
+      rng = np.random.RandomState(layers + z_shards)
+      fields = jnp.asarray(
+          1.0 + np.abs(rng.normal(size=(3, layers) + grid.nodal_shape)),
+          jnp.float32,
+      )
+      kw = dict(
+          order='cubic',
+          vertical_order=vertical_order,
+          max_lat_shift=6,
+          max_vertical_shift=shift,
+      )
+      mesh = jax.sharding.Mesh(
+          np.array(jax.devices()[:z_shards]).reshape((z_shards, 1, 1)),
+          axis_names=['z', 'x', 'y'],
+      )
+      dist_grid = spherical_harmonic.Grid.T21(spmd_mesh=mesh, **grid_kwargs)
+      self.assertEqual(dist_grid.nodal_shape, grid.nodal_shape)
+      for limiter in (None, 'quasi_monotone'):
+        reference = (
+            jnp.asarray(np.linspace(220.0, 295.0, layers), jnp.float32)
+            if limiter
+            else None
+        )
+        expected = semi_lagrangian.interpolate_3d(
+            fields, grid, lon, sin_lat, sigma, centers, method='gather',
+            limiter=limiter, limiter_bound_reference=reference, **kw,
+        )
+        for backend in ('cpu', 'tpu'):
+          with self.subTest(
+              layers=layers, z_shards=z_shards, shift=shift,
+              vertical_order=vertical_order, limiter=limiter, backend=backend,
+          ):
+            # The platform is read off the mesh's devices, which are CPUs
+            # here: `_target_platform` is what selects the TPU layouts.
+            with mock.patch.object(
+                semi_lagrangian, '_target_platform', return_value=backend
+            ):
+              jax.clear_caches()
+              actual = semi_lagrangian.interpolate_3d(
+                  fields, dist_grid, lon, sin_lat, sigma, centers,
+                  method='matmul', limiter=limiter,
+                  limiter_bound_reference=reference, **kw,
+              )
+            np.testing.assert_allclose(
+                actual, expected, rtol=0,
+                atol=2e-5 * float(np.max(np.abs(expected))),
+            )
+    jax.clear_caches()
+
+  def test_semi_lagrangian_mesh_with_non_spatial_axes(self):
+    """Only spatial sharding selects the sharded interpolation."""
+    layers = 8
+    grid_kwargs = dict(spherical_harmonics_impl=_UNPADDED_FAST_HARMONICS)
+    grid = spherical_harmonic.Grid.T21(**grid_kwargs)
+    centers = sigma_coordinates.SigmaCoordinates.equidistant(layers).centers
+    lon, sin_lat, sigma = _displaced_queries(
+        grid, layers, seed=11, cells=(0.0, 1.75)
+    )
+    fields = jnp.asarray(
+        np.random.RandomState(12).normal(size=(2, layers) + grid.nodal_shape),
+        jnp.float32,
+    )
+    kw = dict(vertical_order='cubic', max_lat_shift=2, max_vertical_shift=2)
+    expected = semi_lagrangian.interpolate_3d(
+        fields, grid, lon, sin_lat, sigma, centers, method='gather', **kw
+    )
+
+    def mesh_of(shape):
+      return jax.sharding.Mesh(
+          np.array(jax.devices()[: int(np.prod(shape))]).reshape(shape),
+          axis_names=['batch', 'z', 'x', 'y'],
+      )
+
+    with self.subTest('batch axis only'):
+      batch_grid = spherical_harmonic.Grid.T21(
+          spmd_mesh=mesh_of((2, 1, 1, 1)), **grid_kwargs
+      )
+      self.assertIsNone(semi_lagrangian._spatial_mesh(batch_grid))
+      self.assertEqual(
+          semi_lagrangian._resolve_interpolation_method(None, batch_grid),
+          semi_lagrangian._resolve_interpolation_method(None, grid),
+      )
+      actual = semi_lagrangian.interpolate_3d(
+          fields, batch_grid, lon, sin_lat, sigma, centers, **kw
+      )
+      np.testing.assert_allclose(actual, expected, rtol=0, atol=2e-5)
+
+    with self.subTest('batch and spatial axes'):
+      mixed_grid = spherical_harmonic.Grid.T21(
+          spmd_mesh=mesh_of((2, 1, 1, 2)), **grid_kwargs
+      )
+      self.assertIsNotNone(semi_lagrangian._spatial_mesh(mixed_grid))
+      self.assertEqual(
+          semi_lagrangian._resolve_interpolation_method(None, mixed_grid),
+          'matmul',
+      )
+      # The shard_map is manual over 'x' and 'y' only: the batch axis of the
+      # mesh stays under automatic sharding.
+      actual = semi_lagrangian.interpolate_3d(
+          fields, mixed_grid, lon, sin_lat, sigma, centers, **kw
+      )
+      np.testing.assert_allclose(actual, expected, rtol=0, atol=2e-5)
+      actual_2d = semi_lagrangian.GridInterpolator(
+          mixed_grid, 'cubic', max_lat_shift=2
+      )(fields[0], lon, sin_lat)
+      expected_2d = semi_lagrangian.GridInterpolator(
+          grid, 'cubic', method='gather', max_lat_shift=2
+      )(fields[0], lon, sin_lat)
+      np.testing.assert_allclose(actual_2d, expected_2d, rtol=0, atol=2e-5)
+
+  def test_semi_lagrangian_step_with_batch_only_mesh(self):
+    """A mesh that shards no spatial axis leaves the model step as it is."""
+    physics_specs = units.SimUnits.from_si()
+
+    def build(mesh):
+      coords = coordinate_systems.CoordinateSystem(
+          spherical_harmonic.Grid.T21(
+              spherical_harmonics_impl=spherical_harmonic.FastSphericalHarmonics,
+              radius=physics_specs.radius,
+          ),
+          sigma_coordinates.SigmaCoordinates.equidistant(8),
+          spmd_mesh=mesh,
+      )
+      init_state_fn, aux_features = primitive_equations_states.steady_state_jw(
+          coords, physics_specs
+      )
+      lon, sin_lat = coords.horizontal.nodal_mesh
+      height = physics_specs.nondimensionalize(500 * scales.units.meter)
+      orography = (
+          height * np.exp(-(((lon - 2.0) / 0.5) ** 2) - (sin_lat / 0.3) ** 2)
+      ).astype(np.float32)
+      equation = primitive_equations.SemiLagrangianPrimitiveEquations(
+          aux_features[xarray_utils.REF_TEMP_KEY],
+          primitive_equations.truncated_modal_orography(orography, coords),
+          coords,
+          physics_specs,
+      )
+      state = init_state_fn() + (
+          primitive_equations_states.baroclinic_perturbation_jw(
+              coords, physics_specs
+          )
+      )
+      state.sim_time = 0.0
+      return equation, state
+
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()[:2]).reshape((2, 1, 1, 1)),
+        axis_names=['batch', 'z', 'x', 'y'],
+    )
+    equation, state = build(None)
+    batch_equation, batch_state = build(mesh)
+    # The static terrain correction is still evaluated at trace time.
+    self.assertTrue(primitive_equations._can_eval_static_terrain(equation))
+    self.assertTrue(
+        primitive_equations._can_eval_static_terrain(batch_equation)
+    )
+    dt = physics_specs.nondimensionalize(30 * scales.units.minute)
+
+    def step(eq, x):
+      return jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(eq, dt)
+      )(x)
+
+    assert_states_close(
+        step(batch_equation, batch_state), step(equation, state),
+        range_tol=1e-5,
+    )
+
+  def test_semi_lagrangian_platform_follows_the_mesh(self):
+    """The mesh's devices, not the default backend, pick the layouts."""
+    grid_kwargs = dict(spherical_harmonics_impl=_UNPADDED_FAST_HARMONICS)
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()[:2]).reshape((1, 1, 2)),
+        axis_names=['z', 'x', 'y'],
+    )
+    device_platform = jax.devices()[0].platform
+    other = 'tpu' if device_platform != 'tpu' else 'cpu'
+    with mock.patch.object(jax, 'default_backend', return_value=other):
+      self.assertEqual(
+          semi_lagrangian._target_platform(
+              spherical_harmonic.Grid.T21(spmd_mesh=mesh, **grid_kwargs)
+          ),
+          device_platform,
+      )
+      self.assertEqual(
+          semi_lagrangian._target_platform(
+              spherical_harmonic.Grid.T21(**grid_kwargs)
+          ),
+          other,
+      )
+
+  def test_semi_lagrangian_zero_shift_sharded(self):
+    """`max_*_shift=0` (a one-cell window) exchanges a wide enough halo."""
+    grid_kwargs = dict(spherical_harmonics_impl=_UNPADDED_FAST_HARMONICS)
+    layers = 16
+    grid = spherical_harmonic.Grid.T31(**grid_kwargs)
+    centers = sigma_coordinates.SigmaCoordinates.equidistant(layers).centers
+    # A shift of 0 is a window of one cell, so displace by less than a cell.
+    lon, sin_lat, sigma = _displaced_queries(
+        grid, layers, seed=7, cells=(0.0, 0.75)
+    )
+    rng = np.random.RandomState(8)
+    fields = jnp.asarray(
+        rng.normal(size=(2, layers) + grid.nodal_shape), jnp.float32
+    )
+    expected_3d = semi_lagrangian.interpolate_3d(
+        fields, grid, lon, sin_lat, sigma, centers, method='gather',
+        vertical_order='cubic', max_lat_shift=0, max_vertical_shift=0,
+    )
+    expected_2d = semi_lagrangian.GridInterpolator(
+        grid, 'cubic', method='gather', max_lat_shift=0
+    )(fields[0], lon, sin_lat)
+    for name, shape in [('y', (1, 1, 4)), ('z', (4, 1, 1)), ('zy', (2, 1, 4))]:
+      with self.subTest(name):
+        mesh = jax.sharding.Mesh(
+            np.array(jax.devices()[: int(np.prod(shape))]).reshape(shape),
+            axis_names=['z', 'x', 'y'],
+        )
+        dist_grid = spherical_harmonic.Grid.T31(spmd_mesh=mesh, **grid_kwargs)
+        self.assertEqual(dist_grid.nodal_shape, grid.nodal_shape)
+        actual_3d = semi_lagrangian.interpolate_3d(
+            fields, dist_grid, lon, sin_lat, sigma, centers, method='matmul',
+            vertical_order='cubic', max_lat_shift=0, max_vertical_shift=0,
+        )
+        actual_2d = semi_lagrangian.GridInterpolator(
+            dist_grid, 'cubic', method='matmul', max_lat_shift=0
+        )(fields[0], lon, sin_lat)
+        np.testing.assert_allclose(actual_3d, expected_3d, rtol=0, atol=2e-5)
+        np.testing.assert_allclose(actual_2d, expected_2d, rtol=0, atol=2e-5)
 
 
 if __name__ == '__main__':

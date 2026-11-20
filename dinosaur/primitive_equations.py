@@ -1895,7 +1895,12 @@ def _can_eval_static_terrain(
     equation: SemiLagrangianPrimitiveEquations
     | SemiLagrangianPrimitiveEquationsHybrid,
 ) -> bool:
-  return equation.coords.spmd_mesh is None and not any(
+  # A mesh that shards no spatial axis (e.g. one with only a 'batch' axis)
+  # leaves the transforms on one device, where they can run at trace time.
+  spatially_sharded = spherical_harmonic.has_spatial_sharding(
+      equation.coords.spmd_mesh
+  )
+  return not spatially_sharded and not any(
       isinstance(x, jax.core.Tracer)
       for x in (
           equation.orography,
@@ -1906,19 +1911,33 @@ def _can_eval_static_terrain(
   )
 
 
-def _static_terrain_context(
+def _static_terrain_evaluation(
     equation: SemiLagrangianPrimitiveEquations
     | SemiLagrangianPrimitiveEquationsHybrid,
-) -> contextlib.AbstractContextManager[Any]:
-  """Context in which the static terrain correction is evaluated.
+) -> tuple[contextlib.AbstractContextManager[Any], spherical_harmonic.Grid]:
+  """Context and grid with which the static terrain correction is evaluated.
 
   The correction depends only on constants of the equation, so when none of
   them is a tracer it is evaluated at trace time and enters the compiled
-  program as a constant rather than as per-step spectral transforms.
+  program as a constant rather than as per-step spectral transforms. That
+  evaluation uses the grid without its mesh: a mesh that shards no spatial
+  axis changes neither the transforms' shapes nor their results, but their
+  `shard_map`s can only run inside a trace.
+
+  Args:
+    equation: the semi-Lagrangian equation.
+
+  Returns:
+    `(context, grid)`: the context manager to evaluate in, and the grid to
+    evaluate with.
   """
+  grid = equation.coords.horizontal
   if _can_eval_static_terrain(equation):
-    return jax.ensure_compile_time_eval()
-  return contextlib.nullcontext()
+    return (
+        jax.ensure_compile_time_eval(),
+        dataclasses.replace(grid, spmd_mesh=None),
+    )
+  return contextlib.nullcontext(), grid
 
 
 def _nodal_terrain_correction(
@@ -1926,10 +1945,9 @@ def _nodal_terrain_correction(
     | SemiLagrangianPrimitiveEquationsHybrid,
 ) -> jnp.ndarray:
   """Nodal static terrain correction `C`."""
-  with _static_terrain_context(equation):
-    return equation.coords.horizontal.to_nodal(
-        _log_sp_terrain_correction_modal(equation)
-    )
+  context, grid = _static_terrain_evaluation(equation)
+  with context:
+    return grid.to_nodal(_log_sp_terrain_correction_modal(equation))
 
 
 def _nodal_terrain_correction_grad(
@@ -1937,8 +1955,8 @@ def _nodal_terrain_correction_grad(
     | SemiLagrangianPrimitiveEquationsHybrid,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
   """Nodal `cos(lat)·∇C` of the static terrain correction, as `(x, y)`."""
-  grid = equation.coords.horizontal
-  with _static_terrain_context(equation):
+  context, grid = _static_terrain_evaluation(equation)
+  with context:
     gx, gy = grid.cos_lat_grad(
         _log_sp_terrain_correction_modal(equation), clip=False
     )
@@ -2856,7 +2874,8 @@ class SemiLagrangianPrimitiveEquations(
       dt·max‖∇V‖ < 1) also need at least 2: the warm start cannot rescue
       a barely-contracting iteration.
     interpolation_method: 'gather', 'matmul', or None (auto-selects 'matmul'
-      on TPU or when `coords.spmd_mesh` is set, and 'gather' otherwise).
+      on TPU or when `coords.spmd_mesh` shards a spatial axis, and 'gather'
+      otherwise).
     max_lat_shift: maximum meridional displacement per step, in latitude
       cells: departure points further from their arrival row are clamped to
       this window (and trajectory midpoints to half of it) on every
@@ -2895,6 +2914,10 @@ class SemiLagrangianPrimitiveEquations(
     if self.vertical_interpolation_order not in ('linear', 'cubic'):
       raise ValueError(f'unknown {self.vertical_interpolation_order=}')
     semi_lagrangian._validate_interpolation_method(self.interpolation_method)
+    semi_lagrangian._validate_window_shift('max_lat_shift', self.max_lat_shift)
+    semi_lagrangian._validate_window_shift(
+        'max_vertical_shift', self.max_vertical_shift
+    )
 
   @property
   def _planetary_rotation_rate(self) -> float | None:
@@ -4641,6 +4664,10 @@ class SemiLagrangianPrimitiveEquationsHybrid(
     if self.vertical_interpolation_order not in ('linear', 'cubic'):
       raise ValueError(f'unknown {self.vertical_interpolation_order=}')
     semi_lagrangian._validate_interpolation_method(self.interpolation_method)
+    semi_lagrangian._validate_window_shift('max_lat_shift', self.max_lat_shift)
+    semi_lagrangian._validate_window_shift(
+        'max_vertical_shift', self.max_vertical_shift
+    )
 
   @property
   def _planetary_rotation_rate(self) -> float | None:
