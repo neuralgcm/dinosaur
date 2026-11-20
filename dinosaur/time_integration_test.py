@@ -438,6 +438,38 @@ class SemiLagrangianProtocolTest(absltest.TestCase):
         expected,
     )
 
+  def test_composed_equation_transports_the_predictor_state_in_full(self):
+    x = jnp.arange(3.0)
+    base = ScalarSemiLagrangianODE()
+    forcing = time_integration.ExplicitODE.from_functions(lambda state: state)
+    composed = time_integration.compose_equations([base, forcing])
+    time_integration.semi_lagrangian_crank_nicolson_rk2(composed, 0.1)(x)
+    # A composed forcing may read any field of the predictor state.
+    self.assertEqual(base.transport_calls, [False, False])
+
+    alone = ScalarSemiLagrangianODE()
+    composed = time_integration.compose_equations([alone])
+    time_integration.semi_lagrangian_crank_nicolson_rk2(composed, 0.1)(x)
+    self.assertEqual(alone.transport_calls, [True, False])
+
+  def test_wrappers_forward_an_equations_own_pair(self):
+    x = jnp.arange(3.0)
+    base = PairedODE()
+    forcing = time_integration.ExplicitODE.from_functions(lambda state: state)
+    composed = time_integration.compose_equations([forcing, base])
+    n, v = composed.nonadvective_terms_and_velocities(x)
+    self.assertEqual(base.pair_calls, 1)
+    np.testing.assert_array_equal(n, composed.nonadvective_terms(x))
+    np.testing.assert_array_equal(n, jnp.zeros(3))  # -x + x
+    np.testing.assert_array_equal(v, composed.nodal_velocities(x))
+
+    base = PairedODE()
+    reversed_eq = time_integration.TimeReversedSemiLagrangianODE(base)
+    n, v = reversed_eq.nonadvective_terms_and_velocities(x)
+    self.assertEqual(base.pair_calls, 1)
+    np.testing.assert_array_equal(n, reversed_eq.nonadvective_terms(x))
+    np.testing.assert_array_equal(v, reversed_eq.nodal_velocities(x))
+
   def test_time_reversed_equation_accepts_predictor_stage(self):
     forward = LegacyTransportODE()
     eq = time_integration.TimeReversedSemiLagrangianODE(forward)

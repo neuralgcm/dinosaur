@@ -1813,6 +1813,68 @@ class SemiLagrangianMoistAndTracerTest(parameterized.TestCase):
           transported,
       )
 
+  def test_composed_forcing_reads_transported_passive_tracer(self):
+    """A composed forcing sees passive tracers transported in the predictor.
+
+    `compose_equations` evaluates the other equations' explicit terms on the
+    predictor state, so the predictor stage must not leave passive tracers
+    untransported for the composed equation, even though the base equation's
+    own methods never read them.
+    """
+    equation, state, _, _ = self._setup(humidity=True)
+    passive = primitive_equations_states.gaussian_scalar(
+        equation.coords, equation.physics_specs
+    )
+    state.tracers = {**state.tracers, 'passive': passive}
+    dt = self._nondim_minutes(equation.physics_specs, 30)
+
+    def heating_from_passive_tracer(state):
+      zeros = jax.tree_util.tree_map(jnp.zeros_like, state)
+      return zeros.replace(
+          temperature_variation=state.tracers['passive'], sim_time=None
+      )
+
+    forcing = time_integration.ExplicitODE.from_functions(
+        heating_from_passive_tracer
+    )
+    composed = time_integration.compose_equations([equation, forcing])
+
+    # The same forcing as part of `nonadvective_terms`, which switches the
+    # shortcut off (see the test above), is the reference.
+    reference = dataclasses.replace(equation)
+    library_terms = (
+        primitive_equations.SemiLagrangianPrimitiveEquations.nonadvective_terms
+    )
+
+    def nonadvective_terms(state):
+      return library_terms(reference, state) + heating_from_passive_tracer(
+          state
+      )
+
+    reference.nonadvective_terms = nonadvective_terms
+
+    def step(eq):
+      return jax.jit(
+          time_integration.semi_lagrangian_crank_nicolson_rk2(eq, dt)
+      )(state)
+
+    actual = step(composed)
+    expected = step(reference)
+    for field in ('temperature_variation', 'divergence', 'vorticity'):
+      np.testing.assert_allclose(
+          getattr(actual, field), getattr(expected, field), rtol=1e-5,
+          atol=1e-7, err_msg=field,
+      )
+    # The check has teeth: the forcing changes the step, and evaluating it on
+    # an untransported tracer in the predictor would change it differently.
+    plain = step(equation)
+    self.assertFalse(
+        np.allclose(
+            actual.temperature_variation, plain.temperature_variation,
+            rtol=1e-5, atol=1e-7,
+        )
+    )
+
   def test_fused_terms_and_velocities_respect_overrides(self):
     """The shared-diagnostics path is used only for the library's methods."""
     equation, state, _, _ = self._setup(humidity=True)

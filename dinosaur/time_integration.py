@@ -176,11 +176,17 @@ class SemiLagrangianImplicitExplicitODE:
       nodal_velocities: Callable[[PyTreeState], typing.Pytree],
       departure_points: Callable[..., Any],
       semi_lagrangian_transport: Callable[[PyTreeState, Any], PyTreeState],
+      nonadvective_terms_and_velocities: (
+          Callable[[PyTreeState], tuple[PyTreeState, typing.Pytree]] | None
+      ) = None,
   ) -> SemiLagrangianImplicitExplicitODE:
     """Constructs a `SemiLagrangianImplicitExplicitODE` with given methods.
 
     `semi_lagrangian_transport` may take `(state, departure)` only, or also
     the keyword `predictor_stage` (see `semi_lagrangian_transport`).
+    `nonadvective_terms_and_velocities` is optional: it must return what
+    `nonadvective_terms` and `nodal_velocities` return, and defaults to
+    calling them (see the method of that name).
     """
     ode = cls()
     ode.nonadvective_terms = nonadvective_terms
@@ -189,6 +195,8 @@ class SemiLagrangianImplicitExplicitODE:
     ode.nodal_velocities = nodal_velocities
     ode.departure_points = departure_points
     ode.semi_lagrangian_transport = semi_lagrangian_transport
+    if nonadvective_terms_and_velocities is not None:
+      ode.nonadvective_terms_and_velocities = nonadvective_terms_and_velocities
     return ode
 
   def nodal_velocities(self, state: PyTreeState) -> typing.Pytree:
@@ -565,6 +573,15 @@ class TimeReversedSemiLagrangianODE(SemiLagrangianImplicitExplicitODE):
   def nodal_velocities(self, state: PyTreeState) -> typing.Pytree:
     return tree_map(jnp.negative, self.forward_eq.nodal_velocities(state))
 
+  def nonadvective_terms_and_velocities(
+      self, state: PyTreeState
+  ) -> tuple[PyTreeState, typing.Pytree]:
+    # Forwarded so that the forward equation's shared evaluation is kept.
+    terms, velocities = self.forward_eq.nonadvective_terms_and_velocities(
+        state
+    )
+    return tree_map(jnp.negative, terms), tree_map(jnp.negative, velocities)
+
   def departure_points(
       self,
       velocities: typing.Pytree,
@@ -625,7 +642,10 @@ def compose_equations(
   If the ImplicitExplicitODE instance is a SemiLagrangianImplicitExplicitODE,
   the composed equation is too, delegating trajectories and transport to it:
   the explicit terms of the other equations are treated as additional
-  non-advective forcing.
+  non-advective forcing. Those forcings are evaluated on the predictor state
+  of `semi_lagrangian_crank_nicolson_rk2` and may read any of its fields, so
+  the composed equation's transport does not take `predictor_stage`: the
+  predictor state is always transported in full.
 
   All equations must return tendency pytrees with matching structure. In
   particular, forcings that construct states with empty `tracers` (e.g.
@@ -655,13 +675,33 @@ def compose_equations(
   ):
     base = implicit_explicit_equation
 
-    def nonadvective_fn(x: PyTreeState) -> PyTreeState:
+    def add_forcings(base_terms: PyTreeState, x: PyTreeState) -> PyTreeState:
       tendencies = [
-          base.nonadvective_terms(x) if fn is base else fn.explicit_terms(x)
+          base_terms if fn is base else fn.explicit_terms(x)
           for fn in equations
       ]
       return tree_map(
           lambda *args: sum([x for x in args if x is not None]), *tendencies)
+
+    def nonadvective_fn(x: PyTreeState) -> PyTreeState:
+      return add_forcings(base.nonadvective_terms(x), x)
+
+    def nonadvective_and_velocities_fn(
+        x: PyTreeState,
+    ) -> tuple[PyTreeState, typing.Pytree]:
+      # Keeps the work `base` shares between its terms and its velocities.
+      base_terms, velocities = base.nonadvective_terms_and_velocities(x)
+      return add_forcings(base_terms, x), velocities
+
+    if len(equations) > 1:
+      # `base` may leave fields that none of its own methods read
+      # untransported in the predictor stage (`predictor_stage=True`). The
+      # other equations' forcings are evaluated on that state and may read
+      # them, so the keyword is not offered and nothing is skipped.
+      def transport_fn(state: PyTreeState, departure: Any) -> PyTreeState:
+        return base.semi_lagrangian_transport(state, departure)
+    else:
+      transport_fn = base.semi_lagrangian_transport
 
     return SemiLagrangianImplicitExplicitODE.from_functions(
         nonadvective_terms=nonadvective_fn,
@@ -669,7 +709,8 @@ def compose_equations(
         implicit_inverse=base.implicit_inverse,
         nodal_velocities=base.nodal_velocities,
         departure_points=base.departure_points,
-        semi_lagrangian_transport=base.semi_lagrangian_transport,
+        semi_lagrangian_transport=transport_fn,
+        nonadvective_terms_and_velocities=nonadvective_and_velocities_fn,
     )
 
   return ImplicitExplicitODE.from_functions(
