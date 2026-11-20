@@ -773,6 +773,79 @@ class MatmulInterpolationTest(parameterized.TestCase):
       )
       np.testing.assert_allclose(out_m[idx], single, rtol=1e-6, atol=1e-6)
 
+  def test_transport_wind_and_scalars_matches_separate_transports(self):
+    grid = spherical_harmonic.Grid.T21()
+    coords = coordinate_systems.CoordinateSystem(
+        grid, sigma_coordinates.SigmaCoordinates.equidistant(8)
+    )
+    layers = coords.vertical.layers
+    rng = np.random.RandomState(21)
+    shape = (layers,) + grid.nodal_shape
+    u = jnp.asarray(0.05 * rng.normal(size=shape), jnp.float32)
+    v = jnp.asarray(0.05 * rng.normal(size=shape), jnp.float32)
+    sigma_dot = jnp.asarray(
+        0.01 * rng.normal(size=(layers + 1,) + grid.nodal_shape), jnp.float32
+    )
+    scalars = jnp.asarray(1.0 + np.abs(rng.normal(size=(4,) + shape)), jnp.float32)
+    departure = semi_lagrangian.departure_points_3d(
+        u, v, sigma_dot, coords, dt=0.5, method='gather'
+    )
+    options = dict(vertical_order='cubic', max_vertical_shift=4)
+
+    def interpolator(method, order='cubic', limiter='quasi_monotone'):
+      return semi_lagrangian.GridInterpolator(
+          grid, order, limiter, method=method, max_lat_shift=4
+      )
+
+    expected_u, expected_v = semi_lagrangian.transport_wind(
+        u, v, departure, coords.vertical, interpolator('gather', limiter=None),
+        planetary_rotation_rate=1.0, **options,
+    )
+    expected_unlimited = semi_lagrangian.transport_scalar(
+        scalars, departure, coords.vertical,
+        interpolator('gather', limiter=None), **options,
+    )
+    expected_limited = semi_lagrangian.transport_scalar(
+        scalars, departure, coords.vertical, interpolator('gather'), **options
+    )
+    expected_low_order = semi_lagrangian.transport_scalar(
+        scalars, departure, coords.vertical,
+        interpolator('gather', order='linear', limiter=None),
+        vertical_order='linear', max_vertical_shift=4,
+    )
+    for method in ('gather', 'matmul'):
+      with self.subTest(method=method):
+        actual = semi_lagrangian.transport_wind_and_scalars(
+            u, v, scalars, departure, coords.vertical, interpolator(method),
+            limited_scalar_start=1, low_order_scalar_start=2,
+            planetary_rotation_rate=1.0, **options,
+        )
+        tol = dict(rtol=2e-5, atol=2e-5)
+        np.testing.assert_allclose(actual.u, expected_u, **tol)
+        np.testing.assert_allclose(actual.v, expected_v, **tol)
+        # The limiter applies to the scalars from `limited_scalar_start` on.
+        np.testing.assert_allclose(
+            actual.scalars[:1], expected_unlimited[:1], **tol
+        )
+        np.testing.assert_allclose(
+            actual.scalars[1:], expected_limited[1:], **tol
+        )
+        np.testing.assert_allclose(
+            actual.low_order_scalars, expected_low_order[2:], **tol
+        )
+        # The result has the same fields whether or not a low-order
+        # interpolation is requested.
+        plain = semi_lagrangian.transport_wind_and_scalars(
+            u, v, scalars, departure, coords.vertical, interpolator(method),
+            limited_scalar_start=1, planetary_rotation_rate=1.0, **options,
+        )
+        self.assertEqual(plain.low_order_scalars.shape, (0,) + shape)
+        np.testing.assert_allclose(plain.scalars, actual.scalars, **tol)
+    with self.assertRaisesRegex(ValueError, 'expected scalars of shape'):
+      semi_lagrangian.transport_wind_and_scalars(
+          u, v, scalars[0], departure, coords.vertical, interpolator('gather')
+      )
+
   def test_nodal_padding_and_orography_helpers(self):
     padded_grid = spherical_harmonic.Grid(
         longitude_wavenumbers=22,
@@ -803,7 +876,7 @@ class MatmulInterpolationTest(parameterized.TestCase):
         primitive_equations.filtered_modal_orography(orography_padded, coords),
         atol=1e-6,
     )
-    with self.assertRaisesRegex(ValueError, 'Expected nodal orography with shape='):
+    with self.assertRaisesRegex(ValueError, 'expected a nodal array'):
       primitive_equations.truncated_modal_orography(jnp.zeros((10, 10)), coords)
 
     u = jnp.pad(

@@ -583,6 +583,51 @@ class GridTest(parameterized.TestCase):
     np.testing.assert_array_equal(clipped['u'], expected_u)
     self.assertEqual(clipped['time'], 1.0)
 
+  def testNodalPaddingHelpers(self):
+    padded = spherical_harmonic.Grid(
+        longitude_wavenumbers=22,
+        total_wavenumbers=23,
+        longitude_nodes=68,
+        latitude_nodes=34,
+        spherical_harmonics_impl=functools.partial(
+            spherical_harmonic.FastSphericalHarmonics, nodal_shape_multiple=8
+        ),
+    )
+    self.assertEqual(padded.nodal_shape, (72, 40))
+    self.assertEqual(padded.nodal_padding, (4, 6))
+    rng = np.random.RandomState(0)
+    unpadded_values = rng.normal(size=(3, 68, 34)).astype(np.float32)
+
+    with self.subTest('pad_nodal'):
+      actual = padded.pad_nodal(jnp.asarray(unpadded_values))
+      self.assertEqual(actual.shape, (3, 72, 40))
+      np.testing.assert_array_equal(actual[:, :68, :34], unpadded_values)
+      np.testing.assert_array_equal(actual[:, 68:, :], 0.0)
+      np.testing.assert_array_equal(actual[:, :, 34:], 0.0)
+      # An array that already has the nodal shape is returned as it is.
+      self.assertIs(padded.pad_nodal(actual), actual)
+      np.testing.assert_array_equal(
+          padded.pad_nodal(unpadded_values[0]), actual[0]
+      )
+      with self.assertRaisesRegex(ValueError, 'expected a nodal array'):
+        padded.pad_nodal(jnp.zeros((10, 10)))
+
+    with self.subTest('zero_nodal_padding'):
+      values = jnp.asarray(rng.normal(size=(2, 72, 40)), jnp.float32)
+      actual = padded.zero_nodal_padding(values)
+      np.testing.assert_array_equal(actual[:, :68, :34], values[:, :68, :34])
+      np.testing.assert_array_equal(actual[:, 68:, :], 0.0)
+      np.testing.assert_array_equal(actual[:, :, 34:], 0.0)
+      # Values at points other than the nodes have no padding.
+      points = jnp.ones((5, 7))
+      np.testing.assert_array_equal(padded.zero_nodal_padding(points), points)
+
+    with self.subTest('no padding'):
+      grid = spherical_harmonic.Grid.T21()
+      values = jnp.asarray(rng.normal(size=grid.nodal_shape), jnp.float32)
+      self.assertIs(grid.pad_nodal(values), values)
+      np.testing.assert_array_equal(grid.zero_nodal_padding(values), values)
+
   def testFastSphericalHarmonicsNodalShapeMultiple(self):
     x_shards = 2 if len(jax.devices()) >= 2 else 1
     mesh = jax.sharding.Mesh(

@@ -2420,8 +2420,8 @@ class SemiLagrangianHybridTest(parameterized.TestCase):
           err_msg=name,
       )
 
-  def test_semi_lagrangian_transport_fused_low_order_tracers(self):
-    """return_nodal_tracers_linear fuses trilinear low-order tracer transport."""
+  def test_semi_lagrangian_transport_with_low_order_tracers(self):
+    """The low-order nodal tracers come with an unchanged transported state."""
     hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
         8, sigma_exponent=1.5, stretch_exponent=0.5
     )
@@ -2471,17 +2471,11 @@ class SemiLagrangianHybridTest(parameterized.TestCase):
         with mock.patch.object(jax, 'default_backend', return_value=backend):
           jax.clear_caches()
           ref_out = jax.jit(
-              lambda s: primitive_equations._semi_lagrangian_transport(
-                  eq, s, dep, eq._reference_vertical_nodes
-              )
+              lambda s: eq.semi_lagrangian_transport(s, dep)
           )(state)
           fused_out, tr_low = jax.jit(
-              lambda s: primitive_equations._semi_lagrangian_transport(
-                  eq,
-                  s,
-                  dep,
-                  eq._reference_vertical_nodes,
-                  return_nodal_tracers_linear=True,
+              lambda s: eq.semi_lagrangian_transport_with_low_order_tracers(
+                  s, dep
               )
           )(state)
         assert_states_close(fused_out, ref_out, rtol=2e-5, atol=2e-5)

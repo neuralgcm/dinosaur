@@ -674,23 +674,6 @@ def div_sec_lat(
   return grid.div_cos_lat((m_component, n_component), clip=False)
 
 
-def _pad_nodal_orography(
-    orography: Array, grid: spherical_harmonic.Grid
-) -> Array:
-  """Zero-pads unpadded nodal `orography` when `grid.nodal_padding != (0, 0)`."""
-  expected_shape = grid.nodal_shape
-  unpadded_shape = (grid.longitude_nodes, grid.latitude_nodes)
-  if orography.shape == expected_shape:
-    return orography
-  if orography.shape == unpadded_shape:
-    pad_x, pad_y = grid.nodal_padding
-    return jnp.pad(orography, [(0, pad_x), (0, pad_y)])
-  raise ValueError(
-      f'Expected nodal orography with shape={expected_shape} or '
-      f'{unpadded_shape}; got {orography.shape}'
-  )
-
-
 def truncated_modal_orography(
     orography: Array,
     coords: coordinate_systems.CoordinateSystem,
@@ -698,7 +681,7 @@ def truncated_modal_orography(
 ) -> Array:
   """Returns modal orography with `n` highest wavenumbers truncated."""
   grid = coords.horizontal
-  orography = _pad_nodal_orography(orography, grid)
+  orography = grid.pad_nodal(orography)
   return grid.clip_wavenumbers(grid.to_modal(orography), n=wavenumbers_to_clip)
 
 
@@ -711,7 +694,7 @@ def filtered_modal_orography(
   """Returns modal `orography` interpolated to `coords` and filtered."""
   if input_coords is None:
     input_coords = coords
-  orography = _pad_nodal_orography(orography, input_coords.horizontal)
+  orography = input_coords.horizontal.pad_nodal(orography)
   interpolate_fn = coordinate_systems.get_spectral_interpolate_fn(
       input_coords, coords, expect_same_vertical=False
   )
@@ -2117,7 +2100,6 @@ def _passive_tracers_skip_transport(
     | SemiLagrangianPrimitiveEquationsHybrid,
     *,
     predictor_stage: bool,
-    return_nodal_tracers_linear: bool,
 ) -> bool:
   """Whether the predictor stage may leave passive tracers untransported.
 
@@ -2133,22 +2115,16 @@ def _passive_tracers_skip_transport(
   tracers. An override cannot be assumed to, so if any of them is
   overridden on the class or the instance the full transport is used.
 
-  The low-order nodal fields of `return_nodal_tracers_linear` need every
-  nodal tracer transported, so requesting them also rules the shortcut out.
-
   Args:
     equation: the semi-Lagrangian equation.
     predictor_stage: whether the state being transported is a predictor
       stage's.
-    return_nodal_tracers_linear: whether low-order nodal tracers are
-      requested.
 
   Returns:
     True if passive tracers may be returned untransported.
   """
   return (
       predictor_stage
-      and not return_nodal_tracers_linear
       and all(
           _uses_library_method(equation, name)
           for name in (
@@ -2186,244 +2162,141 @@ def _split_passive_tracers(
   return state.replace(tracers=coupled), passive
 
 
-def _transport_dynamics_and_tracers_fused(
+def _transport_winds_temperature_and_tracers(
     equation: SemiLagrangianPrimitiveEquations
     | SemiLagrangianPrimitiveEquationsHybrid,
     departure: PrimitiveDeparturePoints,
     vertical_nodes: semi_lagrangian.VerticalNodes,
-    interpolator: semi_lagrangian.GridInterpolator,
     u: Array,
     v: Array,
     t_nodal: Array,
-    tracer_arrays: Sequence[Array],
-    nodal_names: Sequence[str],
-    return_nodal_tracers_linear: bool,
-) -> tuple[Array, Array, Array, Array, dict[str, Array]]:
-  """Interpolates winds, temperature and all tracers in one stacked pass.
+    tracers: Sequence[Array],
+    num_low_order: int,
+) -> tuple[Array, Array, Array, Sequence[Array], Sequence[Array]]:
+  """Interpolates winds, temperature and tracers at the departure points.
 
-  Applicable when dynamics are not limited and every tracer has the shape
-  and dtype of the temperature field: the Cartesian wind, `T′` and the
-  tracers then form one stacked field that a single interpolation serves.
+  Without a dynamics limiter the Cartesian wind, `T′` and the tracers are
+  one stack of fields served by a single interpolation, which limits the
+  tracers only. With `monotone_dynamics` the winds and `T′` go through the
+  limited transports (the bound on `T′` expressed in full temperature) and
+  the tracers through one of their own.
 
   Args:
     equation: the semi-Lagrangian equation.
     departure: departure points.
     vertical_nodes: vertical nodes the trajectories are expressed in.
-    interpolator: interpolator carrying the dynamics' order, method and
-      lateral window.
     u: nodal zonal wind at the arrival points.
     v: nodal meridional wind at the arrival points.
     t_nodal: nodal temperature variation at the arrival points.
-    tracer_arrays: nodal tracers: those carried modally first, then those
-      named by `nodal_names`.
-    nodal_names: names of the nodal-carried tracers, which end
-      `tracer_arrays`.
-    return_nodal_tracers_linear: whether to also interpolate the nodal-carried
-      tracers with the low-order (trilinear) scheme.
+    tracers: nodal tracers, each shaped like `t_nodal`.
+    num_low_order: the last `num_low_order` tracers are also interpolated
+      with the low-order (trilinear, unlimited) scheme.
 
   Returns:
-    `(u, v, temperature_variation, transported_tracers, nodal_tracers_linear)`:
-    the transported fields at the arrival points, with `transported_tracers`
-    stacked like `tracer_arrays`, and `nodal_tracers_linear` a dict keyed by
-    `nodal_names` (empty unless requested).
+    `(u, v, temperature_variation, tracers, low_order_tracers)` at the
+    arrival points; `tracers` is ordered like the input and
+    `low_order_tracers` like its last `num_low_order` entries.
   """
   grid = equation.coords.horizontal
-  lon_mesh, sin_lat_mesh = grid.nodal_mesh
-  wind = semi_lagrangian.cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
-  all_fields_in = jnp.concatenate(
-      [wind, t_nodal[jnp.newaxis, ...], jnp.stack(tracer_arrays, axis=0)],
-      axis=0,
-  )
-  need_tri = return_nodal_tracers_linear and bool(nodal_names)
-  n_modal = len(tracer_arrays) - len(nodal_names)
-  tri_start = (4 + n_modal) if need_tri else None
-  mixed_out = semi_lagrangian._interpolate_3d_mixed(
-      all_fields_in,
-      grid,
-      departure.full.lon,
-      departure.full.sin_lat,
-      departure.full.sigma,
-      sigma_nodes=vertical_nodes.centers,
-      order=interpolator.order,
-      limiter='quasi_monotone' if equation.monotone_tracers else None,
-      limited_channel_start=4,
-      trilinear_channel_start=tri_start,
+  options = dict(
       vertical_order=equation.vertical_interpolation_order,
-      method=interpolator.method,
-      max_lat_shift=interpolator.max_lat_shift,
       max_vertical_shift=equation.max_vertical_shift,
   )
-  nodal_tracers_linear = {}
-  if need_tri:
-    full_dep, nodal_lin_dep = mixed_out
-    nodal_lin_dep = semi_lagrangian._zero_nodal_padding(nodal_lin_dep, grid)
-    for idx, name in enumerate(nodal_names):
-      nodal_tracers_linear[name] = nodal_lin_dep[idx]
-  else:
-    full_dep = mixed_out
-  wt_dep = full_dep[:4]
-  u, v = semi_lagrangian._finish_wind_transport(
-      wt_dep[:3],
-      departure.full,
-      grid,
-      rotate=True,
-      planetary_rotation_rate=equation._planetary_rotation_rate,
+  wind_options = dict(
+      planetary_rotation_rate=equation._planetary_rotation_rate, **options
   )
-  temperature_variation = semi_lagrangian._zero_nodal_padding(wt_dep[3], grid)
-  transported_tracers = semi_lagrangian._zero_nodal_padding(full_dep[4:], grid)
-  return u, v, temperature_variation, transported_tracers, nodal_tracers_linear
 
-
-def _transport_dynamics_unfused(
-    equation: SemiLagrangianPrimitiveEquations
-    | SemiLagrangianPrimitiveEquationsHybrid,
-    departure: PrimitiveDeparturePoints,
-    vertical_nodes: semi_lagrangian.VerticalNodes,
-    interpolator: semi_lagrangian.GridInterpolator,
-    u: Array,
-    v: Array,
-    t_nodal: Array,
-) -> tuple[Array, Array, Array]:
-  """Interpolates winds and temperature, leaving the tracers to the caller.
-
-  Without a dynamics limiter the Cartesian wind and `T′` are interpolated
-  together in one pass. With `monotone_dynamics` (`interpolator` carries the
-  limiter) the wind and temperature go through the limited transports.
-
-  Args:
-    equation: the semi-Lagrangian equation.
-    departure: departure points.
-    vertical_nodes: vertical nodes the trajectories are expressed in.
-    interpolator: interpolator for the dynamics, including its limiter.
-    u: nodal zonal wind at the arrival points.
-    v: nodal meridional wind at the arrival points.
-    t_nodal: nodal temperature variation at the arrival points.
-
-  Returns:
-    `(u, v, temperature_variation)` at the arrival points.
-  """
-  grid = equation.coords.horizontal
-  if not interpolator.limiter:
-    lon_mesh, sin_lat_mesh = grid.nodal_mesh
-    wind = semi_lagrangian.cartesian_wind(u, v, lon_mesh, sin_lat_mesh)
-    wt_in = jnp.concatenate([wind, t_nodal[jnp.newaxis, ...]], axis=0)
-    wt_dep = semi_lagrangian.interpolate_3d(
-        wt_in,
+  def interpolator(limited: bool, order: str = equation.interpolation_order):
+    return semi_lagrangian.GridInterpolator(
         grid,
-        departure.full.lon,
-        departure.full.sin_lat,
-        departure.full.sigma,
-        sigma_nodes=vertical_nodes.centers,
-        order=interpolator.order,
-        limiter=None,
-        vertical_order=equation.vertical_interpolation_order,
-        method=interpolator.method,
-        max_lat_shift=interpolator.max_lat_shift,
-        max_vertical_shift=equation.max_vertical_shift,
-    )
-    u, v = semi_lagrangian._finish_wind_transport(
-        wt_dep[:3],
-        departure.full,
-        grid,
-        rotate=True,
-        planetary_rotation_rate=equation._planetary_rotation_rate,
-    )
-    temperature_variation = semi_lagrangian._zero_nodal_padding(
-        wt_dep[3], grid
-    )
-    return u, v, temperature_variation
-  u, v = semi_lagrangian.transport_wind(
-      u,
-      v,
-      departure.full,
-      vertical_nodes,
-      interpolator,
-      planetary_rotation_rate=equation._planetary_rotation_rate,
-      vertical_order=equation.vertical_interpolation_order,
-      max_vertical_shift=equation.max_vertical_shift,
-  )
-  temperature_variation = semi_lagrangian.transport_scalar(
-      t_nodal,
-      departure.full,
-      vertical_nodes,
-      interpolator,
-      vertical_order=equation.vertical_interpolation_order,
-      # with monotone dynamics, express the bound in full temperature:
-      # a T′ bound across levels with different T_ref is gauge-dependent.
-      limiter_bound_reference=jnp.asarray(equation.reference_temperature),
-      max_vertical_shift=equation.max_vertical_shift,
-  )
-  return u, v, temperature_variation
-
-
-def _transport_tracers_unfused(
-    equation: SemiLagrangianPrimitiveEquations
-    | SemiLagrangianPrimitiveEquationsHybrid,
-    departure: PrimitiveDeparturePoints,
-    vertical_nodes: semi_lagrangian.VerticalNodes,
-    tracer_arrays: Sequence[Array],
-    nodal_inputs: Sequence[Array],
-    nodal_names: Sequence[str],
-    return_nodal_tracers_linear: bool,
-) -> tuple[Array | None, dict[str, Array]]:
-  """Transports the stacked tracers on their own.
-
-  Args:
-    equation: the semi-Lagrangian equation.
-    departure: departure points.
-    vertical_nodes: vertical nodes the trajectories are expressed in.
-    tracer_arrays: nodal tracers: those carried modally first, then those
-      named by `nodal_names`.
-    nodal_inputs: the nodal-carried tracers, as stored in the state, in the
-      order of `nodal_names`.
-    nodal_names: names of the nodal-carried tracers.
-    return_nodal_tracers_linear: whether to also interpolate the nodal-carried
-      tracers with the low-order (linear) scheme.
-
-  Returns:
-    `(transported_tracers, nodal_tracers_linear)`: `transported_tracers` is
-    stacked like `tracer_arrays` (None if there are no tracers) and
-    `nodal_tracers_linear` a dict keyed by `nodal_names` (empty unless
-    requested).
-  """
-  if not tracer_arrays:
-    return None, {}
-  grid = equation.coords.horizontal
-  tracer_interpolator = semi_lagrangian.GridInterpolator(
-      grid,
-      equation.interpolation_order,
-      limiter='quasi_monotone' if equation.monotone_tracers else None,
-      method=equation.interpolation_method,
-      max_lat_shift=equation.max_lat_shift,
-  )
-  transported = semi_lagrangian.transport_scalar(
-      jnp.stack(tracer_arrays, axis=0),
-      departure=departure.full,
-      vertical=vertical_nodes,
-      interpolator=tracer_interpolator,
-      vertical_order=equation.vertical_interpolation_order,
-      max_vertical_shift=equation.max_vertical_shift,
-  )
-  nodal_tracers_linear = {}
-  if return_nodal_tracers_linear and nodal_names:
-    low_interpolator = semi_lagrangian.GridInterpolator(
-        grid,
-        'linear',
-        limiter=None,
+        order,
+        'quasi_monotone' if limited else None,
         method=equation.interpolation_method,
         max_lat_shift=equation.max_lat_shift,
     )
-    nodal_lin_dep = semi_lagrangian.transport_scalar(
-        jnp.stack([jnp.asarray(x) for x in nodal_inputs], axis=0),
-        departure=departure.full,
-        vertical=vertical_nodes,
-        interpolator=low_interpolator,
+
+  low_order_start = len(tracers) - num_low_order
+  single_stack = (
+      not equation.monotone_dynamics
+      and bool(tracers)
+      and all(
+          a.shape == t_nodal.shape and a.dtype == t_nodal.dtype
+          for a in tracers
+      )
+  )
+  if single_stack:
+    transported = semi_lagrangian.transport_wind_and_scalars(
+        u,
+        v,
+        jnp.stack([t_nodal, *tracers], axis=0),
+        departure.full,
+        vertical_nodes,
+        interpolator(limited=equation.monotone_tracers),
+        limited_scalar_start=1,
+        low_order_scalar_start=(
+            1 + low_order_start if num_low_order else None
+        ),
+        **wind_options,
+    )
+    return (
+        transported.u,
+        transported.v,
+        transported.scalars[0],
+        transported.scalars[1:],
+        transported.low_order_scalars,
+    )
+
+  if equation.monotone_dynamics:
+    u, v = semi_lagrangian.transport_wind(
+        u,
+        v,
+        departure.full,
+        vertical_nodes,
+        interpolator(limited=True),
+        **wind_options,
+    )
+    temperature_variation = semi_lagrangian.transport_scalar(
+        t_nodal,
+        departure.full,
+        vertical_nodes,
+        interpolator(limited=True),
+        # express the bound in full temperature: a T′ bound across levels
+        # with different T_ref is gauge-dependent.
+        limiter_bound_reference=jnp.asarray(equation.reference_temperature),
+        **options,
+    )
+  else:
+    transported = semi_lagrangian.transport_wind_and_scalars(
+        u,
+        v,
+        t_nodal[jnp.newaxis, ...],
+        departure.full,
+        vertical_nodes,
+        interpolator(limited=False),
+        **wind_options,
+    )
+    u, v = transported.u, transported.v
+    temperature_variation = transported.scalars[0]
+  if not tracers:
+    return u, v, temperature_variation, (), ()
+  transported_tracers = semi_lagrangian.transport_scalar(
+      jnp.stack(tracers, axis=0),
+      departure.full,
+      vertical_nodes,
+      interpolator(limited=equation.monotone_tracers),
+      **options,
+  )
+  low_order_tracers = ()
+  if num_low_order:
+    low_order_tracers = semi_lagrangian.transport_scalar(
+        jnp.stack(tracers[low_order_start:], axis=0),
+        departure.full,
+        vertical_nodes,
+        interpolator(limited=False, order='linear'),
         vertical_order='linear',
         max_vertical_shift=equation.max_vertical_shift,
     )
-    for idx, name in enumerate(nodal_names):
-      nodal_tracers_linear[name] = nodal_lin_dep[idx]
-  return transported, nodal_tracers_linear
+  return u, v, temperature_variation, transported_tracers, low_order_tracers
 
 
 def _transport_log_surface_pressure(
@@ -2431,10 +2304,16 @@ def _transport_log_surface_pressure(
     | SemiLagrangianPrimitiveEquationsHybrid,
     log_surface_pressure: Array,
     departure: PrimitiveDeparturePoints,
-    interpolator: semi_lagrangian.GridInterpolator,
 ) -> Array:
   """Transports modal `ln pₛ` along the 2-D trajectories; returns it nodal."""
   grid = equation.coords.horizontal
+  interpolator = semi_lagrangian.GridInterpolator(
+      grid,
+      equation.interpolation_order,
+      'quasi_monotone' if equation.monotone_dynamics else None,
+      method=equation.interpolation_method,
+      max_lat_shift=equation.max_lat_shift,
+  )
   log_sp_nodal = grid.to_nodal(log_surface_pressure)
   if equation.terrain_smoothed_log_sp:
     # interpolate the smoothed variable ψ = ln pₛ + C: the terrain-locked
@@ -2496,6 +2375,85 @@ def _reassemble_modal_state(
   return grid.clip_wavenumbers(transported)
 
 
+def _transport_state(
+    equation: SemiLagrangianPrimitiveEquations
+    | SemiLagrangianPrimitiveEquationsHybrid,
+    state: State,
+    departure: PrimitiveDeparturePoints,
+    vertical_nodes: semi_lagrangian.VerticalNodes,
+    *,
+    predictor_stage: bool,
+    with_low_order_tracers: bool,
+) -> tuple[State, dict[str, jnp.ndarray]]:
+  """Transports a state; see the two `_semi_lagrangian_transport*` functions.
+
+  Returns `(state, low_order_nodal_tracers)`; the dict is empty unless
+  `with_low_order_tracers`.
+  """
+  passthrough_tracers = {}
+  # The low-order fields need every nodal tracer transported.
+  if not with_low_order_tracers and _passive_tracers_skip_transport(
+      equation, predictor_stage=predictor_stage
+  ):
+    state, passthrough_tracers = _split_passive_tracers(equation, state)
+
+  grid = equation.coords.horizontal
+  modal_names = [
+      name for name in state.tracers if name not in equation.nodal_tracers
+  ]
+  nodal_names = [
+      name for name in state.tracers if name in equation.nodal_tracers
+  ]
+  u, v = spherical_harmonic.vor_div_to_uv_nodal(
+      grid, state.vorticity, state.divergence, clip=False
+  )
+  # Tracers carried modally first, then the nodal ones, which never touch the
+  # spectral basis: their grid values are transported directly.
+  tracers = [
+      *(grid.to_nodal(state.tracers[k]) for k in modal_names),
+      *(jnp.asarray(state.tracers[k]) for k in nodal_names),
+  ]
+  u, v, temperature_variation, tracers, low_order = (
+      _transport_winds_temperature_and_tracers(
+          equation,
+          departure,
+          vertical_nodes,
+          u,
+          v,
+          grid.to_nodal(state.temperature_variation),
+          tracers,
+          num_low_order=len(nodal_names) if with_low_order_tracers else 0,
+      )
+  )
+  log_surface_pressure = _transport_log_surface_pressure(
+      equation, state.log_surface_pressure, departure
+  )
+
+  num_modal = len(modal_names)
+  transported = _reassemble_modal_state(
+      grid,
+      u,
+      v,
+      temperature_variation,
+      log_surface_pressure,
+      tuple(tracers[i] for i in range(num_modal)),
+      modal_names,
+      state.sim_time,
+  )
+  nodal_tracers = {
+      name: tracers[num_modal + i] for i, name in enumerate(nodal_names)
+  }
+  low_order_tracers = {
+      name: low_order[i]
+      for i, name in enumerate(nodal_names)
+      if with_low_order_tracers
+  }
+  result = transported.replace(
+      tracers={**transported.tracers, **nodal_tracers, **passthrough_tracers}
+  )
+  return result, low_order_tracers
+
+
 def _semi_lagrangian_transport(
     equation: SemiLagrangianPrimitiveEquations
     | SemiLagrangianPrimitiveEquationsHybrid,
@@ -2503,9 +2461,8 @@ def _semi_lagrangian_transport(
     departure: PrimitiveDeparturePoints,
     vertical_nodes: semi_lagrangian.VerticalNodes,
     *,
-    return_nodal_tracers_linear: bool = False,
     predictor_stage: bool = False,
-) -> State | tuple[State, dict[str, jnp.ndarray]]:
+) -> State:
   """Remaps the advected representation of a modal state-like pytree.
 
   Winds, temperature and tracers are interpolated at `departure` in nodal
@@ -2517,117 +2474,57 @@ def _semi_lagrangian_transport(
     state: state-like pytree to transport.
     departure: departure points.
     vertical_nodes: vertical nodes the trajectories are expressed in.
-    return_nodal_tracers_linear: if True, also return the nodal tracers
-      interpolated with the low-order scheme, as a second result.
     predictor_stage: whether `state` is a predictor stage's, which allows
       passive tracers to be returned untransported (see
       `_passive_tracers_skip_transport`).
 
   Returns:
-    The transported state, or `(state, nodal_tracers_linear)` when
-    `return_nodal_tracers_linear` is True.
+    The transported state.
   """
-  passthrough_tracers = {}
-  if _passive_tracers_skip_transport(
+  transported, _ = _transport_state(
       equation,
+      state,
+      departure,
+      vertical_nodes,
       predictor_stage=predictor_stage,
-      return_nodal_tracers_linear=return_nodal_tracers_linear,
-  ):
-    state, passthrough_tracers = _split_passive_tracers(equation, state)
+      with_low_order_tracers=False,
+  )
+  return transported
 
-  grid = equation.coords.horizontal
-  dynamics_limiter = 'quasi_monotone' if equation.monotone_dynamics else None
-  interpolator = semi_lagrangian.GridInterpolator(
-      grid,
-      equation.interpolation_order,
-      dynamics_limiter,
-      method=equation.interpolation_method,
-      max_lat_shift=equation.max_lat_shift,
-  )
-  modal_names = [
-      name for name in state.tracers if name not in equation.nodal_tracers
-  ]
-  nodal_names = [
-      name for name in state.tracers if name in equation.nodal_tracers
-  ]
-  u, v = spherical_harmonic.vor_div_to_uv_nodal(
-      grid, state.vorticity, state.divergence, clip=False
-  )
-  t_nodal = grid.to_nodal(state.temperature_variation)
-  nodal_inputs = [state.tracers[k] for k in nodal_names]
-  tracer_arrays = [
-      *(grid.to_nodal(state.tracers[k]) for k in modal_names),
-      *(jnp.asarray(x) for x in nodal_inputs),
-  ]
-  can_fuse_tracers = (
-      not dynamics_limiter
-      and bool(tracer_arrays)
-      and all(
-          a.shape == t_nodal.shape and a.dtype == t_nodal.dtype
-          for a in tracer_arrays
-      )
-  )
 
-  if can_fuse_tracers:
-    u, v, temperature_variation, transported_all, nodal_tracers_linear = (
-        _transport_dynamics_and_tracers_fused(
-            equation,
-            departure,
-            vertical_nodes,
-            interpolator,
-            u,
-            v,
-            t_nodal,
-            tracer_arrays,
-            nodal_names,
-            return_nodal_tracers_linear,
-        )
-    )
-  else:
-    u, v, temperature_variation = _transport_dynamics_unfused(
-        equation, departure, vertical_nodes, interpolator, u, v, t_nodal
-    )
-    transported_all, nodal_tracers_linear = _transport_tracers_unfused(
-        equation,
-        departure,
-        vertical_nodes,
-        tracer_arrays,
-        nodal_inputs,
-        nodal_names,
-        return_nodal_tracers_linear,
-    )
+def _semi_lagrangian_transport_with_low_order_tracers(
+    equation: SemiLagrangianPrimitiveEquations
+    | SemiLagrangianPrimitiveEquationsHybrid,
+    state: State,
+    departure: PrimitiveDeparturePoints,
+    vertical_nodes: semi_lagrangian.VerticalNodes,
+) -> tuple[State, dict[str, jnp.ndarray]]:
+  """Transports `state` and also interpolates its nodal tracers to low order.
 
-  log_surface_pressure = _transport_log_surface_pressure(
-      equation, state.log_surface_pressure, departure, interpolator
-  )
+  The first result is that of `_semi_lagrangian_transport`. The second holds,
+  for every tracer in `equation.nodal_tracers`, its trilinear (unlimited)
+  interpolation at the same departure points. A tracer mass fixer of the
+  Bermejo-Conde type weights its correction by the difference between the
+  two interpolants; computing both here shares the stencil search and the
+  values read (see `semi_lagrangian.transport_wind_and_scalars`).
 
-  n_modal = len(modal_names)
-  transported = _reassemble_modal_state(
-      grid,
-      u,
-      v,
-      temperature_variation,
-      log_surface_pressure,
-      ()
-      if transported_all is None
-      else tuple(transported_all[i] for i in range(n_modal)),
-      modal_names,
-      state.sim_time,
+  Args:
+    equation: the semi-Lagrangian equation.
+    state: state-like pytree to transport.
+    departure: departure points.
+    vertical_nodes: vertical nodes the trajectories are expressed in.
+
+  Returns:
+    `(transported_state, low_order_nodal_tracers)`.
+  """
+  return _transport_state(
+      equation,
+      state,
+      departure,
+      vertical_nodes,
+      predictor_stage=False,
+      with_low_order_tracers=True,
   )
-  nodal_tracers = (
-      {}
-      if transported_all is None
-      else {
-          name: transported_all[n_modal + idx]
-          for idx, name in enumerate(nodal_names)
-      }
-  )
-  result = transported.replace(
-      tracers={**transported.tracers, **nodal_tracers, **passthrough_tracers}
-  )
-  if return_nodal_tracers_linear:
-    return result, nodal_tracers_linear
-  return result
 
 
 @dataclasses.dataclass
@@ -2767,8 +2664,12 @@ class SemiLagrangianPrimitiveEquations(
   interpolation_method: semi_lagrangian.InterpolationMethod | None = (
       dataclasses.field(default=None, kw_only=True)
   )
-  max_lat_shift: int | None = dataclasses.field(default=6, kw_only=True)
-  max_vertical_shift: int | None = dataclasses.field(default=6, kw_only=True)
+  max_lat_shift: int | None = dataclasses.field(
+      default=semi_lagrangian.DEFAULT_MAX_SHIFT, kw_only=True
+  )
+  max_vertical_shift: int | None = dataclasses.field(
+      default=semi_lagrangian.DEFAULT_MAX_SHIFT, kw_only=True
+  )
 
   def __post_init__(self):
     super().__post_init__()
@@ -2776,9 +2677,9 @@ class SemiLagrangianPrimitiveEquations(
       raise ValueError(f'unknown {self.coriolis_mode=}')
     if self.vertical_interpolation_order not in ('linear', 'cubic'):
       raise ValueError(f'unknown {self.vertical_interpolation_order=}')
-    semi_lagrangian._validate_interpolation_method(self.interpolation_method)
-    semi_lagrangian._validate_window_shift('max_lat_shift', self.max_lat_shift)
-    semi_lagrangian._validate_window_shift(
+    semi_lagrangian.validate_interpolation_method(self.interpolation_method)
+    semi_lagrangian.validate_window_shift('max_lat_shift', self.max_lat_shift)
+    semi_lagrangian.validate_window_shift(
         'max_vertical_shift', self.max_vertical_shift
     )
 
@@ -2856,6 +2757,29 @@ class SemiLagrangianPrimitiveEquations(
         departure,
         self._vertical_nodes,
         predictor_stage=predictor_stage,
+    )
+
+  @jax.named_call
+  def semi_lagrangian_transport_with_low_order_tracers(
+      self,
+      state: State,
+      departure: PrimitiveDeparturePoints,
+  ) -> tuple[State, dict[str, jnp.ndarray]]:
+    """Transports `state` and also interpolates its nodal tracers to low order.
+
+    Args:
+      state: modal state-like pytree to transport.
+      departure: departure points from `departure_points`.
+
+    Returns:
+      `(transported, low_order_nodal_tracers)`: what
+      `semi_lagrangian_transport` returns, and for every tracer in
+      `nodal_tracers` its trilinear, unlimited interpolation at the same
+      departure points (the low-order interpolant a Bermejo-Conde type mass
+      fixer compares the transported tracer with).
+    """
+    return _semi_lagrangian_transport_with_low_order_tracers(
+        self, state, departure, self._vertical_nodes
     )
 
 
@@ -4400,8 +4324,12 @@ class SemiLagrangianPrimitiveEquationsHybrid(
   interpolation_method: semi_lagrangian.InterpolationMethod | None = (
       dataclasses.field(default=None, kw_only=True)
   )
-  max_lat_shift: int | None = dataclasses.field(default=6, kw_only=True)
-  max_vertical_shift: int | None = dataclasses.field(default=6, kw_only=True)
+  max_lat_shift: int | None = dataclasses.field(
+      default=semi_lagrangian.DEFAULT_MAX_SHIFT, kw_only=True
+  )
+  max_vertical_shift: int | None = dataclasses.field(
+      default=semi_lagrangian.DEFAULT_MAX_SHIFT, kw_only=True
+  )
 
   def __post_init__(self):
     super().__post_init__()
@@ -4409,9 +4337,9 @@ class SemiLagrangianPrimitiveEquationsHybrid(
       raise ValueError(f'unknown {self.coriolis_mode=}')
     if self.vertical_interpolation_order not in ('linear', 'cubic'):
       raise ValueError(f'unknown {self.vertical_interpolation_order=}')
-    semi_lagrangian._validate_interpolation_method(self.interpolation_method)
-    semi_lagrangian._validate_window_shift('max_lat_shift', self.max_lat_shift)
-    semi_lagrangian._validate_window_shift(
+    semi_lagrangian.validate_interpolation_method(self.interpolation_method)
+    semi_lagrangian.validate_window_shift('max_lat_shift', self.max_lat_shift)
+    semi_lagrangian.validate_window_shift(
         'max_vertical_shift', self.max_vertical_shift
     )
 
@@ -4482,6 +4410,29 @@ class SemiLagrangianPrimitiveEquationsHybrid(
         departure,
         self._reference_vertical_nodes,
         predictor_stage=predictor_stage,
+    )
+
+  @jax.named_call
+  def semi_lagrangian_transport_with_low_order_tracers(
+      self,
+      state: State,
+      departure: PrimitiveDeparturePoints,
+  ) -> tuple[State, dict[str, jnp.ndarray]]:
+    """Transports `state` and also interpolates its nodal tracers to low order.
+
+    Args:
+      state: modal state-like pytree to transport.
+      departure: departure points from `departure_points`.
+
+    Returns:
+      `(transported, low_order_nodal_tracers)`: what
+      `semi_lagrangian_transport` returns, and for every tracer in
+      `nodal_tracers` its trilinear, unlimited interpolation at the same
+      departure points (the low-order interpolant a Bermejo-Conde type mass
+      fixer compares the transported tracer with).
+    """
+    return _semi_lagrangian_transport_with_low_order_tracers(
+        self, state, departure, self._reference_vertical_nodes
     )
 
 

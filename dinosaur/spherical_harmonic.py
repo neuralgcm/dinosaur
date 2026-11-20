@@ -1182,6 +1182,54 @@ class Grid:
   def nodal_padding(self) -> tuple[int, int]:
     return self.spherical_harmonics.nodal_padding
 
+
+  def pad_nodal(self, x: Array) -> Array:
+    """Zero-pads a nodal array that was given without the nodal padding.
+
+    Args:
+      x: array whose two trailing axes have shape `nodal_shape`, or the
+        unpadded shape `(longitude_nodes, latitude_nodes)`.
+
+    Returns:
+      `x` with trailing shape `nodal_shape`: as given in the first case,
+      extended with zeros over `nodal_padding` in the second.
+    """
+    unpadded_shape = (self.longitude_nodes, self.latitude_nodes)
+    if x.shape[-2:] == self.nodal_shape:
+      return x
+    if x.shape[-2:] != unpadded_shape:
+      raise ValueError(
+          f'expected a nodal array with trailing shape {self.nodal_shape} or'
+          f' {unpadded_shape}; got {x.shape}'
+      )
+    pad_x, pad_y = self.nodal_padding
+    return jnp.pad(x, [(0, 0)] * (x.ndim - 2) + [(0, pad_x), (0, pad_y)])
+
+  def zero_nodal_padding(self, x: Array) -> jnp.ndarray:
+    """Zeros the entries of a nodal array that lie in the nodal padding.
+
+    Nodal operations that are not transforms (e.g. interpolation) may leave
+    arbitrary values at the padded nodes; this restores the zeros there.
+
+    Args:
+      x: array whose two trailing axes have shape `nodal_shape`. An array
+        with any other trailing shape (e.g. values at a set of points) has
+        no padding and is returned as it is.
+
+    Returns:
+      `x` with zeros at the nodes beyond `(longitude_nodes, latitude_nodes)`.
+    """
+    x = jnp.asarray(x)
+    pad_x, pad_y = self.nodal_padding
+    if (pad_x == 0 and pad_y == 0) or x.shape[-2:] != self.nodal_shape:
+      return x
+    nx, ny = self.nodal_shape
+    valid = jnp.ones((nx, ny), dtype=bool)
+    if pad_x:
+      valid = valid & (jnp.arange(nx)[:, jnp.newaxis] < self.longitude_nodes)
+    if pad_y:
+      valid = valid & (jnp.arange(ny)[jnp.newaxis, :] < self.latitude_nodes)
+    return jnp.where(valid, x, 0)
   @functools.cached_property
   def nodal_mesh(self) -> tuple[np.ndarray, np.ndarray]:
     return np.meshgrid(*self.nodal_axes, indexing='ij')
