@@ -388,6 +388,34 @@ def _resolve_rhs_binary_dot_precision(
   return jax_numpy_utils.resolve_dot_precision(None, lhs, rhs)
 
 
+def _select_last_axis(
+    values: jax.Array, selector: jax.Array, is_tpu: bool
+) -> jax.Array:
+  """Contracts the last axis of `values` with an exact 0/1 `selector`.
+
+  The selector is the right operand on purpose. On TPU it runs at bfloat16
+  operand precision, which is exact for 0/1 entries, while `values` keep full
+  float32 precision. JAX transposes a dot product by putting the cotangent in
+  the left slot under the same per-operand precision, so with the selector on
+  the left (`('bfloat16', 'highest')`) the reverse-mode gradient with respect
+  to `values` is rounded to bfloat16.
+
+  Args:
+    values: [..., n] array.
+    selector: [m, n] matrix of zeros and ones.
+    is_tpu: whether the computation targets TPUs.
+
+  Returns:
+    [..., m], `values[..., newaxis, :] * selector` summed over the last axis.
+  """
+  return lax.dot_general(
+      values,
+      selector,
+      (((values.ndim - 1,), (1,)), ((), ())),
+      precision=_resolve_rhs_binary_dot_precision(values, selector, is_tpu),
+  )
+
+
 def _gather_lat_with_halo(
     f_x: jax.Array,
     grid: spherical_harmonic.Grid,
@@ -625,9 +653,7 @@ def interpolate_2d_points(
     sin_lat_flat = jnp.pad(sin_lat_flat, [(0, q_padded - q_total)], mode='edge')
 
   dot_prec_f32 = jax_numpy_utils.resolve_dot_precision(None, f_ext, f_ext)
-  dot_prec_bf16 = jax_numpy_utils.resolve_dot_precision(
-      None, f_ext, f_ext, lhs_exact_in_bf16=True
-  )
+  is_tpu = lagrange_interpolation.targets_tpu(grid)
   f_2d = f_ext.reshape(c_total * n_lon, n_lat_ext)
   bounds_2d = None
   if limiter is not None:
@@ -660,9 +686,9 @@ def interpolate_2d_points(
 
     if limiter is not None:
       p_lat_mat = jax.nn.one_hot(lat_cell0, n_lat_ext - 1, dtype=dtype)
-      b_at_lat = jnp.dot(
-          p_lat_mat, bounds_2d.T, precision=dot_prec_bf16
-      ).reshape(lon_q.shape[0], 2 * c_total, n_lon)
+      b_at_lat = _select_last_axis(bounds_2d, p_lat_mat, is_tpu).T.reshape(
+          lon_q.shape[0], 2 * c_total, n_lon
+      )
       p_lon_mat = jax.nn.one_hot(lon_cell0, n_lon, dtype=dtype)
       b_val = (b_at_lat * p_lon_mat[:, jnp.newaxis, :]).sum(axis=-1).T
       val = jnp.clip(val, b_val[:c_total], b_val[c_total:])
@@ -745,9 +771,6 @@ def _matmul_2d_local(
   )  # [w_lat_size, ny_loc, n_lat_buf]
   m_lat_2d_t = m_lat_win.reshape(w_lat_size * ny_loc, n_lat_buf).T
 
-  dot_prec_lhs_bf16 = jax_numpy_utils.resolve_dot_precision(
-      None, m_lat_win, f_buf, lhs_exact_in_bf16=True
-  )
   dot_prec_rhs_bf16 = _resolve_rhs_binary_dot_precision(
       f_buf, m_lat_2d_t, lagrange_interpolation.targets_tpu(grid)
   )
@@ -827,9 +850,14 @@ def _matmul_2d_local(
           .reshape(n_lon, 2 * c_cur * w_lat_cell_size, ny_loc)
           .transpose(2, 0, 1)
       )
-      b_lon = jnp.einsum(
-          'jim,jmk->jik', p_lon_mat, b_lat_win, precision=dot_prec_lhs_bf16
-      )
+      # [ny_loc, K, nx_loc] -> [ny_loc, nx_loc, K]; the one-hot is the right
+      # operand so that gradients keep full precision (`_select_last_axis`).
+      b_lon = lax.dot_general(
+          b_lat_win,
+          p_lon_mat,
+          (((1,), (2,)), ((0,), (0,))),
+          precision=dot_prec_rhs_bf16,
+      ).transpose(0, 2, 1)
       b_val = (
           (
               b_lon.reshape(ny_loc, nx_loc, 2 * c_cur, w_lat_cell_size)
@@ -1062,9 +1090,6 @@ def interpolate_3d_points(
     sigma_flat = jnp.pad(sigma_flat, pad_w, mode='edge')
 
   dot_prec_f32 = jax_numpy_utils.resolve_dot_precision(None, f_ext, f_ext)
-  dot_prec_bf16 = jax_numpy_utils.resolve_dot_precision(
-      None, f_ext, f_ext, lhs_exact_in_bf16=True
-  )
 
   ref_centered = None
   if limiter is not None and limiter_bound_reference is not None:
@@ -1135,7 +1160,7 @@ def interpolate_3d_points(
 
       def _accum_bounds(acc, inp):
         b_l, p_z_l = inp
-        b_at_lat = jnp.dot(p_lat_mat, b_l.T, precision=dot_prec_bf16).reshape(
+        b_at_lat = _select_last_axis(b_l, p_lat_mat, is_tpu).T.reshape(
             q_len, 2 * c_total, n_lon
         )
         b_val_l = (b_at_lat * p_lon_mat[:, jnp.newaxis, :]).sum(axis=-1)
@@ -1854,7 +1879,7 @@ def _project_lat_window(
     stack: jax.Array,
     m_lat_2d: jax.Array,
     window_size: int,
-    precision: jax.lax.PrecisionLike,
+    is_tpu: bool,
 ) -> jax.Array:
   """Restricts a stack of fields to the latitude window of each arrival row.
 
@@ -1872,8 +1897,7 @@ def _project_lat_window(
     m_lat_2d: selector [ny_loc * window_size, n_lat] from
       `_lat_window_selector`.
     window_size: rows per window.
-    precision: dot precision; the selector is exactly representable in
-      bfloat16.
+    is_tpu: whether the computation targets TPUs.
 
   Returns:
     [ny_loc, L, K_pad, n_lon], `K_pad = round_up(C * window_size, 8)`.
@@ -1882,14 +1906,14 @@ def _project_lat_window(
   ny_loc = m_lat_2d.shape[0] // window_size
   k_raw = num_channels * window_size
   k_pad = _round_to_multiple(k_raw, _TPU_SUBLANES)
-  stack_2d_t = (
-      stack.swapaxes(0, 1)
-      .reshape(num_levels * num_channels, n_lon, n_lat)
-      .transpose(2, 0, 1)
-      .reshape(n_lat, num_levels * num_channels * n_lon)
+  stack_3d = stack.swapaxes(0, 1).reshape(
+      num_levels * num_channels, n_lon, n_lat
   )
+  # The window rows leave the minor axis before they are split off it, so
+  # that no intermediate has `window_size` in the lanes.
   projected = (
-      jnp.dot(m_lat_2d, stack_2d_t, precision=precision)
+      _select_last_axis(stack_3d, m_lat_2d, is_tpu)
+      .transpose(2, 0, 1)
       .reshape(ny_loc, window_size, num_levels * num_channels, n_lon)
       .transpose(0, 2, 1, 3)
       .reshape(ny_loc, num_levels, k_raw, n_lon)
@@ -1931,8 +1955,6 @@ class _Matmul3DOperands:
     sig_hi_arr: [l_q_loc] upper σ clamp per query level.
     m_arange: [n_lon, 1] longitude positions.
     lat_arange: [w_lat_size, 1] latitude window positions.
-    dot_prec_lhs_bf16: dot precision for products whose left operand is a
-      selector that is exact in bfloat16.
     dot_prec_rhs_binary: dot precision for products whose right operand is an
       exact 0/1 matrix.
     dot_prec_f32: dot precision for the field contractions.
@@ -1958,7 +1980,6 @@ class _Matmul3DOperands:
   sig_hi_arr: jax.Array
   m_arange: jax.Array
   lat_arange: jax.Array
-  dot_prec_lhs_bf16: jax.lax.PrecisionLike
   dot_prec_rhs_binary: jax.lax.PrecisionLike
   dot_prec_f32: jax.lax.PrecisionLike
   dot_prec_tri: jax.lax.PrecisionLike
@@ -2689,7 +2710,7 @@ def _matmul_3d_channel_chunk(
   ny_loc = plan.ny_loc
   chunk = _channel_chunk(plan, f_chunk.shape[0], lim_start, tri_start)
   f_lat = _project_lat_window(
-      f_chunk, ops.m_lat_2d, plan.w_lat_size, ops.dot_prec_lhs_bf16
+      f_chunk, ops.m_lat_2d, plan.w_lat_size, plan.is_tpu
   )
 
   b_lat = None
@@ -2704,16 +2725,15 @@ def _matmul_3d_channel_chunk(
     lo_buf, hi_buf = lagrange_interpolation.cell_bounds_3d(f_for_bounds)
     # The bounds must reach the clip unrounded, or a constant field (or the
     # zero of a non-negative one) would not stay inside its own bounds. Both
-    # matmuls that select them have one exact 0/1 operand and keep the other
-    # at full float32 precision: this one (binary selector on the left) and
-    # the longitude selection in `_limit_block_values` (binary one-hot on the
-    # right). The remaining selections there are elementwise products with
-    # 0/1 masks, summed over a single non-zero term.
+    # matmuls that select them have an exact 0/1 right operand and keep the
+    # left one at full float32 precision: this one and the longitude
+    # selection in `_limit_block_values`. The remaining selections there are
+    # elementwise products with 0/1 masks, summed over a single non-zero term.
     b_lat = _project_lat_window(
         jnp.concatenate([lo_buf, hi_buf], axis=0),
         ops.m_lat_cell_2d,
         plan.w_lat_cell_size,
-        ops.dot_prec_lhs_bf16,
+        plan.is_tpu,
     )
 
   no_trilinear = (
@@ -2918,9 +2938,6 @@ def _matmul_3d_local(
       buf_lat_origin,
       dtype,
   )
-  dot_prec_lhs_bf16 = jax_numpy_utils.resolve_dot_precision(
-      None, m_lat_2d, f_buf, lhs_exact_in_bf16=True
-  )
   dot_prec_f32 = jax_numpy_utils.resolve_dot_precision(None, f_buf, f_buf)
 
   ref_buf = None
@@ -2970,7 +2987,6 @@ def _matmul_3d_local(
       sig_hi_arr=sig_hi_arr,
       m_arange=jnp.arange(plan.n_lon, dtype=jnp.int32)[:, jnp.newaxis],
       lat_arange=jnp.arange(plan.w_lat_size, dtype=jnp.int32)[:, jnp.newaxis],
-      dot_prec_lhs_bf16=dot_prec_lhs_bf16,
       dot_prec_rhs_binary=_resolve_rhs_binary_dot_precision(
           f_buf, m_lat_2d, plan.is_tpu
       ),
@@ -3201,20 +3217,15 @@ def _matmul_3d_wind_and_sigma_dot_local(
       dtype,
   )
 
-  dot_prec_lhs_bf16 = jax_numpy_utils.resolve_dot_precision(
-      None, m_lat_2d, wind_buf, lhs_exact_in_bf16=True
-  )
   dot_prec_f32 = jax_numpy_utils.resolve_dot_precision(None, wind_buf, wind_buf)
 
   # [ny_loc, level, K_pad, n_lon], see `_project_lat_window`.
   k_w_raw = 3 * w_lat_size
   k_w_pad = _round_to_multiple(k_w_raw, _TPU_SUBLANES)
-  wind_lat = _project_lat_window(
-      wind_buf, m_lat_2d, w_lat_size, dot_prec_lhs_bf16
-  )
+  wind_lat = _project_lat_window(wind_buf, m_lat_2d, w_lat_size, is_tpu)
   k_sd_raw = w_lat_size
   k_sd_pad = _round_to_multiple(k_sd_raw, _TPU_SUBLANES)
-  sd_lat = _project_lat_window(sd_buf, m_lat_2d, w_lat_size, dot_prec_lhs_bf16)
+  sd_lat = _project_lat_window(sd_buf, m_lat_2d, w_lat_size, is_tpu)
 
   lon_q_t = jnp.swapaxes(lon_q, 1, 2)
   sin_lat_q_t = jnp.swapaxes(sin_lat_q, 1, 2)

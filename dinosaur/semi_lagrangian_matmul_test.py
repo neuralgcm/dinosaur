@@ -21,6 +21,7 @@ from absl.testing import parameterized
 from dinosaur import lagrange_interpolation
 from dinosaur import semi_lagrangian_matmul
 from dinosaur import spherical_harmonic
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -105,6 +106,39 @@ class WindowArithmeticTest(parameterized.TestCase):
     np.testing.assert_array_equal(
         actual, [[0.25, 0.75, 0.0, 0.0], [0.0, 0.0, 0.5, 0.5]]
     )
+
+
+class SelectorProductTest(parameterized.TestCase):
+
+  def test_select_last_axis(self):
+    rng = np.random.RandomState(0)
+    values = jnp.asarray(rng.normal(size=(3, 4, 7)), jnp.float32)
+    rows = np.array([6, 0, 0, 3, 5])
+    selector = jnp.asarray(np.eye(7)[rows], jnp.float32)
+    for is_tpu in (False, True):
+      np.testing.assert_array_equal(
+          semi_lagrangian_matmul._select_last_axis(values, selector, is_tpu),
+          values[..., rows],
+      )
+
+  def test_select_last_axis_keeps_cotangents_at_full_precision(self):
+    # JAX transposes a dot product with the cotangent as the left operand and
+    # the per-operand precision unchanged, so the operand that may be rounded
+    # to bfloat16 on TPU has to be the selector, on the right, in the forward
+    # product and in its transpose.
+    values = jnp.ones((3, 4, 7), jnp.float32)
+    selector = jnp.asarray(np.eye(5, 7), jnp.float32)
+
+    def loss(x):
+      out = semi_lagrangian_matmul._select_last_axis(x, selector, True)
+      return jnp.sum(out**2)
+
+    jaxpr = jax.make_jaxpr(jax.grad(loss))(values).jaxpr
+    dots = [e for e in jaxpr.eqns if e.primitive.name == 'dot_general']
+    self.assertLen(dots, 2)
+    for eqn in dots:
+      self.assertEqual(eqn.invars[1].aval.shape, selector.shape)
+      self.assertEqual(eqn.params['precision'][0], jax.lax.Precision.HIGHEST)
 
 
 class PlannerTest(parameterized.TestCase):

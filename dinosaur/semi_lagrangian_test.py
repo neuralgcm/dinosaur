@@ -809,8 +809,13 @@ class MatmulInterpolationTest(parameterized.TestCase):
         np.testing.assert_allclose(
             actual.scalars[1:], expected_limited[1:], **tol
         )
+        # On a real TPU the trilinear contraction runs at 3-pass bfloat16
+        # precision.
         np.testing.assert_allclose(
-            actual.low_order_scalars, expected_low_order[2:], **tol
+            actual.low_order_scalars,
+            expected_low_order[2:],
+            rtol=1e-4,
+            atol=1e-4,
         )
         # The result has the same fields whether or not a low-order
         # interpolation is requested.
@@ -1358,7 +1363,9 @@ class WindowClampTest(parameterized.TestCase):
           high_m, low_m = mixed('matmul')
         scale = float(jnp.max(fields))
         self._assert_close(high_m, high_g, scale)
-        self._assert_close(low_m, low_g, scale, rel=2e-5)
+        # On a real TPU the trilinear contraction runs at 3-pass bfloat16
+        # precision (about 2e-5 relative).
+        self._assert_close(low_m, low_g, scale, rel=5e-5)
         self.assertGreater(float(jnp.min(high_m)), 0.0)
         self.assertGreater(float(jnp.min(low_m)), 0.0)
     # The trilinear output is the trilinear interpolation at the same
