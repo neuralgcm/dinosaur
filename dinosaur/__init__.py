@@ -19,6 +19,7 @@ import dinosaur.filtering
 import dinosaur.held_suarez
 import dinosaur.horizontal_interpolation
 import dinosaur.jax_numpy_utils
+import dinosaur.lagrange_interpolation
 import dinosaur.layer_coordinates
 import dinosaur.primitive_equations
 import dinosaur.primitive_equations_states
@@ -26,6 +27,7 @@ import dinosaur.pytree_utils
 import dinosaur.radiation
 import dinosaur.scales
 import dinosaur.semi_lagrangian
+import dinosaur.semi_lagrangian_matmul
 import dinosaur.shallow_water
 import dinosaur.shallow_water_states
 import dinosaur.sigma_coordinates

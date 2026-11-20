@@ -29,6 +29,7 @@ from unittest import mock
 from absl.testing import absltest
 from absl.testing import parameterized
 from dinosaur import coordinate_systems
+from dinosaur import lagrange_interpolation
 from dinosaur import primitive_equations
 from dinosaur import primitive_equations_states
 from dinosaur import scales
@@ -982,7 +983,7 @@ def _reference_clamp(grid, nodes, sin_lat, sigma, order, shift):
   differently by an ulp), so it represents the clamped point, in the same
   bracketing cell, to within the resolution of sin(latitude).
   """
-  phi_ext = np.asarray(semi_lagrangian._latitude_halo_axis(grid))
+  phi_ext = np.asarray(lagrange_interpolation.latitude_halo_axis(grid))
   n_ext = phi_ext.size
   c_min, c_max = (0, n_ext - 2) if order == 'linear' else (1, n_ext - 3)
   a = np.minimum(np.arange(grid.nodal_shape[1]), grid.latitude_nodes - 1) + 2

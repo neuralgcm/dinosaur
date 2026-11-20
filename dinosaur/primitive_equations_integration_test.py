@@ -20,11 +20,13 @@ from absl.testing import absltest
 import chex
 from dinosaur import coordinate_systems
 from dinosaur import hybrid_coordinates
+from dinosaur import lagrange_interpolation
 from dinosaur import primitive_equations
 from dinosaur import primitive_equations_states
 from dinosaur import pytree_utils
 from dinosaur import scales
 from dinosaur import semi_lagrangian
+from dinosaur import semi_lagrangian_matmul
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 from dinosaur import time_integration
@@ -716,9 +718,11 @@ class IntegrationTest(absltest.TestCase):
               vertical_order=vertical_order, limiter=limiter, backend=backend,
           ):
             # The platform is read off the mesh's devices, which are CPUs
-            # here: `_target_platform` is what selects the TPU layouts.
+            # here: `target_platform` is what selects the TPU layouts.
             with mock.patch.object(
-                semi_lagrangian, '_target_platform', return_value=backend
+                lagrange_interpolation,
+                'target_platform',
+                return_value=backend,
             ):
               jax.clear_caches()
               actual = semi_lagrangian.interpolate_3d(
@@ -760,7 +764,7 @@ class IntegrationTest(absltest.TestCase):
       batch_grid = spherical_harmonic.Grid.T21(
           spmd_mesh=mesh_of((2, 1, 1, 1)), **grid_kwargs
       )
-      self.assertIsNone(semi_lagrangian._spatial_mesh(batch_grid))
+      self.assertIsNone(semi_lagrangian_matmul.spatial_mesh(batch_grid))
       self.assertEqual(
           semi_lagrangian._resolve_interpolation_method(None, batch_grid),
           semi_lagrangian._resolve_interpolation_method(None, grid),
@@ -774,7 +778,7 @@ class IntegrationTest(absltest.TestCase):
       mixed_grid = spherical_harmonic.Grid.T21(
           spmd_mesh=mesh_of((2, 1, 1, 2)), **grid_kwargs
       )
-      self.assertIsNotNone(semi_lagrangian._spatial_mesh(mixed_grid))
+      self.assertIsNotNone(semi_lagrangian_matmul.spatial_mesh(mixed_grid))
       self.assertEqual(
           semi_lagrangian._resolve_interpolation_method(None, mixed_grid),
           'matmul',
@@ -862,13 +866,13 @@ class IntegrationTest(absltest.TestCase):
     other = 'tpu' if device_platform != 'tpu' else 'cpu'
     with mock.patch.object(jax, 'default_backend', return_value=other):
       self.assertEqual(
-          semi_lagrangian._target_platform(
+          lagrange_interpolation.target_platform(
               spherical_harmonic.Grid.T21(spmd_mesh=mesh, **grid_kwargs)
           ),
           device_platform,
       )
       self.assertEqual(
-          semi_lagrangian._target_platform(
+          lagrange_interpolation.target_platform(
               spherical_harmonic.Grid.T21(**grid_kwargs)
           ),
           other,

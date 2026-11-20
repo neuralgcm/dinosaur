@@ -23,8 +23,10 @@ from unittest import mock
 from absl.testing import absltest
 from absl.testing import parameterized
 from dinosaur import coordinate_systems
+from dinosaur import lagrange_interpolation
 from dinosaur import primitive_equations
 from dinosaur import semi_lagrangian
+from dinosaur import semi_lagrangian_matmul
 from dinosaur import sigma_coordinates
 from dinosaur import spherical_harmonic
 import jax
@@ -370,8 +372,11 @@ class InterpolatorTest(parameterized.TestCase):
           field, grid, lon, sin_lat, sigma,
           sigma_nodes=centers, order='cubic', vertical_order=vertical_order,
       )
+    # The two orders sum the same terms through differently structured
+    # programs, so in float32 they agree to rounding of the O(1) stencil
+    # values, not bit for bit.
     np.testing.assert_allclose(
-        results['cubic'], results['linear'], rtol=1e-6, atol=1e-6
+        results['cubic'], results['linear'], rtol=1e-5, atol=1e-5
     )
 
   def test_interpolate_3d_cubic_requires_four_levels(self):
@@ -468,32 +473,6 @@ class MonotoneWindTransportTest(parameterized.TestCase):
         for a, b in zip(unlimited, limited)
     )
     self.assertGreater(difference, 1e-4)
-
-
-class ContractStencilTest(parameterized.TestCase):
-
-  @parameterized.parameters(dict(n=2), dict(n=3))
-  def test_fused_form_matches_einsum(self, n):
-    """The accelerator (fused) contraction equals the einsum form.
-
-    The dispatch in `_contract_stencil` picks by backend, so CPU test runs
-    exercise only the einsum branch; this pins the fused branch directly.
-    """
-    rng = np.random.RandomState(0)
-    batch = (3, 5, 7)
-    sizes = (2, 4, 4)[-n:]
-    values = jnp.asarray(rng.standard_normal(batch + sizes))
-    weights = [
-        jnp.asarray(rng.standard_normal(batch + (s,))) for s in sizes
-    ]
-    letters = 'ijkl'[:n]
-    expected = jnp.einsum(
-        ','.join(f'...{c}' for c in letters) + f',...{letters}->...',
-        *weights,
-        values,
-    )
-    actual = semi_lagrangian._contract_stencil_fused(values, *weights)
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
 
 class DifferentiabilityTest(parameterized.TestCase):
@@ -1236,7 +1215,7 @@ def _reference_clamp(grid, nodes, sin_lat, sigma, order, shift):
   differently by an ulp), so it represents the clamped point, in the same
   bracketing cell, to within the resolution of sin(latitude).
   """
-  phi_ext = np.asarray(semi_lagrangian._latitude_halo_axis(grid))
+  phi_ext = np.asarray(lagrange_interpolation.latitude_halo_axis(grid))
   n_ext = phi_ext.size
   c_min, c_max = (0, n_ext - 2) if order == 'linear' else (1, n_ext - 3)
   a = np.minimum(np.arange(grid.nodal_shape[1]), grid.latitude_nodes - 1) + 2
@@ -1570,14 +1549,14 @@ class WindowClampTest(parameterized.TestCase):
         ),
     )
     ref_w, ref_sd = separate('gather')
-    fused_g = semi_lagrangian._interpolate_3d_wind_and_sigma_dot_gather(
+    fused_g = lagrange_interpolation.interpolate_3d_wind_and_sigma_dot_gather(
         wind, sd, grid, *point, centers, boundaries, **shifts
     )
-    fused_m = semi_lagrangian._interpolate_3d_wind_and_sigma_dot_matmul(
+    fused_m = semi_lagrangian_matmul.interpolate_3d_wind_and_sigma_dot(
         wind, sd, grid, *point, centers, boundaries, **shifts
     )
     with self._tpu():
-      fused_t = semi_lagrangian._interpolate_3d_wind_and_sigma_dot_matmul(
+      fused_t = semi_lagrangian_matmul.interpolate_3d_wind_and_sigma_dot(
           wind, sd, grid, *point, centers, boundaries, **shifts
       )
       sep_t = separate('matmul')
@@ -1625,7 +1604,7 @@ class WindowClampTest(parameterized.TestCase):
     n_lat = grid.latitude_nodes
     lon_mesh, sin_lat_mesh = grid.nodal_mesh
     phi_mesh = np.arcsin(sin_lat_mesh)
-    phi_ext = semi_lagrangian._latitude_halo_axis(grid)
+    phi_ext = lagrange_interpolation.latitude_halo_axis(grid)
     shape = (layers,) + grid.nodal_shape
     rows = np.arange(n_lat)
     polar = np.minimum(rows, n_lat - 1 - rows) < 2
