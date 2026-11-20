@@ -1002,13 +1002,15 @@ class MatmulInterpolationTest(parameterized.TestCase):
         best = max(best, tpu_bytes)
       return best
 
-    compiled = step_transport.lower(u, v, sigma_dot, tracers).compile()
-    mem = compiled.memory_analysis()
-    # Unpadded HLO temporary workspace for T63 L47 + 10 tracers must stay <750MB
-    # on single-level non-TPU paths, with every buffer <200MB under TPU (8, 128)
-    # physical tile padding.
-    self.assertLess(mem.temp_size_in_bytes, 750 * 1024 * 1024)
-    self.assertLess(max_padded_bytes(compiled.as_text()), 200 * 1024 * 1024)
+    if jax.default_backend() != 'tpu':
+      compiled = step_transport.lower(u, v, sigma_dot, tracers).compile()
+      mem = compiled.memory_analysis()
+      # Unpadded HLO temporary workspace for T63 L47 + 10 tracers must stay
+      # <750MB on single-level non-TPU paths, with every buffer <200MB under
+      # TPU (8, 128) physical tile padding. (On a real TPU this compiles the
+      # multi-level layout, which the bounds below cover.)
+      self.assertLess(mem.temp_size_in_bytes, 750 * 1024 * 1024)
+      self.assertLess(max_padded_bytes(compiled.as_text()), 200 * 1024 * 1024)
 
     # Also verify multi-level TPU MXU chunking stays bounded under (8, 128)
     # tile padding (catches 6-D transpose blowups while trading modest workspace
