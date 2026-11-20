@@ -864,27 +864,6 @@ def _with_vertical_padding(
   """
 
   def g(x):
-    if mesh is not None and x.ndim > 3:
-      batch_shape = x.shape[:-3]
-      batch_size = math.prod(batch_shape)
-      if batch_size == 0:
-        out_spatial = jax.eval_shape(
-            f, jnp.zeros((1,) + x.shape[-2:], dtype=x.dtype)
-        ).shape[-2:]
-        return jnp.zeros(x.shape[:-2] + out_spatial, dtype=x.dtype)
-      z_size = x.shape[-3]
-      z_multiple = mesh.shape['z']
-      z_padded = _round_to_multiple(z_size, z_multiple)
-      x_moved = jnp.moveaxis(x, -3, 0)
-      if z_padded > z_size:
-        pad_width = [(0, z_padded - z_size)] + [(0, 0)] * (x_moved.ndim - 1)
-        x_moved = jnp.pad(x_moved, pad_width)
-      x_flat = x_moved.reshape((z_padded * batch_size,) + x.shape[-2:])
-      y_flat = f(x_flat)
-      y_moved = y_flat.reshape((z_padded, *batch_shape, *y_flat.shape[-2:]))
-      if z_padded > z_size:
-        y_moved = jax.lax.slice_in_dim(y_moved, 0, z_size, axis=0)
-      return jnp.moveaxis(y_moved, 0, -3)
     x, padding = _vertical_pad(x, mesh)
     return _vertical_crop(f(x), padding)
 
