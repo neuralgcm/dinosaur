@@ -598,7 +598,30 @@ class GridTest(parameterized.TestCase):
     expected_modal = (128, 72) if x_shards > 1 else (128, 65)
     self.assertEqual(t63.modal_shape, expected_modal)
 
-    # Explicit base_shape_multiple preserves backwards compatibility for nodal.
+    # A sharded grid keeps its default nodal padding (a multiple of 8 per
+    # shard, like the modal shape) unless `nodal_shape_multiple` is given.
+    sharded = dict(
+        longitude_nodes=68,
+        latitude_nodes=34,
+        longitude_wavenumbers=22,
+        total_wavenumbers=23,
+        spmd_mesh=mesh,
+    )
+    default = spherical_harmonic.FastSphericalHarmonics(**sharded)
+    unpadded = spherical_harmonic.FastSphericalHarmonics(
+        nodal_shape_multiple=1, **sharded
+    )
+    if x_shards > 1:
+      self.assertEqual(default.base_shape_multiple, 8)
+      self.assertEqual(default.nodal_shape_multiple, 8)
+      self.assertEqual(default.nodal_shape, (80, 40))
+      self.assertEqual(unpadded.nodal_shape, (68, 34))
+      self.assertEqual(unpadded.nodal_padding, (0, 0))
+    else:
+      self.assertEqual(default.nodal_shape, (68, 34))
+    self.assertEqual(unpadded.modal_shape, default.modal_shape)
+
+    # The nodal padding follows an explicit base_shape_multiple.
     padded_legacy = spherical_harmonic.FastSphericalHarmonics(
         longitude_nodes=94,
         latitude_nodes=47,

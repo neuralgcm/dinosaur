@@ -465,6 +465,24 @@ def _transform_einsum(
   )
 
 
+def has_spatial_sharding(mesh: jax.sharding.Mesh | None) -> bool:
+  """Whether `mesh` splits a spatial axis ('z', 'x' or 'y') across devices.
+
+  A mesh may be attached for another reason, e.g. with a 'batch' or 'ensemble'
+  axis and every spatial axis of size 1. Code that asks whether the model
+  itself is parallelized should use this rather than `mesh is not None`.
+
+  Args:
+    mesh: an SPMD mesh, or None.
+
+  Returns:
+    True if `mesh` has a spatial axis with more than one shard.
+  """
+  return mesh is not None and any(
+      mesh.shape[axis] > 1 for axis in 'zxy' if axis in mesh.axis_names
+  )
+
+
 @dataclasses.dataclass(frozen=True)
 class FastSphericalHarmonics(SphericalHarmonics):
   """Fast implementation of spherical harmonic transformation.
@@ -480,6 +498,15 @@ class FastSphericalHarmonics(SphericalHarmonics):
   This version of spherical harmonics also supports model parallelism, if
   `spmd_mesh` is provided. The additional optional arguments allow for low-level
   control of how the transforms are implemented.
+
+  `base_shape_multiple` (by default 8 with model parallelism, else 1) is the
+  multiple, per shard, to which the modal shape is padded.
+  `nodal_shape_multiple` is the same for the nodal shape and defaults to
+  `base_shape_multiple`. Pass `nodal_shape_multiple=1` for a sharded grid with
+  no nodal padding beyond what the shard counts require: `fourier_method='fft'`
+  needs that in longitude, and the semi-Lagrangian interpolation needs it in
+  latitude to exchange halos between neighbouring shards instead of gathering
+  the whole axis (see `semi_lagrangian`).
   """
 
   spmd_mesh: jax.sharding.Mesh | None = None
@@ -493,20 +520,17 @@ class FastSphericalHarmonics(SphericalHarmonics):
   )
 
   def __post_init__(self):
-    model_parallelism = self.spmd_mesh is not None and any(
-        self.spmd_mesh.shape[dim] > 1 for dim in 'zxy'
-    )
+    model_parallelism = has_spatial_sharding(self.spmd_mesh)
 
-    explicit_base_multiple = self.base_shape_multiple
     if self.base_shape_multiple is None:
       shape_multiple = 8 if model_parallelism else 1
       object.__setattr__(self, 'base_shape_multiple', shape_multiple)
 
     if self.nodal_shape_multiple is None:
-      nodal_multiple = (
-          explicit_base_multiple if explicit_base_multiple is not None else 1
+      # By default the nodal grid is padded like the modal one.
+      object.__setattr__(
+          self, 'nodal_shape_multiple', self.base_shape_multiple
       )
-      object.__setattr__(self, 'nodal_shape_multiple', nodal_multiple)
 
     if self.reverse_einsum_arg_order is None:
       object.__setattr__(self, 'reverse_einsum_arg_order', model_parallelism)
@@ -547,9 +571,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
           else 'matmul'
       )
 
-    model_parallelism = self.spmd_mesh is not None and any(
-        self.spmd_mesh.shape[dim] > 1 for dim in 'zxy'
-    )
+    model_parallelism = has_spatial_sharding(self.spmd_mesh)
     if method == 'fft' and model_parallelism:
       raise NotImplementedError(
           'fourier_method="fft" does not support model parallelism'
