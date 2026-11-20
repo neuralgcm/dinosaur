@@ -67,10 +67,10 @@ _MATMUL_2D_CHANNEL_CHUNK_LIMITED = 4
 
 # Budgets that size the channel chunk of the windowed 3-D matmul. In bytes of
 # (8, 128)-tile-padded buffers, per channel chunk: `single_buf` bounds the
-# largest single buffer, `ws_buf` the sum of the hoisted buffers alive at
-# once, and `vmem` the per-block working set of the gather/contraction, which
-# on TPU must fit in on-chip VMEM without spilling (hence below 128 MiB). The
-# non-TPU `vmem` is not a hardware limit. `max_channels` caps the chunk.
+# largest single buffer and `ws_buf` the sum of the hoisted buffers alive at
+# once (accelerator memory); `vmem` bounds the per-block working set of the
+# contraction, relative to TPU v5e's 128 MiB of on-chip VMEM. The non-TPU
+# `vmem` is not a hardware limit. `max_channels` caps the chunk.
 # TPU values:
 _MATMUL_3D_MAX_CHANNELS_TPU = 12
 _MATMUL_3D_SINGLE_BUF_LIMIT_TPU = 450 * _MIB
@@ -82,14 +82,43 @@ _MATMUL_3D_SINGLE_BUF_LIMIT_CPU_GPU = 185 * _MIB
 _MATMUL_3D_WS_BUF_LIMIT_CPU_GPU = 440 * _MIB
 _MATMUL_3D_VMEM_LIMIT_CPU_GPU = 256 * _MIB
 
-# Numbers of consecutive query levels fused into one scan block, tried in this
-# order (1 is the fallback), on TPU only.
-_BLOCK_LEVEL_CANDIDATES = (4, 2)
+# The planner constants below were chosen from sweeps of the channel chunk and
+# the block length on TPU v5e: T63, T85, T106 and T170 at L47, windows of 2
+# and 6, limited and unlimited stacks.
 
-# Largest per-block working set (bytes) accepted when probing the block
-# length: the 3-D scalar/limiter path and the fused wind + sigma_dot path.
-# Both sit just below TPU v5e's 128 MiB VMEM.
-_MATMUL_3D_BLOCK_VMEM_PROBE = 116 * _MIB
+# Number of consecutive query levels evaluated per scan block on TPU, when
+# blocks are used (see `_plan_blocks_and_channels`); 3 and 4 were slower than
+# 2 wherever they were measured.
+_TPU_BLOCK_LEVELS = 2
+
+# Cost per level of a block relative to single levels, lane padding aside:
+# the block's levels share a vertical window only one level taller than a
+# single level's. Measured 0.94 to 0.96 at T85, where the padding is the same
+# either way. The padding is the larger effect where it differs: the queries
+# of a block's levels lie side by side on the lane axis, so two levels of 192
+# (T63) or 320 (T106) longitudes fill 128-lane tiles exactly, where one level
+# leaves a third or a fifth of them empty.
+_TPU_BLOCK_COST = 0.95
+
+# On-chip memory (VMEM) per core of TPU v5e and v6e. Blocks are only
+# considered if their longitude weights fit.
+_TPU_VMEM_BYTES = 128 * _MIB
+
+# TPU budget of the part of a block's working set that grows with the channel
+# chunk: the vertical window patch and its longitude-contracted result. The
+# fastest chunk was the largest one within about this size in every measured
+# configuration, including where the whole working set (with the longitude
+# weights, or with the limiter's bounds) exceeds VMEM.
+_MATMUL_3D_CHUNK_VMEM_TPU = 100 * _MIB
+
+# Fixed cost of one more channel chunk (its stencils and weight matrices are
+# built again), relative to the cost of one channel: about a half in the
+# per-chunk timings at T63 and T106. Used to trade chunks against padding,
+# and blocks (which need smaller chunks) against single levels.
+_CHUNK_OVERHEAD_IN_CHANNELS = 0.5
+
+# Largest working set of a block of the fused wind + sigma_dot kernel for
+# which it uses blocks of `_TPU_BLOCK_LEVELS` levels.
 _WIND_SIGMA_DOT_BLOCK_VMEM_PROBE = 118 * _MIB
 
 # TPU (8, 128) tiling of 32-bit arrays: the minor axis is padded to a multiple
@@ -1264,6 +1293,10 @@ class _Matmul3DPlan:
     max_block_levels: largest number of query levels that may share one
       vertical window (see `block_window`): a longer block's window would not
       fit in the real source levels of a z-shard's buffer.
+    block_levels: number of query levels evaluated per scan block; 1 as
+      built by `_plan_matmul_3d`, set by `_plan_blocks_and_channels`.
+    allowed_block_levels: the block length that may be used instead of 1
+      (`_level_block_length`; 1 if none).
     need_separate_trilinear: whether the trilinear channels need stencils of
       their own (they do not if the main stencil already is trilinear).
     item_bytes: bytes per element.
@@ -1302,6 +1335,8 @@ class _Matmul3DPlan:
   lat_start_offset: int
   z_start_offset: int
   max_block_levels: int
+  block_levels: int
+  allowed_block_levels: int
   need_separate_trilinear: bool
   item_bytes: int
   n_lon_pad128: int
@@ -1350,6 +1385,17 @@ class _Matmul3DPlan:
       the per-block working set are all within their limits.
     """
     k_c_pad = _round_to_multiple(num_channels * self.w_lat_size, _TPU_SUBLANES)
+    # On TPU: the chunk-dependent part of the working set of a block.
+    chunk_vmem_b = (
+        self.ny_loc
+        * self.block_window(self.w_z_size, self.block_levels)
+        * k_c_pad
+        * (
+            self.n_lon_pad128
+            + _round_to_multiple(self.block_levels * self.nx_loc, _TPU_LANES)
+        )
+        * self.item_bytes
+    )
     f_lat_b = (
         self.ny_loc * self.l_buf * k_c_pad * self.n_lon_pad128 * self.item_bytes
     )
@@ -1397,10 +1443,14 @@ class _Matmul3DPlan:
       max_single_b = max(max_single_b, b_lat_b)
       ws_b = f_lat_b + b_lat_b
       vmem_b = max(vmem_b, self.w_lon_vmem_b + b_patch_b + b_lon_b)
+    if self.is_tpu:
+      fits_vmem = chunk_vmem_b <= _MATMUL_3D_CHUNK_VMEM_TPU
+    else:
+      fits_vmem = vmem_b <= self.vmem_limit
     return (
         max_single_b <= self.single_buf_limit
         and ws_b <= self.ws_buf_limit
-        and vmem_b <= self.vmem_limit
+        and fits_vmem
     )
 
 
@@ -1466,9 +1516,6 @@ def _plan_matmul_3d(
   else:
     max_block_levels = max(1, l_valid - (2 * eff_z_shift + s_z) + 1)
 
-  # Channel chunks are sized so the hoisted `[ny_loc, l_buf, k_pad, n_lon]`
-  # buffers stay compact in HBM AND the per-level `b_len = 1` working sets fit
-  # inside TPU v5e's 128 MiB on-chip VMEM without spilling.
   item_bytes = 8 if dtype == jnp.float64 else 4
   n_lon_pad128 = _round_to_multiple(n_lon, _TPU_LANES)
   nx_pad128 = _round_to_multiple(nx_loc, _TPU_LANES)
@@ -1515,6 +1562,20 @@ def _plan_matmul_3d(
           -eff_z_shift if vertical_order == 'linear' else (-eff_z_shift - 1)
       ),
       max_block_levels=max_block_levels,
+      block_levels=1,
+      allowed_block_levels=_level_block_length(
+          l_q_loc,
+          is_tpu,
+          # The longitude weights [ny_loc, n_lon, block levels * nx_loc].
+          lambda levels: (
+              ny_loc
+              * _round_to_multiple(n_lon, _TPU_SUBLANES)
+              * _round_to_multiple(levels * nx_loc, _TPU_LANES)
+              * item_bytes
+          ),
+          _TPU_VMEM_BYTES,
+          max_block_levels,
+      ),
       need_separate_trilinear=trilinear_channel_start is not None
       and not (order == 'linear' and vertical_order == 'linear'),
       item_bytes=item_bytes,
@@ -1549,6 +1610,8 @@ class _ChannelPlan:
   Attributes:
     chunk_size: channels evaluated together (one `lax.scan` step if the
       channels do not fit in a single chunk).
+    cost: relative cost of the plan per query level, in channels: every
+      channel of every chunk (padding included) plus a fixed cost per chunk.
     segments: None if the channels are evaluated as one stack. Otherwise the
       homogeneous runs the stack is split into, because chunking a stack
       that mixes limited / unlimited / trilinear channels would make the
@@ -1557,6 +1620,7 @@ class _ChannelPlan:
 
   chunk_size: int
   segments: tuple[_ChannelSegment, ...] | None
+  cost: float
 
 
 def _plan_channels(
@@ -1567,8 +1631,9 @@ def _plan_channels(
   """Chooses the channel chunk size and splits mixed channels into runs.
 
   The chunk is the whole stack if it fits the budgets of `plan` with its
-  limited channels; otherwise the largest chunk that fits when every one of
-  its channels is limited (the worst case), at least 1.
+  limited channels. Otherwise it is the cheapest size up to the largest one
+  that fits (taking every one of its channels to be limited, the worst
+  case), counting the padding of the last chunk and a fixed cost per chunk.
 
   Args:
     plan: the static plan of the call.
@@ -1580,16 +1645,30 @@ def _plan_channels(
     The channel plan.
   """
   num_channels = plan.num_channels
+
+  def chunk_cost(chunk: int) -> float:
+    num_chunks = -(-num_channels // chunk)
+    return num_chunks * (chunk + _CHUNK_OVERHEAD_IN_CHANNELS)
+
   if num_channels <= plan.max_channels and plan.fits_budget(
       num_channels, limited_channel_start
   ):
     chunk_size = num_channels
+    plan_cost = chunk_cost(num_channels)
   else:
-    chunk_size = 1
+    max_chunk = 1
     for c_cand in range(min(num_channels, plan.max_channels), 0, -1):
       if plan.fits_budget(c_cand, 0):
-        chunk_size = c_cand
+        max_chunk = c_cand
         break
+
+    # The chunks are equal, the last one padded with zero channels. A padded
+    # channel costs as much as a real one and every chunk has a fixed cost,
+    # so the largest chunk that fits is not always the cheapest: 8 channels
+    # are better as 2 chunks of 4 than as 6 + 2 padded to 6, or as 3 chunks
+    # of 3.
+    chunk_size = min(range(max_chunk, 0, -1), key=chunk_cost)
+    plan_cost = chunk_cost(chunk_size)
 
   if not (
       num_channels > chunk_size
@@ -1601,7 +1680,7 @@ def _plan_channels(
           )
       )
   ):
-    return _ChannelPlan(chunk_size, None)
+    return _ChannelPlan(chunk_size, None, plan_cost)
 
   split_pts = sorted(
       {0, num_channels}
@@ -1629,7 +1708,47 @@ def _plan_channels(
       for s0, s1 in zip(split_pts[:-1], split_pts[1:])
       if s0 != s1
   )
-  return _ChannelPlan(chunk_size, segments)
+  return _ChannelPlan(chunk_size, segments, plan_cost)
+
+
+def _plan_blocks_and_channels(
+    plan: _Matmul3DPlan,
+    limited_channel_start: int,
+    trilinear_channel_start: int | None,
+) -> tuple[_Matmul3DPlan, _ChannelPlan]:
+  """Chooses the block length and the channel chunks together.
+
+  A block of `plan.allowed_block_levels` levels is cheaper per level than
+  single levels (`_TPU_BLOCK_COST`, and less lane padding when the local
+  longitudes are not a multiple of the lane count), but its working set is
+  larger, so it may only fit smaller channel chunks, of which there are then
+  more. Both are planned and the cheaper one is taken.
+
+  Args:
+    plan: the static plan of the call, as built by `_plan_matmul_3d`.
+    limited_channel_start: first limited channel.
+    trilinear_channel_start: first channel that also gets a trilinear output,
+      or None.
+
+  Returns:
+    `(plan, channel_plan)`, the plan with its `block_levels` set.
+  """
+  channels = _plan_channels(
+      plan, limited_channel_start, trilinear_channel_start
+  )
+  levels = plan.allowed_block_levels
+  if levels == 1:
+    return plan, channels
+  block_plan = dataclasses.replace(plan, block_levels=levels)
+  block_channels = _plan_channels(
+      block_plan, limited_channel_start, trilinear_channel_start
+  )
+  lanes_per_level = _round_to_multiple(levels * plan.nx_loc, _TPU_LANES) / (
+      levels * plan.nx_pad128
+  )
+  if block_channels.cost * _TPU_BLOCK_COST * lanes_per_level < channels.cost:
+    return block_plan, block_channels
+  return plan, channels
 
 
 def _matmul_3d_by_segments(
@@ -2001,45 +2120,6 @@ def _level_block(
   )
 
 
-def _matmul_3d_block_bytes(
-    plan: _Matmul3DPlan, chunk: _ChannelChunk, b_cand: int
-) -> int:
-  """Padded working-set bytes of a block of `b_cand` query levels.
-
-  The larger of the field contraction (vertical patch, longitude weights and
-  contracted result) and, with limited channels, the cell-bound contraction.
-  """
-  w_z_c = plan.block_window(plan.w_z_size, b_cand)
-  f_blk_vmem = (
-      plan.ny_loc * w_z_c * chunk.k_pad * plan.n_lon_pad128 * plan.item_bytes
-  )
-  g_1_vmem = (
-      plan.ny_loc * w_z_c * chunk.k_pad * plan.nx_pad128 * plan.item_bytes
-  )
-  nx_c_pad128 = _round_to_multiple(b_cand * plan.nx_loc, _TPU_LANES)
-  w_lon_c_vmem = (
-      plan.ny_loc
-      * _round_to_multiple(plan.n_lon, _TPU_SUBLANES)
-      * nx_c_pad128
-      * plan.item_bytes
-  )
-  b_vmem = 0
-  if chunk.c_lim > 0:
-    w_zc_c = plan.block_window(plan.w_z_cell_size, b_cand, cells=True)
-    b_blk_vmem = (
-        plan.ny_loc
-        * w_zc_c
-        * chunk.k_lim_pad
-        * plan.n_lon_pad128
-        * plan.item_bytes
-    )
-    b_lon_vmem = (
-        plan.ny_loc * w_zc_c * chunk.k_lim_pad * nx_c_pad128 * plan.item_bytes
-    )
-    b_vmem = b_blk_vmem + w_lon_c_vmem + b_lon_vmem
-  return max(f_blk_vmem + plan.w_lon_vmem_b + g_1_vmem, b_vmem)
-
-
 def _level_block_length(
     num_levels: int,
     is_tpu: bool,
@@ -2047,33 +2127,32 @@ def _level_block_length(
     limit: int,
     max_block_levels: int | None = None,
 ) -> int:
-  """Number of consecutive query levels to fuse into one scan block.
+  """Longest block of consecutive query levels a kernel may evaluate at once.
 
-  Blocking reuses the overlapping vertical windows of neighbouring levels
-  and widens the longitude contraction; it is only used on TPU, and only
-  while the block's working set fits in on-chip memory.
+  On TPU the levels can be evaluated `_TPU_BLOCK_LEVELS` at a time, sharing
+  one vertical window and one (wider) longitude contraction, provided what
+  `block_bytes` measures for such a block stays within `limit`. Elsewhere,
+  and otherwise, one at a time.
 
   Args:
     num_levels: number of local query levels.
     is_tpu: whether the TPU layouts apply; otherwise blocks have one level.
-    block_bytes: function from a candidate block length to the padded
-      working-set bytes of such a block.
-    limit: largest accepted working set, in bytes.
+    block_bytes: function from a block length to the padded bytes that must
+      stay within `limit` for a block of that length to be used.
+    limit: the budget for `block_bytes`.
     max_block_levels: optional cap on the block length (the longest block
       whose vertical window fits a z-shard's buffer).
 
   Returns:
-    The first of `_BLOCK_LEVEL_CANDIDATES` that is not longer than
-    `num_levels` (or the cap) and fits, else 1.
+    `_TPU_BLOCK_LEVELS` or 1.
   """
-  if is_tpu:
-    for b_cand in _BLOCK_LEVEL_CANDIDATES:
-      if num_levels < b_cand:
-        continue
-      if max_block_levels is not None and b_cand > max_block_levels:
-        continue
-      if block_bytes(b_cand) <= limit:
-        return b_cand
+  if (
+      is_tpu
+      and num_levels >= _TPU_BLOCK_LEVELS
+      and (max_block_levels is None or max_block_levels >= _TPU_BLOCK_LEVELS)
+      and block_bytes(_TPU_BLOCK_LEVELS) <= limit
+  ):
+    return _TPU_BLOCK_LEVELS
   return 1
 
 
@@ -2666,13 +2745,7 @@ def _matmul_3d_channel_chunk(
         else no_trilinear,
     )
 
-  b_len = _level_block_length(
-      l_q_loc,
-      plan.is_tpu,
-      lambda b_cand: _matmul_3d_block_bytes(plan, chunk, b_cand),
-      _MATMUL_3D_BLOCK_VMEM_PROBE,
-      plan.max_block_levels,
-  )
+  b_len = plan.block_levels
   block = _level_block(plan, chunk, b_len)
   scan_res = _scan_level_blocks(
       functools.partial(
@@ -2807,11 +2880,12 @@ def _matmul_3d_local(
     [C - trilinear_channel_start, l_q_loc, nx_loc, ny_loc] (None if
     `spec.trilinear_channel_start` is None).
   """
-  plan = _plan_matmul_3d(buffer, queries, spec, sigma_nodes)
   limited_channel_start = spec.limited_channel_start
   trilinear_channel_start = spec.trilinear_channel_start
-  channel_plan = _plan_channels(
-      plan, limited_channel_start, trilinear_channel_start
+  plan, channel_plan = _plan_blocks_and_channels(
+      _plan_matmul_3d(buffer, queries, spec, sigma_nodes),
+      limited_channel_start,
+      trilinear_channel_start,
   )
   if channel_plan.segments is not None:
     return _matmul_3d_by_segments(

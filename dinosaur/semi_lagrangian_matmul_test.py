@@ -14,9 +14,13 @@
 
 """Tests for semi_lagrangian_matmul."""
 
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
+from dinosaur import lagrange_interpolation
 from dinosaur import semi_lagrangian_matmul
+from dinosaur import spherical_harmonic
 import jax.numpy as jnp
 import numpy as np
 
@@ -100,6 +104,107 @@ class WindowArithmeticTest(parameterized.TestCase):
     )
     np.testing.assert_array_equal(
         actual, [[0.25, 0.75, 0.0, 0.0], [0.0, 0.0, 0.5, 0.5]]
+    )
+
+
+class PlannerTest(parameterized.TestCase):
+
+  def _plan(
+      self, platform, num_channels, limited_start, shift=2, wavenumber=63
+  ):
+    grid = spherical_harmonic.Grid.construct(
+        max_wavenumber=wavenumber,
+        gaussian_nodes={42: 32, 63: 48, 85: 64, 106: 80, 170: 128}[wavenumber],
+        spherical_harmonics_impl=spherical_harmonic.FastSphericalHarmonics,
+    )
+    layers = 47
+    nodes = np.linspace(0.01, 0.99, layers)
+    halo = lagrange_interpolation.HALO_WIDTH
+    fields = jnp.zeros(
+        (
+            num_channels,
+            layers,
+            grid.longitude_nodes,
+            grid.latitude_nodes + 2 * halo,
+        ),
+        jnp.float32,
+    )
+    queries = jnp.zeros((layers,) + grid.nodal_shape, jnp.float32)
+    limiter = 'quasi_monotone' if limited_start < num_channels else None
+    spec = semi_lagrangian_matmul._Matmul3DSpec(
+        grid, 'cubic', 'cubic', limiter, shift, shift, limited_start
+    )
+    with mock.patch.object(
+        lagrange_interpolation, 'target_platform', return_value=platform
+    ):
+      plan = semi_lagrangian_matmul._plan_matmul_3d(
+          semi_lagrangian_matmul._LocalBuffer(fields),
+          semi_lagrangian_matmul._LocalQueries(
+              queries, queries, queries, (None, None), (None, None)
+          ),
+          spec,
+          nodes,
+      )
+    return semi_lagrangian_matmul._plan_blocks_and_channels(
+        plan, limited_start, None
+    )
+
+  @parameterized.parameters(
+      # (channels, largest chunk that fits) -> chunk
+      dict(num_channels=8, max_chunk=6, expected=4),
+      dict(num_channels=8, max_chunk=3, expected=2),
+      dict(num_channels=16, max_chunk=5, expected=4),
+      dict(num_channels=7, max_chunk=4, expected=4),
+      dict(num_channels=9, max_chunk=4, expected=3),
+      dict(num_channels=5, max_chunk=1, expected=1),
+  )
+  def test_chunk_trades_padding_against_chunks(
+      self, num_channels, max_chunk, expected
+  ):
+    plan, _ = self._plan('gpu', num_channels, 0)
+    with mock.patch.object(
+        type(plan),
+        'fits_budget',
+        lambda self, chunk, limited_start=0: chunk <= max_chunk,
+    ):
+      channels = semi_lagrangian_matmul._plan_channels(plan, 0, None)
+    self.assertEqual(channels.chunk_size, expected)
+    num_chunks = -(-num_channels // expected)
+    self.assertEqual(channels.cost, num_chunks * (expected + 0.5))
+
+  @parameterized.parameters(
+      # The configurations the planner constants were measured on (TPU v5e,
+      # L47): (wavenumber, window, channels, first limited) -> (chunk, block),
+      # the fastest of the measured combinations.
+      dict(wavenumber=42, shift=2, channels=8, limited=0, expected=(8, 2)),
+      dict(wavenumber=63, shift=2, channels=8, limited=0, expected=(4, 2)),
+      dict(wavenumber=63, shift=2, channels=4, limited=4, expected=(4, 2)),
+      dict(wavenumber=63, shift=6, channels=8, limited=0, expected=(1, 2)),
+      dict(wavenumber=85, shift=2, channels=8, limited=0, expected=(4, 1)),
+      dict(wavenumber=85, shift=2, channels=4, limited=4, expected=(4, 1)),
+      dict(wavenumber=106, shift=2, channels=8, limited=0, expected=(2, 2)),
+      dict(wavenumber=170, shift=2, channels=8, limited=0, expected=(1, 1)),
+  )
+  def test_tpu_plan(self, wavenumber, shift, channels, limited, expected):
+    plan, channel_plan = self._plan(
+        'tpu', channels, limited, shift=shift, wavenumber=wavenumber
+    )
+    self.assertEqual((channel_plan.chunk_size, plan.block_levels), expected)
+
+  def test_blocks_are_a_tpu_layout(self):
+    plan, _ = self._plan('gpu', 8, 0)
+    self.assertEqual(plan.allowed_block_levels, 1)
+    self.assertEqual(plan.block_levels, 1)
+
+  def test_block_length(self):
+    block_length = semi_lagrangian_matmul._level_block_length
+    fits = dict(block_bytes=lambda levels: 1, limit=1)
+    self.assertEqual(block_length(47, True, **fits), 2)
+    self.assertEqual(block_length(47, False, **fits), 1)
+    self.assertEqual(block_length(1, True, **fits), 1)
+    self.assertEqual(block_length(47, True, max_block_levels=1, **fits), 1)
+    self.assertEqual(
+        block_length(47, True, block_bytes=lambda levels: 2, limit=1), 1
     )
 
 

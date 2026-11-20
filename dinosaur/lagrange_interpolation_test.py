@@ -29,17 +29,13 @@ import numpy as np
 def _queries(grid, shape, seed):
   rng = np.random.RandomState(seed)
   lon = jnp.asarray(rng.uniform(0, 2 * np.pi, size=shape), jnp.float32)
-  sin_lat = jnp.asarray(
-      np.sin(rng.uniform(-1.5, 1.5, size=shape)), jnp.float32
-  )
+  sin_lat = jnp.asarray(np.sin(rng.uniform(-1.5, 1.5, size=shape)), jnp.float32)
   return lon, sin_lat
 
 
 class StencilTest(parameterized.TestCase):
 
-  @parameterized.product(
-      order=('linear', 'cubic'), backend=('cpu', 'tpu')
-  )
+  @parameterized.product(order=('linear', 'cubic'), backend=('cpu', 'tpu'))
   def test_horizontal_stencil(self, order, backend):
     grid = spherical_harmonic.Grid.T21()
     lon, sin_lat = _queries(grid, (50,), seed=0)
@@ -76,9 +72,7 @@ class StencilTest(parameterized.TestCase):
     for alpha in (alpha_lon, alpha_lat):
       self.assertTrue(np.all(alpha >= -1e-5) and np.all(alpha <= 1 + 1e-5))
 
-  @parameterized.product(
-      order=('linear', 'cubic'), backend=('cpu', 'tpu')
-  )
+  @parameterized.product(order=('linear', 'cubic'), backend=('cpu', 'tpu'))
   def test_vertical_stencil(self, order, backend):
     nodes = jnp.asarray(
         sigma_coordinates.SigmaCoordinates.equidistant(8).centers, jnp.float32
@@ -86,7 +80,10 @@ class StencilTest(parameterized.TestCase):
     rng = np.random.RandomState(1)
     sigma = jnp.asarray(rng.uniform(-0.1, 1.1, size=(60,)), jnp.float32)
     stencil = lagrange_interpolation.vertical_stencil(
-        sigma, nodes, order, is_tpu=backend == 'tpu',
+        sigma,
+        nodes,
+        order,
+        is_tpu=backend == 'tpu',
         include_linear_fractions=True,
     )
     plain = lagrange_interpolation.vertical_stencil(
@@ -124,9 +121,7 @@ class StencilTest(parameterized.TestCase):
     # A halo row is the row mirrored about the pole, half a turn away.
     rolled = np.roll(np.asarray(field), nx // 2, axis=-2)
     for k in range(halo):
-      np.testing.assert_array_equal(
-          extended[..., halo - 1 - k], rolled[..., k]
-      )
+      np.testing.assert_array_equal(extended[..., halo - 1 - k], rolled[..., k])
       np.testing.assert_array_equal(
           extended[..., ny + halo + k], rolled[..., ny - 1 - k]
       )
@@ -200,9 +195,7 @@ class ContractStencilTest(parameterized.TestCase):
     batch = (3, 5, 7)
     sizes = (2, 4, 4)[-n:]
     values = jnp.asarray(rng.standard_normal(batch + sizes))
-    weights = [
-        jnp.asarray(rng.standard_normal(batch + (s,))) for s in sizes
-    ]
+    weights = [jnp.asarray(rng.standard_normal(batch + (s,))) for s in sizes]
     letters = 'ijkl'[:n]
     expected = jnp.einsum(
         ','.join(f'...{c}' for c in letters) + f',...{letters}->...',
