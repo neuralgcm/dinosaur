@@ -367,17 +367,42 @@ def semi_lagrangian_crank_nicolson_rk2(
     Temperton, C., Hortal, M. & Simmons, A. A two-time-level semi-Lagrangian
     global spectral model. Q. J. R. Meteorol. Soc. 127, 111-127 (2001).
   """
+  step_from_first_stage = _semi_lagrangian_rk2_from_first_stage(
+      equation, time_step, off_centering, warm_start_corrector
+  )
+
+  def step_fn(x0: PyTreeState) -> PyTreeState:
+    n0, v0 = equation.nonadvective_terms_and_velocities(x0)
+    # Stage 1 (predictor): first-order trajectories from current winds.
+    departure1 = equation.departure_points(v0, time_step)
+    return step_from_first_stage(x0, n0, v0, departure1)
+
+  return step_fn
+
+
+def _semi_lagrangian_rk2_from_first_stage(
+    equation: SemiLagrangianImplicitExplicitODE,
+    time_step: float,
+    off_centering: float,
+    warm_start_corrector: bool,
+) -> Callable[..., PyTreeState]:
+  """The step of `semi_lagrangian_crank_nicolson_rk2`, given its first terms.
+
+  Returns a function `(x0, n0, v0, departure1) -> x1`, where `n0` and `v0`
+  are the non-advective terms and nodal velocities of `x0` and `departure1`
+  the departure points of the trajectories of `v0` over `time_step`: a caller
+  that needs those values itself (`semi_lagrangian_settls_init`) computes
+  them once.
+  """
   dt = time_step
   α = (0.5 + off_centering) * dt
   β = (0.5 - off_centering) * dt
   supports_predictor_stage = _accepts_predictor_stage(equation)
 
-  def step_fn(x0: PyTreeState) -> PyTreeState:
-    n0, v0 = equation.nonadvective_terms_and_velocities(x0)
+  def step_fn(
+      x0: PyTreeState, n0: PyTreeState, v0: typing.Pytree, departure1: Any
+  ) -> PyTreeState:
     l0 = equation.implicit_terms(x0)
-
-    # Stage 1 (predictor): first-order trajectories from current winds.
-    departure1 = equation.departure_points(v0, dt)
     bracket1 = tree_map(lambda x, l, n: x + β * l + dt * n, x0, l0, n0)
     transported1 = (
         equation.semi_lagrangian_transport(
@@ -510,15 +535,19 @@ def semi_lagrangian_settls_init(
     tuple (plus carried departure points if warm-starting) consumed by
     `semi_lagrangian_settls`.
   """
-  rk2_step = semi_lagrangian_crank_nicolson_rk2(equation, time_step)
+  # The defaults of `semi_lagrangian_crank_nicolson_rk2`; the step reuses the
+  # terms, velocities and departure points this function returns.
+  rk2_step = _semi_lagrangian_rk2_from_first_stage(
+      equation, time_step, off_centering=0.0, warm_start_corrector=True
+  )
 
   def init_fn(x0):
-    n0 = equation.nonadvective_terms(x0)
-    v0 = equation.nodal_velocities(x0)
+    n0, v0 = equation.nonadvective_terms_and_velocities(x0)
+    dep0 = equation.departure_points(v0, time_step)
+    x1 = rk2_step(x0, n0, v0, dep0)
     if warm_start_departures:
-      dep0 = equation.departure_points(v0, time_step)
-      return (rk2_step(x0), (n0, v0, dep0))
-    return (rk2_step(x0), (n0, v0))
+      return (x1, (n0, v0, dep0))
+    return (x1, (n0, v0))
 
   return init_fn
 

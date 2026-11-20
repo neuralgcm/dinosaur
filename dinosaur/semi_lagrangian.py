@@ -1349,8 +1349,8 @@ def _finish_wind_transport(
   """Rotates interpolated Cartesian winds to arrival and projects to (u, v)."""
   lon_mesh, sin_lat_mesh = grid.nodal_mesh
   arrival = lon_lat_to_cartesian(
-      jnp.broadcast_to(lon_mesh, departure.lon.shape),
-      jnp.broadcast_to(sin_lat_mesh, departure.lon.shape),
+      jnp.broadcast_to(lon_mesh, departure.cartesian.shape[1:]),
+      jnp.broadcast_to(sin_lat_mesh, departure.cartesian.shape[1:]),
   )
   if planetary_rotation_rate is not None:
     # add the analytic planetary momentum at the departure point (only the
