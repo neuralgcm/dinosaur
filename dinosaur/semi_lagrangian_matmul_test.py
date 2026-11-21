@@ -35,6 +35,13 @@ class WindowArithmeticTest(parameterized.TestCase):
     self.assertEqual(window_size(100, 10, 6, 4), 10)
     self.assertEqual(window_size(12, 100, 6, 4), 12)
 
+  def test_cell_window_size(self):
+    cell_window_size = semi_lagrangian_matmul._cell_window_size
+    # The cells `a - half_width ... a + half_width`, truncated like a window.
+    self.assertEqual(cell_window_size(99, 99, 6), 13)
+    self.assertEqual(cell_window_size(99, 9, 6), 9)
+    self.assertEqual(cell_window_size(11, 99, 6), 11)
+
   def test_z_window_on_an_unsharded_column(self):
     starts = semi_lagrangian_matmul._z_window_starts
     for first, expected in ((-3, 0), (5, 5), (30, 16)):
@@ -224,6 +231,17 @@ class PlannerTest(parameterized.TestCase):
         'tpu', channels, limited, shift=shift, wavenumber=wavenumber
     )
     self.assertEqual((channel_plan.chunk_size, plan.block_levels), expected)
+
+  @parameterized.parameters(1, 2, 6)
+  def test_limiter_cell_windows_hold_the_clamped_cells(self, shift):
+    # The clamps keep a query's bracketing cell within `shift` cells of its
+    # arrival node, in latitude and in the vertical: `2 * shift + 1` cells.
+    plan, _ = self._plan('tpu', 8, 0, shift=shift)
+    self.assertEqual(plan.w_lat_cell_size, 2 * shift + 1)
+    self.assertEqual(plan.w_z_cell_size, 2 * shift + 1)
+    # The stencil windows also hold the cells' outer stencil nodes.
+    self.assertEqual(plan.w_lat_size, 2 * shift + 4)
+    self.assertEqual(plan.w_z_size, 2 * shift + 4)
 
   def test_blocks_are_a_tpu_layout(self):
     plan, _ = self._plan('gpu', 8, 0)

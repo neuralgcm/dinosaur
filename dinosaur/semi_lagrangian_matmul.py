@@ -151,6 +151,17 @@ def _window_size(
   return min(n_buffer, min(n_source, 2 * half_width + stencil))
 
 
+def _cell_window_size(n_buffer: int, n_source: int, half_width: int) -> int:
+  """Number of cells in a window of bracketing cells.
+
+  A query's bracketing cell is one of the `2 * half_width + 1` cells
+  `a - half_width ... a + half_width` around its arrival node `a` (the clamps
+  of `lat_clamp_bounds` and `level_clamp_bounds`), so that is the window: a
+  stencil of one cell. `n_buffer` and `n_source` count cells.
+  """
+  return _window_size(n_buffer, n_source, half_width, 1)
+
+
 def _arrival_lat_rows(
     j_offset: int | jax.Array, ny_loc: int, n_lat: int
 ) -> jax.Array:
@@ -789,12 +800,12 @@ def _matmul_2d_local(
   )  # [ny_loc, nx_loc, w_lat_size]
 
   if limiter is not None:
-    w_lat_cell_size = _window_size(
-        n_lat_buf - 1, n_lat_ext - 1, eff_lat_shift, 2
+    w_lat_cell_size = _cell_window_size(
+        n_lat_buf - 1, n_lat_ext - 1, eff_lat_shift
     )
     win_lat_cell_start, buf_lat_cell_start = _lat_window_starts(
         j_global,
-        j_global + 1 - eff_lat_shift,
+        j_global + lagrange_interpolation.HALO_WIDTH - eff_lat_shift,
         n_lat_ext - 1,
         n_lat_buf - 1,
         w_lat_cell_size,
@@ -1528,10 +1539,10 @@ def _plan_matmul_3d(
   w_lat_cell_size = 0
   w_z_cell_size = 0
   if eff_limiter is not None:
-    w_lat_cell_size = _window_size(
-        n_lat_buf - 1, n_lat_ext - 1, eff_lat_shift, 2
+    w_lat_cell_size = _cell_window_size(
+        n_lat_buf - 1, n_lat_ext - 1, eff_lat_shift
     )
-    w_z_cell_size = _window_size(l_valid - 1, l_src - 1, eff_z_shift, 2)
+    w_z_cell_size = _cell_window_size(l_valid - 1, l_src - 1, eff_z_shift)
   # A block of `b` query levels shares one window of `2 * shift + s_z + b - 1`
   # levels. On a z-shard between two others that window has to fit in the
   # `l_valid` levels a buffer is guaranteed to hold; when the buffer holds the
@@ -2956,7 +2967,7 @@ def _matmul_3d_local(
   if plan.limiter is not None:
     win_lat_cell_start, m_lat_cell_2d = _lat_window_selector(
         j_global,
-        j_global + 1 - plan.eff_lat_shift,
+        j_global + lagrange_interpolation.HALO_WIDTH - plan.eff_lat_shift,
         plan.n_lat_ext - 1,
         plan.n_lat_buf - 1,
         plan.w_lat_cell_size,
