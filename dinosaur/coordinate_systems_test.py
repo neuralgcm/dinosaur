@@ -58,13 +58,22 @@ class CoordinateSystemTest(parameterized.TestCase):
   @parameterized.parameters(
       dict(
           horizontal=spherical_harmonic.Grid.T21(),
-          vertical=sigma_coordinates.SigmaCoordinates.equidistant(8)),
+          vertical=sigma_coordinates.SigmaCoordinates.equidistant(8),
+      ),
       dict(
           horizontal=spherical_harmonic.Grid.with_wavenumbers(34),
-          vertical=sigma_coordinates.SigmaCoordinates.equidistant(8)),
+          vertical=sigma_coordinates.SigmaCoordinates.equidistant(8),
+      ),
       dict(
           horizontal=spherical_harmonic.Grid.T21(),
-          vertical=layer_coordinates.LayerCoordinates(5)),
+          vertical=layer_coordinates.LayerCoordinates(5),
+      ),
+      dict(
+          horizontal=spherical_harmonic.Grid.T21(
+              transform_method='least_squares'
+          ),
+          vertical=layer_coordinates.LayerCoordinates(5),
+      ),
   )
   def test_xarray_attrs_roundtrip(self, horizontal, vertical):
     """Tests that `CoordinateSystem` converts to attrs and back."""
@@ -82,6 +91,18 @@ class CoordinateSystemTest(parameterized.TestCase):
         np.testing.assert_allclose(actual, expected)
       else:
         self.assertEqual(actual, expected)
+
+  def test_xarray_attrs_backwards_compatibility(self):
+    """Tests deserializing legacy attrs missing optional `Grid` fields."""
+    coordinate_system = coordinate_systems.CoordinateSystem(
+        spherical_harmonic.Grid.T21(),
+        layer_coordinates.LayerCoordinates(5),
+    )
+    legacy_attrs = coordinate_system.asdict()
+    legacy_attrs.pop('transform_method')
+    legacy_attrs.pop('basis_as_jax_arrays')
+    reconstructed = xarray_utils.coordinate_system_from_attrs(legacy_attrs)
+    self.assertEqual(reconstructed, coordinate_system)
 
   @parameterized.parameters(
       dict(wavenumbers=128,
