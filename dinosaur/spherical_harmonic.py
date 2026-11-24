@@ -1365,7 +1365,6 @@ class Grid:
   def nodal_padding(self) -> tuple[int, int]:
     return self.spherical_harmonics.nodal_padding
 
-
   def pad_nodal(self, x: Array) -> Array:
     """Zero-pads a nodal array that was given without the nodal padding.
 
@@ -1413,6 +1412,7 @@ class Grid:
     if pad_y:
       valid = valid & (jnp.arange(ny)[jnp.newaxis, :] < self.latitude_nodes)
     return jnp.where(valid, x, 0)
+
   @functools.cached_property
   def nodal_mesh(self) -> tuple[np.ndarray, np.ndarray]:
     return np.meshgrid(*self.nodal_axes, indexing='ij')
