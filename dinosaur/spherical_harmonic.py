@@ -53,6 +53,10 @@ LATITUDE_SPACINGS = dict(
 )
 
 
+TransformMethod = Literal['quadrature', 'least_squares']
+TRANSFORM_METHODS = ('quadrature', 'least_squares')
+
+
 def get_latitude_nodes(n: int, spacing: str) -> tuple[np.ndarray, np.ndarray]:
   """Computes latitude nodes using the given spacing."""
   get_nodes = LATITUDE_SPACINGS.get(spacing)
@@ -64,14 +68,125 @@ def get_latitude_nodes(n: int, spacing: str) -> tuple[np.ndarray, np.ndarray]:
   return get_nodes(n)
 
 
+def _solve_weighted_least_squares_block(
+    s_fold: np.ndarray,
+    w_fold: np.ndarray,
+    rcond: float = 1e-12,
+) -> np.ndarray:
+  """Computes `p_fold` so `p_fold.T @ (w_fold[:, None] * s_fold) ≈ I`."""
+  if s_fold.size == 0:
+    return np.zeros_like(s_fold)
+  sqrt_w = np.sqrt(np.maximum(w_fold, 0.0))
+  weighted_s = sqrt_w[:, np.newaxis] * s_fold
+  _, singular_values, vt = np.linalg.svd(weighted_s, full_matrices=False)
+  if singular_values.size == 0 or singular_values[0] == 0:
+    return np.zeros_like(s_fold)
+  cutoff = rcond * singular_values[0]
+  safe_s = np.where(singular_values > cutoff, singular_values, 1.0)
+  inv_s2 = np.where(singular_values > cutoff, 1.0 / (safe_s * safe_s), 0.0)
+  return (s_fold @ (vt.T * inv_s2)) @ vt
+
+
+def _least_squares_legendre(
+    p: np.ndarray,
+    x: np.ndarray,
+    wp: np.ndarray,
+    rcond: float = 1e-12,
+) -> np.ndarray:
+  """Computes quadrature-weighted least-squares Legendre transform matrices.
+
+  Given nodal synthesis evaluations `p[m, j, l] = c_{l,m} P_l^m(x_j)` and
+  latitudinal quadrature weights `wp[j]`, returns `p_fwd` of the same shape such
+  that contracting `p_fwd` against quadrature-weighted Fourier coefficients
+  `wp[j] * f_m[j]` solves the `wp`-weighted least-squares problem
+  `min_c || sqrt(wp) * (p[m] @ c - f_m) ||_2` for each zonal wavenumber `m`.
+
+  On grids with symmetric latitudes (`x == -x[::-1]`, `wp == wp[::-1]`), modes
+  with even and odd `l - m` are decoupled by parity and capped at the number of
+  independent latitudinal nodes in each parity sector (excluding poles for
+  `m >= 1`, where `P_l^m(±1) == 0`). Any higher modes that exceed the available
+  degrees of freedom are left as zeros in `p_fwd`. When a parity sector is
+  filled to its node count (e.g., low `m` on linear grids with `n_l ≈ n_lat`),
+  the solve becomes exact interpolation on `x = sin(θ)` (Chebyshev-clustered
+  near `±1`, hence well-conditioned), so out-of-band power (`l >= n_lat`)
+  aliases into retained modes without overdetermined damping.
+
+  Args:
+    p: synthesis Legendre array of shape `(n_m, n_lat, n_l)`.
+    x: `sin(latitude)` nodes of shape `(n_lat,)`.
+    wp: latitudinal quadrature weights of shape `(n_lat,)`.
+    rcond: relative singular-value cutoff for pseudoinversion.
+
+  Returns:
+    Array `p_fwd` of shape `(n_m, n_lat, n_l)` with dtype `float64`.
+  """
+  n_m, n_lat, n_l = p.shape
+  p_fwd = np.zeros_like(p, dtype=np.float64)
+  if n_m == 0 or n_lat == 0 or n_l == 0:
+    return p_fwd
+
+  is_symmetric = np.allclose(x, -x[::-1]) and np.allclose(wp, wp[::-1])
+  if is_symmetric:
+    half = n_lat // 2
+    odd_start = half if n_lat % 2 == 0 else half + 1
+    x_even = x[half:]
+    w_even = 2.0 * wp[half:]
+    if n_lat % 2 == 1:
+      w_even[0] = wp[half]
+    x_odd = x[odd_start:]
+    w_odd = 2.0 * wp[odd_start:]
+
+    dof_even_m0 = int(np.sum(w_even > 0))
+    dof_odd_m0 = int(np.sum(w_odd > 0))
+    dof_even_pos = int(np.sum((1.0 - x_even**2 > 1e-15) & (w_even > 0)))
+    dof_odd_pos = int(np.sum((1.0 - x_odd**2 > 1e-15) & (w_odd > 0)))
+
+    for m in range(n_m):
+      p_m = p_fwd[m]
+      dof_even = dof_even_m0 if m == 0 else dof_even_pos
+      dof_odd = dof_odd_m0 if m == 0 else dof_odd_pos
+
+      even_cols = np.arange(m, n_l, 2)[:dof_even]
+      if even_cols.size > 0:
+        s_even = p[m, half:, :][:, even_cols]
+        p_even = _solve_weighted_least_squares_block(s_even, w_even, rcond)
+        p_m[half:, even_cols] = p_even
+        if n_lat % 2 == 0:
+          p_m[:half, even_cols] = p_even[::-1, :]
+        else:
+          p_m[:half, even_cols] = p_even[1:, :][::-1, :]
+
+      odd_cols = np.arange(m + 1, n_l, 2)[:dof_odd]
+      if odd_cols.size > 0:
+        s_odd = p[m, odd_start:, :][:, odd_cols]
+        p_odd = _solve_weighted_least_squares_block(s_odd, w_odd, rcond)
+        p_m[odd_start:, odd_cols] = p_odd
+        p_m[:half, odd_cols] = -p_odd[::-1, :]
+  else:
+    dof_m0 = int(np.sum(wp > 0))
+    dof_pos = int(np.sum((1.0 - x**2 > 1e-15) & (wp > 0)))
+    for m in range(n_m):
+      p_m = p_fwd[m]
+      dof = dof_m0 if m == 0 else dof_pos
+      cols = np.arange(m, n_l)[:dof]
+      if cols.size > 0:
+        p_m[:, cols] = _solve_weighted_least_squares_block(
+            p[m, :, :][:, cols], wp, rcond
+        )
+
+  return p_fwd
+
+
 @dataclasses.dataclass
 class _SphericalHarmonicBasis:
   """Data structure representing a basis for spherical harmonics.
 
   Attributes:
     f: Fourier matrix.
-    p: Legendre transform coefficients.
+    p: Legendre inverse-transform coefficients (modal to nodal).
     w: nodal quadrature weights.
+    p_fwd: Legendre forward-transform coefficients (nodal to modal). Equals `p`
+      when `transform_method == 'quadrature'`.
   """
 
   # The large Fourier and Legendre matrices can be stored either as jax (device)
@@ -83,12 +198,14 @@ class _SphericalHarmonicBasis:
   f: np.ndarray | jax.Array | None
   p: np.ndarray | jax.Array
   w: np.ndarray
+  p_fwd: np.ndarray | jax.Array
 
 
 def _make_basis(
     f: np.ndarray | None,
     p: np.ndarray,
     w: np.ndarray,
+    p_fwd: np.ndarray | None = None,
     *,
     as_jax_arrays: bool = True,
 ) -> _SphericalHarmonicBasis:
@@ -96,10 +213,12 @@ def _make_basis(
 
   Args:
     f: Fourier matrix, or None for FFT-based implementations.
-    p: Legendre transform coefficients.
+    p: Legendre inverse-transform coefficients (modal to nodal).
     w: Nodal quadrature weights (always kept as numpy).
-    as_jax_arrays: if True (default), ``f`` and ``p`` are converted to
-      ``jax.Array`` so that ``jnp.einsum`` can de-duplicate them by identity.
+    p_fwd: Legendre forward-transform coefficients (nodal to modal). If None,
+      reuses `p` without allocating a second matrix.
+    as_jax_arrays: if True (default), ``f``, ``p``, and ``p_fwd`` are converted
+      to ``jax.Array`` so that ``jnp.einsum`` can de-duplicate them by identity.
       If False they are kept as numpy arrays, which allows XLA constant folding
       but may be duplicated at each einsum call site during lowering.
 
@@ -110,10 +229,17 @@ def _make_basis(
     # ensure_compile_time_eval yields concrete arrays even if the basis is
     # first evaluated inside a traced function (caching a tracer would leak)
     with jax.ensure_compile_time_eval():
+      p_jax = jnp.asarray(p)
+      p_fwd_jax = p_jax if p_fwd is None else jnp.asarray(p_fwd)
       return _SphericalHarmonicBasis(
-          f=None if f is None else jnp.asarray(f), p=jnp.asarray(p), w=w
+          f=None if f is None else jnp.asarray(f),
+          p=p_jax,
+          w=w,
+          p_fwd=p_fwd_jax,
       )
-  return _SphericalHarmonicBasis(f=f, p=p, w=w)
+  return _SphericalHarmonicBasis(
+      f=f, p=p, w=w, p_fwd=p if p_fwd is None else p_fwd
+  )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -140,6 +266,18 @@ class SphericalHarmonics:
       or as numpy arrays (eligible for XLA constant-folding, but may be
       duplicated at each call site during lowering). ``None`` (default) lets
       each subclass choose its own preferred default.
+    transform_method: method used to compute forward (nodal to modal) Legendre
+      transform coefficients. ``'quadrature'`` (default) projects onto
+      associated Legendre functions via nodal quadrature weights; on ``N``-node
+      ``'gauss'`` grids, Gauss-Legendre quadrature integrates polynomials up to
+      degree ``2 * N - 1``, so ``'quadrature'`` is already exact up to
+      ``l_max = N - 1``. On ``'equiangular'`` and ``'equiangular_with_poles'``
+      grids, interpolatory latitude weights only integrate up to degree
+      ``N - 1``, so ``'quadrature'`` loses discrete orthogonality once
+      ``l + l' >= N`` (corrupting ``l >= N / 2`` on linear grids).
+      ``'least_squares'`` precomputes weighted least-squares Legendre analysis
+      matrices per zonal wavenumber, yielding exact round-trips for all
+      resolvable modes on non-Gaussian grids.
   """
 
   longitude_wavenumbers: int = 0
@@ -148,6 +286,14 @@ class SphericalHarmonics:
   latitude_nodes: int = 0
   latitude_spacing: str = 'gauss'
   basis_as_jax_arrays: bool | None = None
+  transform_method: TransformMethod = 'quadrature'
+
+  def __post_init__(self):
+    if self.transform_method not in TRANSFORM_METHODS:
+      raise ValueError(
+          f'Unsupported `transform_method` "{self.transform_method}". '
+          f'Supported values are: {list(TRANSFORM_METHODS)}.'
+      )
 
   @property
   def nodal_axes(self) -> tuple[np.ndarray, np.ndarray]:
@@ -299,6 +445,11 @@ class RealSphericalHarmonics(SphericalHarmonics):
     p = associated_legendre.evaluate(
         n_m=self.longitude_wavenumbers, n_l=self.total_wavenumbers, x=x
     )
+    if self.transform_method == 'least_squares':
+      p_fwd = _least_squares_legendre(p, x, wp)
+      p_fwd = np.repeat(p_fwd, 2, axis=0)[1:]
+    else:
+      p_fwd = None
     # Each associated Legendre polynomial Pᵐₗ with m > 0 is paired with both
     # the sin and cos components of the Fourier basis. As a result, we have to
     # duplicate the rows of the associated Legendre matrix.
@@ -311,7 +462,7 @@ class RealSphericalHarmonics(SphericalHarmonics):
         if self.basis_as_jax_arrays is not None
         else False  # default to numpy arrays.
     )
-    return _make_basis(f, p, w, as_jax_arrays=as_jax_arrays)
+    return _make_basis(f, p, w, p_fwd=p_fwd, as_jax_arrays=as_jax_arrays)
 
   def inverse_transform(self, x):
     p = self.basis.p
@@ -325,7 +476,7 @@ class RealSphericalHarmonics(SphericalHarmonics):
   def transform(self, x):
     w = self.basis.w
     f = self.basis.f
-    p = self.basis.p
+    p = self.basis.p_fwd
     wx = w * x
     fwx = jax.named_call(einsum, name='fwd_fourier')('im,...ij->...mj', f, wx)
     pfwx = jax.named_call(einsum, name='fwd_legendre')(
@@ -490,6 +641,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
   fourier_method: Literal['matmul', 'fft'] | None = None
 
   def __post_init__(self):
+    super().__post_init__()
     model_parallelism = self.spmd_mesh is not None and any(
         self.spmd_mesh.shape[dim] > 1 for dim in 'zxy'
     )
@@ -674,14 +826,20 @@ class FastSphericalHarmonics(SphericalHarmonics):
     p = associated_legendre.evaluate(
         n_m=self.longitude_wavenumbers, n_l=self.total_wavenumbers, x=x
     )
-    p = np.pad(p, [(0, modal_pad_x // 2), (0, nodal_pad_y), (0, modal_pad_y)])
+    pad_width = [(0, modal_pad_x // 2), (0, nodal_pad_y), (0, modal_pad_y)]
+    if self.transform_method == 'least_squares':
+      p_fwd = _least_squares_legendre(p, x, wp)
+      p_fwd = np.pad(p_fwd, pad_width)
+    else:
+      p_fwd = None
+    p = np.pad(p, pad_width)
 
     as_jax_arrays = (
         self.basis_as_jax_arrays
         if self.basis_as_jax_arrays is not None
         else False
     )
-    return _make_basis(f, p, w, as_jax_arrays=as_jax_arrays)
+    return _make_basis(f, p, w, p_fwd=p_fwd, as_jax_arrays=as_jax_arrays)
 
   @functools.cached_property
   def _fft_forward_scale(self) -> jax.Array:
@@ -782,7 +940,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
         )
         x = _unstack_m(x, mesh)
     x = jax.named_call(_transform_einsum, name='fwd_legendre')(
-        'mjl,...smj->...sml', self.basis.p, x, mesh, *einsum_args
+        'mjl,...smj->...sml', self.basis.p_fwd, x, mesh, *einsum_args
     )
     x = _stack_m(x, mesh)
     return x
@@ -882,6 +1040,10 @@ class Grid:
       are stored as ``jax.Array`` or as numpy arrays. See
       ``SphericalHarmonics.basis_as_jax_arrays`` for details. ``None`` (default)
       defers to the subclass default.
+    transform_method: method used to compute forward (nodal to modal) Legendre
+      transform coefficients (``'quadrature'`` or ``'least_squares'``). See
+      ``SphericalHarmonics.transform_method`` for details. Defaults to
+      ``'quadrature'``.
   """
 
   longitude_wavenumbers: int = 0
@@ -894,6 +1056,7 @@ class Grid:
   spherical_harmonics_impl: SphericalHarmonicsImpl = RealSphericalHarmonics
   spmd_mesh: jax.sharding.Mesh | None = None
   basis_as_jax_arrays: bool | None = None
+  transform_method: TransformMethod = 'quadrature'
 
   def __post_init__(self):
     if self.radius is None:
@@ -904,6 +1067,19 @@ class Grid:
       raise ValueError(
           f'Unsupported `latitude_spacing` "{self.latitude_spacing}". '
           f'Supported values are: {list(LATITUDE_SPACINGS)}.'
+      )
+
+    if self.transform_method not in TRANSFORM_METHODS:
+      raise ValueError(
+          f'Unsupported `transform_method` "{self.transform_method}". '
+          f'Supported values are: {list(TRANSFORM_METHODS)}.'
+      )
+
+    bound_keywords = getattr(self.spherical_harmonics_impl, 'keywords', None)
+    if bound_keywords and 'transform_method' in bound_keywords:
+      raise ValueError(
+          'Pass `transform_method` directly to `Grid` instead of binding it on'
+          ' `spherical_harmonics_impl`.'
       )
 
     if self.spmd_mesh is not None:
@@ -924,6 +1100,7 @@ class Grid:
       spherical_harmonics_impl: SphericalHarmonicsImpl = RealSphericalHarmonics,
       radius: float | None = None,
       spmd_mesh: jax.sharding.Mesh | None = None,
+      transform_method: TransformMethod = 'quadrature',
   ) -> Grid:
     """Construct a `Grid` by specifying only wavenumbers."""
 
@@ -942,6 +1119,7 @@ class Grid:
         spherical_harmonics_impl=spherical_harmonics_impl,
         radius=radius,
         spmd_mesh=spmd_mesh,
+        transform_method=transform_method,
     )
 
   @classmethod
@@ -954,6 +1132,7 @@ class Grid:
       radius: float | None = None,
       spherical_harmonics_impl: SphericalHarmonicsImpl = RealSphericalHarmonics,
       spmd_mesh: jax.sharding.Mesh | None = None,
+      transform_method: TransformMethod = 'quadrature',
   ) -> Grid:
     """Construct a `Grid` by specifying max wavenumber & the number of nodes.
 
@@ -970,6 +1149,8 @@ class Grid:
       spmd_mesh: mesh to use for parallelism in the single program multiple
         device (SPMD) paradigm with distributed JAX arrays, if any. Required if
         using model parallelism.
+      transform_method: method used to compute forward (nodal to modal) Legendre
+        transform coefficients (`'quadrature'` or `'least_squares'`).
 
     Returns:
       Constructed Grid object.
@@ -985,6 +1166,7 @@ class Grid:
         spherical_harmonics_impl=spherical_harmonics_impl,
         radius=radius,
         spmd_mesh=spmd_mesh,
+        transform_method=transform_method,
     )
 
   # The factory methods below return "standard" grids that appear in the
@@ -1110,10 +1292,11 @@ class Grid:
   @functools.cached_property
   def spherical_harmonics(self) -> SphericalHarmonics:
     """Implementation of spherical harmonic transformations."""
+    kwargs: dict[str, Any] = {}
     if self.spmd_mesh is not None:
-      kwargs = dict(spmd_mesh=self.spmd_mesh)
-    else:
-      kwargs = dict()
+      kwargs['spmd_mesh'] = self.spmd_mesh
+    if self.transform_method != 'quadrature':
+      kwargs['transform_method'] = self.transform_method
     return self.spherical_harmonics_impl(
         longitude_wavenumbers=self.longitude_wavenumbers,
         total_wavenumbers=self.total_wavenumbers,
