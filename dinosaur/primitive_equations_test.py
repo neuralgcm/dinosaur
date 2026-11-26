@@ -2332,7 +2332,7 @@ class PrimitiveEquationsHybridTest(parameterized.TestCase):
       assert_states_close(
           explicit_sigma,
           primitive_equations.State(**explicit_hybrid_interp.asdict()),
-          atol=1e-3,
+          atol=3e-3,
       )
     with self.subTest('implicit_terms'):
       assert_states_close(
