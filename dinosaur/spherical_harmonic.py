@@ -616,6 +616,24 @@ def _transform_einsum(
   )
 
 
+def has_spatial_sharding(mesh: jax.sharding.Mesh | None) -> bool:
+  """Whether `mesh` splits a spatial axis ('z', 'x' or 'y') across devices.
+
+  A mesh may be attached for another reason, e.g. with a 'batch' or 'ensemble'
+  axis and every spatial axis of size 1. Code that asks whether the model
+  itself is parallelized should use this rather than `mesh is not None`.
+
+  Args:
+    mesh: an SPMD mesh, or None.
+
+  Returns:
+    True if `mesh` has a spatial axis with more than one shard.
+  """
+  return mesh is not None and any(
+      mesh.shape[axis] > 1 for axis in 'zxy' if axis in mesh.axis_names
+  )
+
+
 @dataclasses.dataclass(frozen=True)
 class FastSphericalHarmonics(SphericalHarmonics):
   """Fast implementation of spherical harmonic transformation.
@@ -631,6 +649,15 @@ class FastSphericalHarmonics(SphericalHarmonics):
   This version of spherical harmonics also supports model parallelism, if
   `spmd_mesh` is provided. The additional optional arguments allow for low-level
   control of how the transforms are implemented.
+
+  `base_shape_multiple` (by default 8 with model parallelism, else 1) is the
+  multiple, per shard, to which the modal shape is padded.
+  `nodal_shape_multiple` is the same for the nodal shape and defaults to
+  `base_shape_multiple`. Pass `nodal_shape_multiple=1` for a sharded grid with
+  no nodal padding beyond what the shard counts require: `fourier_method='fft'`
+  needs that in longitude, and the semi-Lagrangian interpolation needs it in
+  latitude to exchange halos between neighbouring shards instead of gathering
+  the whole axis (see `semi_lagrangian`).
   """
 
   spmd_mesh: jax.sharding.Mesh | None = None
@@ -639,16 +666,23 @@ class FastSphericalHarmonics(SphericalHarmonics):
   stacked_fourier_transforms: bool | None = None
   transform_precision: jax.lax.PrecisionLike = None
   fourier_method: Literal['matmul', 'fft'] | None = None
+  nodal_shape_multiple: int | None = dataclasses.field(
+      default=None, kw_only=True
+  )
 
   def __post_init__(self):
     super().__post_init__()
-    model_parallelism = self.spmd_mesh is not None and any(
-        self.spmd_mesh.shape[dim] > 1 for dim in 'zxy'
-    )
+    model_parallelism = has_spatial_sharding(self.spmd_mesh)
 
     if self.base_shape_multiple is None:
       shape_multiple = 8 if model_parallelism else 1
       object.__setattr__(self, 'base_shape_multiple', shape_multiple)
+
+    if self.nodal_shape_multiple is None:
+      # By default the nodal grid is padded like the modal one.
+      object.__setattr__(
+          self, 'nodal_shape_multiple', self.base_shape_multiple
+      )
 
     if self.reverse_einsum_arg_order is None:
       object.__setattr__(self, 'reverse_einsum_arg_order', model_parallelism)
@@ -689,9 +723,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
           else 'matmul'
       )
 
-    model_parallelism = self.spmd_mesh is not None and any(
-        self.spmd_mesh.shape[dim] > 1 for dim in 'zxy'
-    )
+    model_parallelism = has_spatial_sharding(self.spmd_mesh)
     if method == 'fft' and model_parallelism:
       raise NotImplementedError(
           'fourier_method="fft" does not support model parallelism'
@@ -707,7 +739,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
     if method == 'fft' and self.nodal_padding[0]:
       raise ValueError(
           'fourier_method="fft" does not support nodal padding in longitude; '
-          f'got {self.nodal_padding[0]=} from {self.base_shape_multiple=}'
+          f'got {self.nodal_padding[0]=} from {self.nodal_shape_multiple=}'
       )
     return method
 
@@ -727,7 +759,7 @@ class FastSphericalHarmonics(SphericalHarmonics):
 
   @functools.cached_property
   def nodal_shape(self) -> tuple[int, int]:
-    base = self.base_shape_multiple or 1
+    base = self.nodal_shape_multiple or 1
     x_shards, y_shards = self._mesh_shape()
     shape_multiples = (base * x_shards, base * y_shards)
     return tuple(map(_round_to_multiple, self.nodal_limits, shape_multiples))  # pyrefly: ignore[bad-return]
@@ -1200,6 +1232,10 @@ class Grid:
     return cls.construct(max_wavenumber=42, gaussian_nodes=32, **kwargs)
 
   @classmethod
+  def T63(cls, **kwargs) -> Grid:
+    return cls.construct(max_wavenumber=63, gaussian_nodes=48, **kwargs)
+
+  @classmethod
   def T85(cls, **kwargs) -> Grid:
     return cls.construct(max_wavenumber=85, gaussian_nodes=64, **kwargs)
 
@@ -1328,6 +1364,54 @@ class Grid:
   @functools.cached_property
   def nodal_padding(self) -> tuple[int, int]:
     return self.spherical_harmonics.nodal_padding
+
+  def pad_nodal(self, x: Array) -> Array:
+    """Zero-pads a nodal array that was given without the nodal padding.
+
+    Args:
+      x: array whose two trailing axes have shape `nodal_shape`, or the
+        unpadded shape `(longitude_nodes, latitude_nodes)`.
+
+    Returns:
+      `x` with trailing shape `nodal_shape`: as given in the first case,
+      extended with zeros over `nodal_padding` in the second.
+    """
+    unpadded_shape = (self.longitude_nodes, self.latitude_nodes)
+    if x.shape[-2:] == self.nodal_shape:
+      return x
+    if x.shape[-2:] != unpadded_shape:
+      raise ValueError(
+          f'expected a nodal array with trailing shape {self.nodal_shape} or'
+          f' {unpadded_shape}; got {x.shape}'
+      )
+    pad_x, pad_y = self.nodal_padding
+    return jnp.pad(x, [(0, 0)] * (x.ndim - 2) + [(0, pad_x), (0, pad_y)])
+
+  def zero_nodal_padding(self, x: Array) -> jnp.ndarray:
+    """Zeros the entries of a nodal array that lie in the nodal padding.
+
+    Nodal operations that are not transforms (e.g. interpolation) may leave
+    arbitrary values at the padded nodes; this restores the zeros there.
+
+    Args:
+      x: array whose two trailing axes have shape `nodal_shape`. An array
+        with any other trailing shape (e.g. values at a set of points) has
+        no padding and is returned as it is.
+
+    Returns:
+      `x` with zeros at the nodes beyond `(longitude_nodes, latitude_nodes)`.
+    """
+    x = jnp.asarray(x)
+    pad_x, pad_y = self.nodal_padding
+    if (pad_x == 0 and pad_y == 0) or x.shape[-2:] != self.nodal_shape:
+      return x
+    nx, ny = self.nodal_shape
+    valid = jnp.ones((nx, ny), dtype=bool)
+    if pad_x:
+      valid = valid & (jnp.arange(nx)[:, jnp.newaxis] < self.longitude_nodes)
+    if pad_y:
+      valid = valid & (jnp.arange(ny)[jnp.newaxis, :] < self.latitude_nodes)
+    return jnp.where(valid, x, 0)
 
   @functools.cached_property
   def nodal_mesh(self) -> tuple[np.ndarray, np.ndarray]:

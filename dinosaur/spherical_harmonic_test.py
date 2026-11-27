@@ -649,6 +649,111 @@ class GridTest(parameterized.TestCase):
     np.testing.assert_array_equal(clipped['u'], expected_u)
     self.assertEqual(clipped['time'], 1.0)
 
+  def testNodalPaddingHelpers(self):
+    padded = spherical_harmonic.Grid(
+        longitude_wavenumbers=22,
+        total_wavenumbers=23,
+        longitude_nodes=68,
+        latitude_nodes=34,
+        spherical_harmonics_impl=functools.partial(
+            spherical_harmonic.FastSphericalHarmonics, nodal_shape_multiple=8
+        ),
+    )
+    self.assertEqual(padded.nodal_shape, (72, 40))
+    self.assertEqual(padded.nodal_padding, (4, 6))
+    rng = np.random.RandomState(0)
+    unpadded_values = rng.normal(size=(3, 68, 34)).astype(np.float32)
+
+    with self.subTest('pad_nodal'):
+      actual = padded.pad_nodal(jnp.asarray(unpadded_values))
+      self.assertEqual(actual.shape, (3, 72, 40))
+      np.testing.assert_array_equal(actual[:, :68, :34], unpadded_values)
+      np.testing.assert_array_equal(actual[:, 68:, :], 0.0)
+      np.testing.assert_array_equal(actual[:, :, 34:], 0.0)
+      # An array that already has the nodal shape is returned as it is.
+      self.assertIs(padded.pad_nodal(actual), actual)
+      np.testing.assert_array_equal(
+          padded.pad_nodal(unpadded_values[0]), actual[0]
+      )
+      with self.assertRaisesRegex(ValueError, 'expected a nodal array'):
+        padded.pad_nodal(jnp.zeros((10, 10)))
+
+    with self.subTest('zero_nodal_padding'):
+      values = jnp.asarray(rng.normal(size=(2, 72, 40)), jnp.float32)
+      actual = padded.zero_nodal_padding(values)
+      np.testing.assert_array_equal(actual[:, :68, :34], values[:, :68, :34])
+      np.testing.assert_array_equal(actual[:, 68:, :], 0.0)
+      np.testing.assert_array_equal(actual[:, :, 34:], 0.0)
+      # Values at points other than the nodes have no padding.
+      points = jnp.ones((5, 7))
+      np.testing.assert_array_equal(padded.zero_nodal_padding(points), points)
+
+    with self.subTest('no padding'):
+      grid = spherical_harmonic.Grid.T21()
+      values = jnp.asarray(rng.normal(size=grid.nodal_shape), jnp.float32)
+      self.assertIs(grid.pad_nodal(values), values)
+      np.testing.assert_array_equal(grid.zero_nodal_padding(values), values)
+
+  def testFastSphericalHarmonicsNodalShapeMultiple(self):
+    x_shards = 2 if len(jax.devices()) >= 2 else 1
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()[:x_shards]).reshape(1, x_shards, 1),
+        ['z', 'x', 'y'],
+    )
+    t63 = spherical_harmonic.Grid.T63(
+        spherical_harmonics_impl=spherical_harmonic.FastSphericalHarmonics,
+        spmd_mesh=mesh,
+    )
+    self.assertEqual(t63.nodal_shape, (192, 96))
+    self.assertEqual(t63.nodal_padding, (0, 0))
+    expected_modal = (128, 72) if x_shards > 1 else (128, 65)
+    self.assertEqual(t63.modal_shape, expected_modal)
+
+    # A sharded grid keeps its default nodal padding (a multiple of 8 per
+    # shard, like the modal shape) unless `nodal_shape_multiple` is given.
+    sharded = dict(
+        longitude_nodes=68,
+        latitude_nodes=34,
+        longitude_wavenumbers=22,
+        total_wavenumbers=23,
+        spmd_mesh=mesh,
+    )
+    default = spherical_harmonic.FastSphericalHarmonics(**sharded)
+    unpadded = spherical_harmonic.FastSphericalHarmonics(
+        nodal_shape_multiple=1, **sharded
+    )
+    if x_shards > 1:
+      self.assertEqual(default.base_shape_multiple, 8)
+      self.assertEqual(default.nodal_shape_multiple, 8)
+      self.assertEqual(default.nodal_shape, (80, 40))
+      self.assertEqual(unpadded.nodal_shape, (68, 34))
+      self.assertEqual(unpadded.nodal_padding, (0, 0))
+    else:
+      self.assertEqual(default.nodal_shape, (68, 34))
+    self.assertEqual(unpadded.modal_shape, default.modal_shape)
+
+    # The nodal padding follows an explicit base_shape_multiple.
+    padded_legacy = spherical_harmonic.FastSphericalHarmonics(
+        longitude_nodes=94,
+        latitude_nodes=47,
+        longitude_wavenumbers=32,
+        total_wavenumbers=32,
+        base_shape_multiple=8,
+    )
+    self.assertEqual(padded_legacy.nodal_shape, (96, 48))
+    self.assertEqual(padded_legacy.nodal_padding, (2, 1))
+
+    # Explicit nodal_shape_multiple controls nodal rounding independently.
+    padded_nodal = spherical_harmonic.FastSphericalHarmonics(
+        longitude_nodes=94,
+        latitude_nodes=47,
+        longitude_wavenumbers=32,
+        total_wavenumbers=32,
+        nodal_shape_multiple=8,
+    )
+    self.assertEqual(padded_nodal.nodal_shape, (96, 48))
+    self.assertEqual(padded_nodal.modal_shape, (64, 32))
+
   @parameterized.product(
       grid_ctor=[
           spherical_harmonic.Grid.T21,
